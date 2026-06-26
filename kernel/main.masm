@@ -19,6 +19,7 @@
 
 @include "macros.masm"
 @include "prims.masm"
+@include "rstack.masm"
 @include "stack.masm"
 @include "arith.masm"
 @include "logic.masm"
@@ -57,12 +58,11 @@ proc(forth_main)
 
     mov     x9, x0                          ; save target_xt (x0 becomes TOS)
     mov     UP, x3                          ; UP = user_base
-    mov     x16, sp
-    str     x16, [UP, #user_HOST_RSP]       ; stash host sp
     mov     DSP, x1                         ; DSP = logical_dsp_in
     ldr     LP, [UP, #user_LP0]             ; LP = locals top
-    ldr     x16, [UP, #user_RSP_CURRENT]
-    mov     sp, x16                         ; switch to the Forth return stack
+    ldr     RP, [UP, #user_RSP_CURRENT]     ; Forth return-stack pointer (x28)
+    ; sp is left as the (16-aligned) host C stack — bl/blr stay legal, and the
+    ; Forth return stack lives in RP, so no sp switch is needed.
 
     ; Prologue: memory wire-format → internal cached-TOS form.
     ldr     TOS, [DSP]
@@ -78,11 +78,7 @@ proc(forth_main)
     str     DSP, [UP, #user_DSP_SAVE]
 
     str     FTOS, [UP, #user_FTOS_SAVE]     ; park FP top-of-stack
-
-    mov     x16, sp
-    str     x16, [UP, #user_RSP_CURRENT]    ; persist Forth rstack pointer
-    ldr     x16, [UP, #user_HOST_RSP]
-    mov     sp, x16                         ; restore host sp
+    str     RP, [UP, #user_RSP_CURRENT]     ; persist Forth return-stack pointer
 
     ldp     x19, x20, [sp, #16]
     ldp     x21, x22, [sp, #32]

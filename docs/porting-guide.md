@@ -17,7 +17,13 @@ literal instruction-for-instruction copy.
 | LP | `r15` | `x21` (`LP`) | locals frame |
 | FTOS | `xmm15` | `d8` (`FTOS`) | FP top of stack |
 | scratch | `rcx rdx rsi rdi r8–r11` | **`x9`–`x15`** (caller-saved) | free inside a primitive |
-| return stk | `rsp` | `sp` | STC; `next()` = `ret` |
+| return stk | `rsp` | `x28` (`RP`) | 8-byte full descending stack; push `[RP,#-cell]!`, pop `[RP],#cell` |
+| (C stack) | — | `sp` | NOT the Forth return stack; stays 16-aligned for `bl`/`blr` |
+
+Return-stack words don't juggle the return address (x86 has it on `rsp`; AArch64
+has it in x30, off the stack) — `>r` is just `str TOS,[RP,#-cell]!`. `next()` =
+`ret`. A colon word nests with `str x30,[RP,#-cell]!` and unnests with
+`ldr x30,[RP],#cell; ret`.
 
 **Forbidden:** never emit `x16`, `x17` (veneer/IP scratch — clobbered by any
 `bl`), `x18` (Darwin-reserved), or 128-bit `q8`–`q15`. The `kernel_lint` test

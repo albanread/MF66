@@ -1,0 +1,86 @@
+; MF66 kernel — return-stack primitives.
+; The return stack is RP (x28), a plain 8-byte full descending stack (push =
+; pre-decrement `[RP, #-cell]!`, pop = post-increment `[RP], #cell`). Because
+; AArch64 `bl` puts the return address in x30 (not on a stack), >r/r>/r@ are
+; simple push/pop — none of WF66's x86 `pop rcx … push rcx` return-address juggle.
+; See docs/porting-guide.md and kernel/macros.masm.
+
+; >r  ( n -- )  ( R: -- n )
+proc(to_r)
+    str     TOS, [RP, #-cell]!     ; push n onto the return stack
+    ldr     TOS, [DSP]             ; raise NOS into TOS
+    stk(1, 0)
+    next()
+endp()
+
+; r>  ( -- n )  ( R: n -- )
+proc(r_from)
+    str     TOS, [DSP, #-cell]!    ; spill old TOS down the data stack
+    ldr     TOS, [RP], #cell       ; pop n from the return stack into TOS
+    next()
+endp()
+
+; r@  ( -- n )  ( R: n -- n )
+proc(r_fetch)
+    str     TOS, [DSP, #-cell]!    ; spill old TOS down the data stack
+    ldr     TOS, [RP]              ; peek top of the return stack
+    next()
+endp()
+
+; rdrop  ( R: n -- )
+proc(rdrop)
+    add     RP, RP, #cell
+    next()
+endp()
+
+; dup>r  ( n -- n )  ( R: -- n )   copy TOS to the return stack
+proc(dup_to_r)
+    str     TOS, [RP, #-cell]!
+    next()
+endp()
+
+; 2>r  ( x1 x2 -- )  ( R: -- x1 x2 )   x2 ends on top of the return stack
+proc(two_to_r)
+    ldr     x9, [DSP]              ; x9 = x1 (NOS)
+    stp     TOS, x9, [RP, #-16]!   ; [RP]=x2 (top), [RP+8]=x1 (deeper)
+    ldr     TOS, [DSP, #cell]      ; raise NNOS into the new TOS
+    stk(2, 0)
+    next()
+endp()
+
+; 2r>  ( -- x1 x2 )  ( R: x1 x2 -- )
+proc(two_r_from)
+    str     TOS, [DSP, #-cell]!    ; spill old TOS (becomes NNOS)
+    ldp     TOS, x9, [RP], #16     ; TOS = x2 (top), x9 = x1; pop both
+    str     x9, [DSP, #-cell]!     ; push x1 as the new NOS
+    next()
+endp()
+
+; 2r@  ( -- x1 x2 )  ( R: x1 x2 -- x1 x2 )
+proc(two_r_fetch)
+    str     TOS, [DSP, #-cell]!    ; spill old TOS
+    ldp     TOS, x9, [RP]          ; peek: TOS = x2, x9 = x1 (no pop)
+    str     x9, [DSP, #-cell]!     ; push x1 as the new NOS
+    next()
+endp()
+
+; 2rdrop  ( R: x1 x2 -- )
+proc(two_rdrop)
+    add     RP, RP, #16
+    next()
+endp()
+
+; rp@  ( -- addr )   current return-stack pointer
+proc(rp_fetch)
+    str     TOS, [DSP, #-cell]!
+    mov     TOS, RP
+    next()
+endp()
+
+; rp!  ( addr -- )   install a new return-stack pointer
+proc(rp_store)
+    mov     RP, TOS
+    ldr     TOS, [DSP]             ; raise NOS into TOS
+    stk(1, 0)
+    next()
+endp()

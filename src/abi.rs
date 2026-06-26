@@ -25,6 +25,10 @@ pub const LP: &str = "x21";
 pub const FTOS: &str = "d8";
 /// Float-stack pointer (callee-saved; may fall back to `[UP + user_FSP]`).
 pub const FSP: &str = "x22";
+/// Return-stack pointer — a plain 8-byte full descending stack, callee-saved and
+/// decoupled from `sp` (AArch64 `bl` puts the return address in x30, not on a
+/// stack), so `sp` stays permanently 16-aligned for `bl`/`blr`.
+pub const RP: &str = "x28";
 
 /// Caller-saved scratch / parallel-move temporaries — window-local only (a fused
 /// window contains no calls), so volatility is fine and the wider pool (7 vs
@@ -57,7 +61,7 @@ mod tests {
     #[test]
     fn pools_are_disjoint_and_avoid_forbidden() {
         let mut seen = std::collections::HashSet::new();
-        for &r in FUSION_POOL.iter().chain(PROMO_POOL).chain([&DSP, &UP, &LP, &FSP]) {
+        for &r in FUSION_POOL.iter().chain(PROMO_POOL).chain([&DSP, &UP, &LP, &FSP, &RP]) {
             assert!(!FORBIDDEN.contains(&r), "{r} is forbidden but in a pool/home");
             assert!(seen.insert(r), "{r} appears in two pools/homes");
         }

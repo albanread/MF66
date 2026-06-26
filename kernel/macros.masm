@@ -7,16 +7,22 @@
 ;   x20 = UP     (user-area pointer — per-task state)
 ;   x21 = LP     (locals-frame pointer)
 ;   x22 = FSP    (float stack pointer)
+;   x28 = RP     (return-stack pointer — a plain 8-byte full descending stack)
 ;   d8  = FTOS   (float top of stack — callee-saved low 64; NOT d31)
-;   sp  = return stack (also the CPU call/ret stack since we are STC)
+;   sp  = the AAPCS64 C stack — kept 16-byte aligned; NOT the Forth return stack
 ;   x16 = call scratch (IP0; clobbered by every bl/blr incl. loader veneers)
 ;
-; Everything that must survive a settle-barrier rt_* call (DSP/UP/LP/FSP/FTOS)
+; Everything that must survive a settle-barrier rt_* call (DSP/UP/LP/FSP/RP/FTOS)
 ; is AAPCS64 callee-saved, so it persists across call-outs with no spill.
 ;
-; Subroutine-threaded: every primitive ends with `ret` (next()); colon words
-; invoke children with `bl` and MUST save/restore the link register x30 around
-; their body (the AArch64 nest/unnest — x30 is not auto-pushed like x86's rsp).
+; Subroutine-threaded: every primitive ends with `ret` (next()). The return
+; stack is RP (x28), NOT sp — AArch64 `bl` puts the return address in x30 (the
+; link register), not on a stack, so the Forth return stack is decoupled from sp.
+; This keeps sp permanently 16-aligned (so every bl/blr is legal) while the
+; return stack uses natural 8-byte cells. A colon word saves x30 to RP on nest
+; (`str x30, [RP, #-cell]!`) and restores it on unnest (`ldr x30, [RP], #cell`).
+; >r/r>/r@ are therefore trivial push/pop on RP — no return-address juggling
+; (unlike x86, where `call` puts the return address on the return stack itself).
 ; ─────────────────────────────────────────────────────────────────────
 
 @assign cell = 8
@@ -27,6 +33,7 @@
 @define UP   x20
 @define LP   x21
 @define FSP  x22
+@define RP   x28
 @define FTOS d8
 
 ; ── User-area layout (offsets from UP) — adopted from WF66 kernel/macros.masm ──
@@ -80,22 +87,14 @@
 @endmacro
 
 ; ── aapcs_call(target) — call a host extern under AAPCS64 ────────────────
-; Two AArch64 facts x86 didn't have: (1) `bl` overwrites x30 (LR), so the
-; caller's return address must be saved/restored — there is no implicit stack
-; push like x86 `call`; (2) the Forth return stack on sp is frequently at
-; 8-mod-16, but AAPCS64 needs sp 16-aligned at the bl. x16/x17 are the ABI
-; scratch (clobbered by the bl's veneer, so x16 is reloaded after; x17 is dead
-; before the call). NOTE: AND-immediate cannot target sp, so the alignment math
-; must go through a GPR.
-; Phase 1: always save LR + realign (correct regardless of parity). Phase 5+:
-; the optimizer elides the realign where sp is provably aligned (design §2).
+; `bl` overwrites x30 (LR), so save/restore the caller's return address — there
+; is no implicit stack push like x86 `call`. No sp realignment is needed: the
+; Forth return stack is RP (x28), not sp, so sp is only ever the C stack and
+; stays 16-aligned by construction (forth_main's 160-byte frame is the only thing
+; on it). Pushing 16 bytes keeps it aligned for the bl. (This is why the earlier
+; "sp-alignment parity" optimization is moot — sp never goes odd.)
 @macro aapcs_call(target)
-    mov     x16, sp                 ; x16 = original sp (the Forth return-stack ptr)
-    and     x17, x16, #-16          ; align in a GPR (AND-imm can't write sp)
-    sub     x17, x17, #16           ; reserve a 16-byte aligned save slot
-    mov     sp, x17
-    stp     x30, x16, [sp]          ; save LR + original sp
+    str     x30, [sp, #-16]!        ; save LR (16-byte frame keeps sp aligned)
     bl      &target
-    ldp     x30, x16, [sp]          ; restore LR + original sp
-    mov     sp, x16                 ; restore the Forth return-stack pointer
+    ldr     x30, [sp], #16          ; restore LR
 @endmacro

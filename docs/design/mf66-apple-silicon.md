@@ -63,8 +63,20 @@ FP/LR.
 | **fusion scratch** | rsi/rdi/r8/r9/rcx/rdx | **x9–x15** (7) | caller | no (window-local) |
 | **GP promotion** | r10/r11 (caller!) | **x23,x24** | callee | yes (upgrade — survives barriers unconditionally) |
 | **FP promotion** ⚠ | — | **d9–d15** | callee (low 64) | yes (the critique's add — FP-heavy windows need it) |
-| return stack | rsp | **sp** | — | STC native call/ret |
+| **RP** (return stack) | rsp | **x28** | callee | yes — a plain 8-byte full descending stack |
 | FP scratch | xmm0/1 | **d0–d7** | caller | no |
+
+**Return-stack decision (revised during Phase 2):** the return stack is a
+dedicated register **RP = x28**, *not* `sp`. AArch64 `bl` writes the return
+address to x30 (the link register), not to a stack, so the Forth return stack is
+naturally decoupled from `sp`. Keeping it in RP means: (a) natural **8-byte
+cells** (no fighting `sp`'s 16-byte alignment), (b) `sp` stays the pristine C
+stack, **always 16-aligned by construction** (only `forth_main`'s frame touches
+it) — so every `bl`/`blr` is legal with no work, (c) `forth_main` is simpler (it
+loads/persists RP via `user_RSP_CURRENT` instead of switching `sp`), and (d)
+`>r`/`r>`/`r@` are trivial push/pop with **no return-address juggling** (unlike
+x86, where `call` puts the return address on the return stack itself). A colon
+word nests by `str x30, [RP, #-cell]!` / unnests by `ldr x30, [RP], #cell; ret`.
 
 **Reserved/forbidden (⚠ from the critique):**
 - **`x16`/`x17` never appear in any allocatable pool.** `MacJit`'s far-call
@@ -82,32 +94,19 @@ FP/LR.
 - **`x29` is unusable as a frame/unwind anchor in STC code** (no C frame per
   Forth word); the crash handler (§6) must walk the Forth return stack manually.
 
-**Darwin call-out rule (⚠):** the Forth return stack on `sp` is frequently at
-8-mod-16, but AAPCS64 requires `sp` 16-byte aligned at every `bl`/`blr`.
+**Darwin call-out rule — resolved by the RP decision (was ⚠).** The original
+worry was that a return stack on `sp` goes to 8-mod-16 after an odd number of
+`>r`s, breaking the AAPCS64 "`sp` 16-aligned at every `bl`/`blr`" rule — and the
+plan was to track an `sp`-alignment parity through the IR (like `coalesce_dsp`)
+and elide realigns where provable. **Putting the return stack in RP (x28) instead
+of `sp` makes this moot:** the Forth side never touches `sp`, so `sp` is *always*
+16-aligned by construction. `aapcs_call` therefore needs no realign at all — just
+a 16-byte LR save (`str x30,[sp,#-16]!; bl; ldr x30,[sp],#16`). No alignment
+parity to track, no per-call tax, no Phase-5 optimization needed. (The framing
+insight still applies to *other* barrier costs — settle-to-canonical, FP-stack
+reloads — just not to `sp` alignment.)
 
-`sp` alignment is a **framing concern, optimized like `coalesce_dsp`** — track it
-as data, guarantee it, emit fix-ups only where they are actually needed:
-
-- **MVP / correctness first:** `aapcs_call` re-aligns defensively (save sp, `and
-  sp,sp,#-16`, call, restore) so it is *always* correct regardless of caller
-  parity. This is the Phase-1 implementation. Never call out with `sp` misaligned.
-- **Optimized (Phase 5+):** the return stack only moves by *statically known*
-  cell deltas (each `>r`/`r>`/nest/unnest is ±8, every word entry/exit is a fixed
-  frame). So the compiler can carry an **`sp`-alignment parity** through the IR
-  exactly as `coalesce_dsp` carries the running DSP delta, and **elide the
-  realign at any call site where `sp` is provably 16-aligned** (e.g. an even
-  number of return-stack pushes since the last known-aligned point, or a word
-  that maintains a 16-aligned frame). The realign is emitted **only** at sites
-  where parity is unknown or odd — minimal fix-ups, never blanket overhead, while
-  the invariant (aligned at every `bl`) is preserved by construction.
-
-This makes alignment a tracked property of the deferred-assembly buffer rather
-than a per-call tax: the same "defer, track the delta, emit the minimal
-adjustment at the window edge" discipline `coalesce_dsp`/`window_fuse` already
-use. (Open: model alignment parity as a 1-bit lattice on the `Instr` stream, with
-calls/labels/Raw spans as the points where unknown parity forces a realign.)
-
-Why this mapping: everything that must survive a settle-barrier rt_* call (DSP,
+Why the register homes: everything that must survive a settle-barrier rt_* call (DSP,
 UP, LP, FTOS, FSP, both promotion pools) is **callee-saved**, so the
 `coalesce_dsp`/`promote_hot_cells` soundness conditions hold with no spill code;
 TOS↔x0 unifies the Forth value reg with the C arg/ret reg.
@@ -274,10 +273,10 @@ x86-only) is gated off; metrics are diagnostic, never a gate.
 4. **FP + math** — `float`/`fmath`, libm via `aapcs_call`, FTOS=d8, FSP=x22.
    *Verify:* FP suite matches within IEEE-754 identity.
 5. **Optimizer back-end** — §3 + ⚠§4: `ArchReg`/`RegFile`, `lower()`→`Instr`,
-   AArch64 `render()`, re-tuned promote/fuse thresholds, NZCV-liveness guard, and
-   **sp-alignment-parity tracking** (§2 — elide redundant `aapcs_call` realigns
-   where `sp` is provably 16-aligned, like `coalesce_dsp` for DSP). Kernel
-   peephole (`compile.masm` K4) stays **disabled** (its backward scan assumes
+   AArch64 `render()`, re-tuned promote/fuse thresholds, NZCV-liveness guard.
+   (sp-alignment-parity tracking is no longer needed — the RP return-stack
+   decision keeps `sp` aligned by construction, §2.) Kernel peephole
+   (`compile.masm` K4) stays **disabled** (its backward scan assumes
    fixed x86 sizes; accept ~5–10% leaf loss; the Rust reducer has most of the
    win). *Verify:* round-trip tests; reducer cross-check; optimized == unoptimized
    == corpus observable state; **no `bl`/`blr` ever reached with misaligned sp**
@@ -305,10 +304,10 @@ x86-only) is gated off; metrics are diagnostic, never a gate.
 - **Verify-cost dominates translate-cost** — for 13.6k hand-written asm lines the
   schedule lives in per-primitive differential verification, serialized behind
   the corpus. Label effort as (translate, verify) pairs.
-- **`>r`/`r>`/`r@`/`2>r`/`rdrop` need from-scratch AArch64 semantics**, not
-  translation: x86 pushes the return address to `rsp` automatically; AArch64 `bl`
-  writes x30 (LR), spilled to `sp` only when the word nests. Define precisely what
-  "top of the return stack" is (x30 vs `[sp]`).
+- **`>r`/`r>`/`r@`/`2>r`/`rdrop` ✅ DONE** (`kernel/rstack.masm`, `tests/rstack.rs`):
+  resolved by the RP-register decision — the return stack is RP (x28), the return
+  address rides in x30 (saved to RP on nest), so these are plain push/pop with no
+  juggling. "Top of the return stack" = `[RP]`.
 - **MASM-idiom rewrites:** `rep movs`→ldr/str post-index loop (one shared macro,
   grep every `rep`); flag idioms→`csetm`/`csel`; 128-bit `rdx:rax`→
   `mul`+`umulh`/`smulh`; msvcrt→libm (IEEE-754 match).
