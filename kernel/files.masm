@@ -1,0 +1,146 @@
+; MF66 kernel — ANS File-Access wordset (host I/O via rt_* externs in
+; src/runtime.rs). Each word marshals args into x0..x4 and aapcs_calls a host fn;
+; the host returns `ior` in x0, and writes any secondary output (read-file u2,
+; file-position/size ud, read-line u2+flag) through an out-pointer = a scratch
+; cell in the user PAD. ABI: TOS=x0, NOS=[DSP], cell=8; scratch x9/x10 only.
+
+; open-file ( c-addr u fam -- fid ior )
+proc(open_file_word)
+    mov     x2, x0                  ; fam (TOS)
+    ldr     x1, [DSP]               ; u   (NOS)
+    ldr     x0, [DSP, #cell]        ; c-addr (NNOS)
+    add     x3, UP, #user_PAD       ; &fid_out
+    aapcs_call(rt_open_file)        ; x0 = ior
+    ldr     x9, [UP, #user_PAD]     ; fid
+    str     x9, [DSP, #cell]        ; NNOS slot ← fid
+    stk(3, 2)                       ; TOS=ior, NOS=fid
+    next()
+endp()
+
+; create-file ( c-addr u fam -- fid ior )
+proc(create_file_word)
+    mov     x2, x0
+    ldr     x1, [DSP]
+    ldr     x0, [DSP, #cell]
+    add     x3, UP, #user_PAD
+    aapcs_call(rt_create_file)
+    ldr     x9, [UP, #user_PAD]
+    str     x9, [DSP, #cell]
+    stk(3, 2)
+    next()
+endp()
+
+; close-file ( fid -- ior )
+proc(close_file_word)
+    aapcs_call(rt_close_file)
+    next()
+endp()
+
+; read-file ( c-addr u1 fid -- u2 ior )
+proc(read_file_word)
+    mov     x2, x0                  ; fid
+    ldr     x1, [DSP]               ; u1
+    ldr     x0, [DSP, #cell]        ; c-addr
+    add     x3, UP, #user_PAD       ; &u2_out
+    aapcs_call(rt_read_file)
+    ldr     x9, [UP, #user_PAD]     ; u2
+    str     x9, [DSP, #cell]
+    stk(3, 2)                       ; TOS=ior, NOS=u2
+    next()
+endp()
+
+; write-file ( c-addr u fid -- ior )
+proc(write_file_word)
+    mov     x2, x0
+    ldr     x1, [DSP]
+    ldr     x0, [DSP, #cell]
+    aapcs_call(rt_write_file)
+    stk(3, 1)
+    next()
+endp()
+
+; write-line ( c-addr u fid -- ior )
+proc(write_line_word)
+    mov     x2, x0
+    ldr     x1, [DSP]
+    ldr     x0, [DSP, #cell]
+    aapcs_call(rt_write_line)
+    stk(3, 1)
+    next()
+endp()
+
+; read-line ( c-addr u1 fid -- u2 flag ior )
+proc(read_line_word)
+    mov     x2, x0                  ; fid
+    ldr     x1, [DSP]               ; u1
+    ldr     x0, [DSP, #cell]        ; c-addr
+    add     x3, UP, #user_PAD       ; &u2_out
+    add     x4, UP, #user_PAD
+    add     x4, x4, #cell           ; &flag_out = PAD + 8
+    aapcs_call(rt_read_line)        ; x0 = ior
+    ldr     x9,  [UP, #user_PAD]    ; u2
+    add     x10, UP, #user_PAD
+    ldr     x10, [x10, #cell]       ; flag (PAD+8)
+    str     x9,  [DSP, #cell]       ; NNOS ← u2
+    str     x10, [DSP]             ; NOS  ← flag
+    stk(3, 3)                       ; balanced; TOS=ior
+    next()
+endp()
+
+; file-position ( fid -- ud ior )   ud = low high (low deeper)
+proc(file_position_word)
+    add     x1, UP, #user_PAD       ; &pos_out
+    aapcs_call(rt_file_position)    ; x0 = ior (fid was TOS)
+    ldr     x9, [UP, #user_PAD]     ; pos (low)
+    str     x9,  [DSP, #-cell]!     ; push low
+    mov     x10, #0
+    str     x10, [DSP, #-cell]!     ; push high
+    next()                          ; TOS=ior
+endp()
+
+; file-size ( fid -- ud ior )
+proc(file_size_word)
+    add     x1, UP, #user_PAD
+    aapcs_call(rt_file_size)
+    ldr     x9, [UP, #user_PAD]
+    str     x9,  [DSP, #-cell]!
+    mov     x10, #0
+    str     x10, [DSP, #-cell]!
+    next()
+endp()
+
+; reposition-file ( ud fid -- ior )   seek to ud's low cell
+proc(reposition_file_word)
+    mov     x1, x0                  ; fid (TOS)
+    ldr     x0, [DSP, #cell]        ; low cell of ud (NNOS)
+    aapcs_call(rt_reposition_file)
+    stk(3, 1)
+    next()
+endp()
+
+; delete-file ( c-addr u -- ior )
+proc(delete_file_word)
+    mov     x1, x0                  ; u
+    ldr     x0, [DSP]               ; c-addr
+    aapcs_call(rt_delete_file)
+    stk(2, 1)
+    next()
+endp()
+
+; flush-file ( fid -- ior )
+proc(flush_file_word)
+    aapcs_call(rt_flush_file)
+    next()
+endp()
+
+; rename-file ( c-addr1 u1 c-addr2 u2 -- ior )
+;   TOS=u2, NOS=c-addr2 [DSP], NNOS=u1 [DSP+8], NNNOS=c-addr1 [DSP+16].
+proc(rename_file_word)
+    mov     x3, x0                  ; u2 (TOS)
+    ldr     x2, [DSP]               ; c-addr2 (NOS)
+    ldr     x1, [DSP, #cell]        ; u1 (NNOS)
+    ldr     x0, [DSP, #16]          ; c-addr1 (NNNOS)
+    aapcs_call(rt_rename_file)
+    stk(4, 1)
+    next()
+endp()

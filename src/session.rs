@@ -315,6 +315,11 @@ impl Mf66Session {
         self.eval(": 2field: aligned create dup , 16 + does> @ + ;")?;
         self.eval(": begin-structure create here 0 , 0 does> @ ;")?;
         self.eval(": end-structure swap ! ;")?;
+        // File access modes (low 3 bits select read/write; bin is a no-op here).
+        self.eval("1 constant r/o")?;
+        self.eval("2 constant w/o")?;
+        self.eval("3 constant r/w")?;
+        self.eval(": bin ;")?;
         Ok(())
     }
 
@@ -323,6 +328,8 @@ impl Mf66Session {
     fn oop_boot(&mut self) -> Result<()> {
         self.write_user(USER_SELF, 0);
         self.publish_constant("cell", CELL as i64)?; // `cell ivar: n`
+        let pad = self.user_base + USER_PAD;
+        self.publish_constant("pad", pad as i64)?; // scratch buffer address
         self.dnu_xt = self.xt_of("dnu_word")?;
         self.send_xt = self.xt_of("send_word")?;
         self.send_xt_xt = self.xt_of("send_xt_word")?;
