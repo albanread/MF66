@@ -169,6 +169,33 @@ deferred-assembly passes is x86 codegen = the Phase-5 optimizer back-end.
    caller-saved regs; on AArch64 hold counter/limit in callee-saved x19–x28 across
    the inner call (or re-spill) — same hazard class, different register split.
 
+## 7a. Memory placement & addressing (AArch64 vs x86 rip-relative)
+
+x86 WF66 keeps the dict heap within ±1.75 GB of code so `call rel32` + rip-relative
+`lea` work. AArch64 has no rip-relative *data* load, so the strategy differs:
+
+- **One ±128 MB window for all mutually-calling code.** Compiled colon bodies `bl`
+  primitives and each other (`bl` = ±128 MB). So the **dict code/header heap (where
+  colon bodies are emitted) must be allocated within ±128 MB of `MacJit`'s primitive
+  arena** — then every call is a 1-instruction `bl`; out-of-range falls back to a
+  `compile,` veneer (`movz/movk x16; blr x16`). 128 MB easily holds the Forth code.
+- **Hot per-task data uses base registers, not PC-relative.** Every user variable
+  is `ldr x,[UP,#off]` (one instruction; the 12-bit scaled offset covers the whole
+  0…32 KB user area, incl. `VAR_LIMIT`=0x1828). `DSP`/`RP`/`LP` likewise. This is the
+  "data base pointer" — better than rip-relative, and what WF66 already does (RBX=UP).
+- **Compile-time-known addresses → `adrp+add`** (2 insns, ±4 GB, loader-resolved via
+  `@PAGE`/`@PAGEOFF`): the AArch64 analogue of rip-relative, for fixed kernel symbols
+  (`compile_word`/`execute`) and folded variable PFAs. Beats `movz/movk` (4 insns)
+  when the target is within ±4 GB — so keep the var-data region within ±4 GB of code.
+- **Variable/CREATE bodies** are reached via the address baked in the stub (loaded
+  once, §7.1), then `@`/`!` operate on a stack address — no PC-relative needed.
+- **No dedicated data-base register required** for the dictionary/interpreter (UP
+  covers hot vars; a dedicated base only reaches ±32 KB, too small for a growing
+  region). x25/x26/x27 remain free if a hot table later wants one.
+
+Net allocation rule: place `{primitive arena, dict code/header heap, var-data
+region}` in one ±128 MB span (calls = `bl`; data addresses = `adrp+add`).
+
 ## 8. Port phasing
 
 1. **Layout** — add the full dict/overlay/user-var block to `kernel/macros.masm`
