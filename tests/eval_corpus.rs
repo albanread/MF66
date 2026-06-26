@@ -111,7 +111,18 @@ fn classify(in_path: &Path, out_path: &Path) -> Outcome {
 fn is_available(s: &mut Mf66Session, w: &str) -> bool {
     matches!(
         w,
-        ":" | ";" | "bye" | "if" | "else" | "then" | "begin" | "until" | "while" | "repeat"
+        ":" | ";"
+            | "bye"
+            | "if"
+            | "else"
+            | "then"
+            | "begin"
+            | "until"
+            | "while"
+            | "repeat"
+            | "do"
+            | "loop"
+            | "+loop"
     ) || s.find(w).map(|o| o.is_some()).unwrap_or(false)
 }
 

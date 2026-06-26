@@ -88,6 +88,72 @@ pub fn b(off: i32) -> u32 {
     0x1400_0000 | ((off as u32) & 0x03FF_FFFF)
 }
 
+/// `ldr Xt, [Xn, #imm]`  (unsigned scaled offset; imm is bytes, must be /8).
+pub fn ldr_off(rt: u32, rn: u32, imm: u32) -> u32 {
+    0xF940_0000 | (((imm / 8) & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+/// `str Xt, [Xn, #imm]`  (unsigned scaled offset).
+pub fn str_off(rt: u32, rn: u32, imm: u32) -> u32 {
+    0xF900_0000 | (((imm / 8) & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+/// `add Xd, Xn, Xm`.
+pub fn add_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x8B00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `sub Xd, Xn, Xm`.
+pub fn sub_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+    0xCB00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `eor Xd, Xn, Xm`.
+pub fn eor_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+    0xCA00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `tbz Xt, #bit, off`  — branch if bit `bit` of Xt is 0; `off` = instruction count.
+pub fn tbz(rt: u32, bit: u32, off: i32) -> u32 {
+    let b5 = (bit >> 5) & 1;
+    let b40 = bit & 0x1F;
+    (b5 << 31) | 0x3600_0000 | (b40 << 19) | (((off as u32) & 0x3FFF) << 5) | (rt & 0x1F)
+}
+
+// ── DO/LOOP (counted loops) — frame on RP is [index@RP, limit@RP+8] ─────────
+
+/// `do` ( limit start -- ): push [index=start, limit] onto RP, drop both.
+pub fn emit_do(out: &mut Vec<u32>) {
+    out.push(ldr0(9, DSP)); // x9 = limit (NOS)
+    out.push(str_pre(9, RP, -CELL)); // push limit (deeper)
+    out.push(str_pre(TOS, RP, -CELL)); // push index = start (top)
+    out.push(ldr_off(TOS, DSP, CELL as u32)); // new TOS = item below limit
+    out.push(add_imm(DSP, DSP, CELL as u32 * 2)); // drop ( limit start )
+}
+/// `loop`: index++; loop back to `top` unless (index-limit) changed sign.
+pub fn emit_loop(out: &mut Vec<u32>, top: usize) {
+    out.push(ldr0(9, RP)); // index
+    out.push(ldr_off(10, RP, CELL as u32)); // limit
+    out.push(sub_reg(11, 9, 10)); // d_old = index - limit
+    out.push(add_imm(9, 9, 1)); // index++
+    out.push(str_off(9, RP, 0));
+    out.push(sub_reg(12, 9, 10)); // d_new
+    out.push(eor_reg(11, 11, 12)); // sign change?
+    let at = out.len();
+    out.push(tbz(11, 63, top as i32 - at as i32)); // no change → loop back
+    out.push(add_imm(RP, RP, 16)); // exit: drop the loop frame
+}
+/// `+loop` ( n -- ): index += n; same signed-crossing termination test.
+pub fn emit_plus_loop(out: &mut Vec<u32>, top: usize) {
+    out.push(ldr0(9, RP));
+    out.push(ldr_off(10, RP, CELL as u32));
+    out.push(sub_reg(11, 9, 10)); // d_old
+    out.push(add_reg(9, 9, TOS)); // index += n
+    out.push(str_off(9, RP, 0));
+    out.push(sub_reg(12, 9, 10)); // d_new
+    out.push(eor_reg(11, 11, 12));
+    out.push(ldr0(TOS, DSP)); // consume n: raise NOS
+    out.push(add_imm(DSP, DSP, CELL as u32));
+    let at = out.len();
+    out.push(tbz(11, 63, top as i32 - at as i32));
+    out.push(add_imm(RP, RP, 16));
+}
+
 const SCRATCH: u32 = 9; // x9
 
 /// Compile a Forth `IF`/`UNTIL`/`WHILE` flag test: consume TOS (raise NOS),
@@ -127,6 +193,19 @@ mod cf_tests {
         assert_eq!(asm("b .L\nnop\n.L:")[0], b(2));
         // backward (negative) offset
         assert_eq!(asm(".L:\nnop\nb .L")[1], b(-1));
+    }
+
+    #[test]
+    fn doloop_encoders_match_assembler() {
+        assert_eq!(vec![ldr_off(9, 28, 8)], asm("ldr x9, [x28, #8]"));
+        assert_eq!(vec![str_off(9, 28, 0)], asm("str x9, [x28]"));
+        assert_eq!(vec![add_reg(9, 9, 0)], asm("add x9, x9, x0"));
+        assert_eq!(vec![sub_reg(11, 9, 10)], asm("sub x11, x9, x10"));
+        assert_eq!(vec![eor_reg(11, 11, 12)], asm("eor x11, x11, x12"));
+        // a64 can't assemble tbz-to-label, so assert against llvm-mc-verified
+        // constants (fixed bits match `llvm-mc -triple=aarch64-apple-darwin`).
+        assert_eq!(tbz(11, 63, 2), 0xB6F8_004B);
+        assert_eq!(tbz(9, 5, 2), 0x3628_0049);
     }
 }
 

@@ -54,3 +54,24 @@ fn factorial_with_loop() {
     s.eval(": fact 1 swap begin dup 0> while dup >r * r> 1- repeat drop ;").unwrap();
     assert_eq!(s.eval_out("5 fact .").unwrap(), "120 ");
 }
+
+#[test]
+fn do_loop_counts() {
+    let mut s = Mf66Session::new().unwrap();
+    s.eval(": cu 5 0 do i . loop ;").unwrap();
+    assert_eq!(s.eval_out("cu").unwrap(), "0 1 2 3 4 ");
+}
+
+#[test]
+fn plus_loop_steps() {
+    let mut s = Mf66Session::new().unwrap();
+    s.eval(": ev 10 0 do i . 2 +loop ;").unwrap();
+    assert_eq!(s.eval_out("ev").unwrap(), "0 2 4 6 8 ");
+}
+
+#[test]
+fn nested_do_loop_with_j() {
+    let mut s = Mf66Session::new().unwrap();
+    s.eval(": mt 3 0 do 3 0 do i j * . loop loop ;").unwrap();
+    assert_eq!(s.eval_out("mt").unwrap(), "0 0 0 0 1 2 0 2 4 ");
+}

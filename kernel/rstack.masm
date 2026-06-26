@@ -70,6 +70,20 @@ proc(two_rdrop)
     next()
 endp()
 
+; i  ( -- index )   the innermost DO-loop index (top of the loop frame on RP)
+proc(i_word)
+    str     TOS, [DSP, #-cell]!
+    ldr     TOS, [RP]
+    next()
+endp()
+
+; j  ( -- index )   the next-outer DO-loop index (skip the inner [index,limit])
+proc(j_word)
+    str     TOS, [DSP, #-cell]!
+    ldr     TOS, [RP, #16]
+    next()
+endp()
+
 ; rp@  ( -- addr )   current return-stack pointer
 proc(rp_fetch)
     str     TOS, [DSP, #-cell]!

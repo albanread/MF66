@@ -86,6 +86,7 @@ enum Cf {
     FwdCbz(usize), // a forward `cbz` to patch (if / while)
     FwdB(usize),   // a forward `b` to patch (else)
     Begin(usize),  // a backward target word index (begin)
+    Do(usize),     // a DO-loop body top (loop / +loop branch back here)
 }
 
 impl Mf66Session {
@@ -333,7 +334,10 @@ impl Mf66Session {
     /// else a call if it's a word, else a literal if it's a number.
     fn compile_token(&mut self, tok: &str) -> Result<()> {
         let lk = tok.to_ascii_lowercase();
-        if matches!(lk.as_str(), "if" | "else" | "then" | "begin" | "until" | "while" | "repeat") {
+        if matches!(
+            lk.as_str(),
+            "if" | "else" | "then" | "begin" | "until" | "while" | "repeat" | "do" | "loop" | "+loop"
+        ) {
             return self.compile_control(&lk);
         }
         let base = self.read_user(UVAR_BASE) as u32;
@@ -407,6 +411,24 @@ impl Mf66Session {
                 patch_b(&mut def.body, bidx, target); // branch back to begin
                 let here = def.body.len();
                 patch_cbz(&mut def.body, wcbz, here); // while's exit → after repeat
+            }
+            "do" => {
+                crate::aenc::emit_do(&mut def.body);
+                def.cf.push(Cf::Do(def.body.len())); // loop body top
+            }
+            "loop" => {
+                let top = match def.cf.pop() {
+                    Some(Cf::Do(t)) => t,
+                    _ => anyhow::bail!("`loop` without `do`"),
+                };
+                crate::aenc::emit_loop(&mut def.body, top);
+            }
+            "+loop" => {
+                let top = match def.cf.pop() {
+                    Some(Cf::Do(t)) => t,
+                    _ => anyhow::bail!("`+loop` without `do`"),
+                };
+                crate::aenc::emit_plus_loop(&mut def.body, top);
             }
             _ => unreachable!(),
         }

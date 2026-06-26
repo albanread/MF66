@@ -20,6 +20,8 @@ pub const PRIMITIVES: &[(&str, &str, bool)] = &[
     ("2>r", "two_to_r", false),
     ("2r>", "two_r_from", false),
     ("2r@", "two_r_fetch", false),
+    ("i", "i_word", false),
+    ("j", "j_word", false),
     ("2rdrop", "two_rdrop", false),
     ("rp@", "rp_fetch", false),
     ("rp!", "rp_store", false),
