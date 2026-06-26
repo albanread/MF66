@@ -137,339 +137,451 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
     out
 }
 
-const TOS: u32 = 0; // x0 — always holds the top of stack within a window
+const TOS: u32 = 0; // canonical top-of-stack register (x0) at window boundaries
 const DSP: u32 = 19;
 const LP: u32 = 21; // locals-frame pointer
 const UP: u32 = 20; // user-area base
 const USER_SELF: u32 = 0x1830; // OOP receiver slot in the user area
-const POOL: [u32; 7] = [9, 10, 11, 12, 13, 14, 15]; // register window below TOS
+const POOL: [u32; 7] = [9, 10, 11, 12, 13, 14, 15]; // register window pool
 
-/// Register-windowing lowerer (O2). The invariant: TOS is in x0; the next cells
-/// down live in `below` registers (below[0] = NOS); cells beyond the window are in
-/// memory. Memory is touched lazily — only when a value must be pulled in, when
-/// the pool overflows, or at a window boundary (`settle`: before a Call and at the
-/// end). This replaces O1's per-op ldr/str with register-resident stack cells.
+
+/// A virtual-stack value location: a known constant (not yet in a register) or a
+/// pool register. Constants are deferred until consumed; permutations only move
+/// `Loc`s around `vs` with no emitted code (WF66's "stack motion is bookkeeping").
+#[derive(Clone, Copy, PartialEq)]
+enum Loc {
+    Const(i64),
+    Reg(u32),
+}
+
+/// The deferred-assembly lowerer. `vs` is the virtual stack (vs.last() = TOS); a
+/// value lives as a `Const` or in a pool register (each register is referenced by
+/// at most one `vs` entry — duplications copy). Below `vs` is the entry stack in
+/// memory, `consumed` cells of which have been pulled in. Code is emitted only
+/// when a value is consumed (arithmetic / memory / call) or forced to canonical
+/// memory at a window boundary (`settle`). Stack words are pure `vs` reshuffles.
 struct Low<'a> {
     out: &'a mut Vec<u32>,
-    below: Vec<u32>, // registers below TOS; below[0] = NOS
-    consumed: i64,   // memory cells pulled from below the window (cells)
+    vs: Vec<Loc>,
+    used: [bool; 32], // which registers are live (in vs or a transient)
+    consumed: i64,    // entry-memory cells pulled below the window
 }
 
 impl<'a> Low<'a> {
     fn new(out: &'a mut Vec<u32>) -> Self {
-        Low { out, below: Vec::new(), consumed: 0 }
+        // The incoming canonical form has TOS in x0; the rest is in memory.
+        let mut used = [false; 32];
+        used[0] = true;
+        Low { out, vs: vec![Loc::Reg(0)], used, consumed: 0 }
     }
 
-    /// A pool register not currently in the window (settling first if all are in use).
+    fn nfree(&self) -> usize {
+        POOL.iter().filter(|&&r| !self.used[r as usize]).count()
+    }
+
     fn alloc(&mut self) -> u32 {
-        if let Some(&r) = POOL.iter().find(|r| !self.below.contains(r)) {
-            return r;
-        }
-        self.settle();
-        POOL[0]
-    }
-
-    /// Remove NOS (below[0]) into a register, pulling it from memory if the window
-    /// is empty. The returned register is no longer part of the window.
-    fn pop_nos(&mut self) -> u32 {
-        if !self.below.is_empty() {
-            return self.below.remove(0);
-        }
-        let r = self.alloc();
-        self.out.push(ldr_off(r, DSP, (self.consumed * 8) as u32));
-        self.consumed += 1;
+        let r = *POOL.iter().find(|&&r| !self.used[r as usize]).expect("alloc: no free reg");
+        self.used[r as usize] = true;
         r
     }
 
-    /// Ensure NOS is resident in the window and return its register (kept in place).
-    fn ensure_nos(&mut self) -> u32 {
-        if self.below.is_empty() {
-            let r = self.alloc();
-            self.out.push(ldr_off(r, DSP, (self.consumed * 8) as u32));
-            self.consumed += 1;
-            self.below.insert(0, r);
-        }
-        self.below[0]
+    fn freer(&mut self, r: u32) {
+        self.used[r as usize] = false;
     }
 
-    /// Ensure the window holds at least `n` cells below TOS, pulling the deepest
-    /// from memory as needed (each appended at the bottom of the window).
-    fn ensure_below(&mut self, n: usize) {
-        while self.below.len() < n {
-            let r = self.alloc();
-            self.out.push(ldr_off(r, DSP, (self.consumed * 8) as u32));
-            self.consumed += 1;
-            self.below.push(r);
+    fn free_loc(&mut self, l: Loc) {
+        if let Loc::Reg(r) = l {
+            self.used[r as usize] = false;
         }
     }
 
-    /// Push the current TOS down into the window (caller then sets the new TOS).
-    fn push_down(&mut self) {
-        let r = self.alloc();
-        self.out.push(mov_reg(r, TOS));
-        self.below.insert(0, r);
-    }
-
-    /// A transient scratch register (not tracked in the window).
-    fn scratch(&mut self) -> u32 {
-        self.alloc()
-    }
-
-    /// Settle the window if fewer than `need` pool registers are free, so an op
-    /// that holds window cells across an `alloc` won't have them spilled mid-op.
-    fn settle_if_tight(&mut self, need: usize) {
-        if POOL.len() - self.below.len() < need {
+    /// Ensure `n` free pool registers, settling the window to memory if not. Call
+    /// at the START of an op (while `vs` is consistent) so later allocs never settle.
+    fn reserve(&mut self, n: usize) {
+        if self.nfree() < n {
             self.settle();
         }
     }
 
-    /// Write the window back to memory in canonical form (TOS stays in x0); reset.
-    fn settle(&mut self) {
-        let l = self.below.len() as i64;
-        let delta = self.consumed - l; // net DSP change, in cells
-        if delta > 0 {
-            self.out.push(add_imm(DSP, DSP, (delta * 8) as u32));
-        } else if delta < 0 {
-            self.out.push(sub_imm(DSP, DSP, ((-delta) * 8) as u32));
+    /// Ensure the window holds at least `n` cells, pulling from entry memory.
+    fn ensure(&mut self, n: usize) {
+        while self.vs.len() < n {
+            let r = self.alloc();
+            self.out.push(ldr_off(r, DSP, (self.consumed * 8) as u32));
+            self.consumed += 1;
+            self.vs.insert(0, Loc::Reg(r)); // deeper than the existing window
         }
-        for i in 0..self.below.len() {
-            self.out.push(str_off(self.below[i], DSP, (i as u32) * 8)); // below[0]=NOS@[DSP]
-        }
-        self.below.clear();
-        self.consumed = 0;
     }
 
-    fn lit(&mut self, n: i64) {
-        self.push_down();
-        load_imm64(TOS, n as u64, self.out);
-    }
-
-    fn bin(&mut self, op: Bin) {
-        let r = self.pop_nos();
-        self.out.push(match op {
-            Bin::Add => add_reg(TOS, TOS, r),
-            Bin::Sub => sub_reg(TOS, r, TOS), // NOS - TOS
-            Bin::Mul => mul(TOS, TOS, r),
-            Bin::And => and_reg(TOS, TOS, r),
-            Bin::Or => orr_reg(TOS, TOS, r),
-            Bin::Xor => eor_reg(TOS, TOS, r),
-        });
-    }
-
-    fn imm_bin(&mut self, op: Bin, k: i64) {
-        let small = (0..=4095).contains(&k);
-        let nsmall = (-4095..0).contains(&k);
-        match op {
-            Bin::Add if small => self.out.push(add_imm(TOS, TOS, k as u32)),
-            Bin::Add if nsmall => self.out.push(sub_imm(TOS, TOS, (-k) as u32)),
-            Bin::Sub if small => self.out.push(sub_imm(TOS, TOS, k as u32)),
-            Bin::Sub if nsmall => self.out.push(add_imm(TOS, TOS, (-k) as u32)),
-            _ => {
-                let r = self.scratch();
-                load_imm64(r, k as u64, self.out);
-                self.out.push(match op {
-                    Bin::Add => add_reg(TOS, TOS, r),
-                    Bin::Sub => sub_reg(TOS, TOS, r), // TOS - k
-                    Bin::Mul => mul(TOS, TOS, r),
-                    Bin::And => and_reg(TOS, TOS, r),
-                    Bin::Or => orr_reg(TOS, TOS, r),
-                    Bin::Xor => eor_reg(TOS, TOS, r),
-                });
+    /// A value in a register (a `Const` is loaded into a fresh register).
+    fn to_reg(&mut self, l: Loc) -> u32 {
+        match l {
+            Loc::Reg(r) => r,
+            Loc::Const(n) => {
+                let r = self.alloc();
+                load_imm64(r, n as u64, self.out);
+                r
             }
         }
     }
 
-    fn dup_bin(&mut self, op: Bin) {
-        match op {
-            Bin::Add => self.out.push(add_reg(TOS, TOS, TOS)),
-            Bin::Mul => self.out.push(mul(TOS, TOS, TOS)),
-            Bin::And | Bin::Or => {} // a&a = a|a = a
-            Bin::Sub | Bin::Xor => self.out.push(movz(TOS, 0, 0)), // 0
+    /// A copy of a value (constants are free; registers cost one `mov`).
+    fn copy_of(&mut self, l: Loc) -> Loc {
+        match l {
+            Loc::Const(n) => Loc::Const(n),
+            Loc::Reg(r) => {
+                let r2 = self.alloc();
+                self.out.push(mov_reg(r2, r));
+                Loc::Reg(r2)
+            }
         }
+    }
+
+    fn lit(&mut self, n: i64) {
+        self.vs.push(Loc::Const(n)); // deferred — no code
     }
 
     fn stk(&mut self, s: Stk) {
         match s {
-            Stk::Dup => {
-                let r = self.alloc();
-                self.out.push(mov_reg(r, TOS));
-                self.below.insert(0, r);
-            }
+            Stk::Dup => self.pick_n(0),
+            Stk::Over => self.pick_n(1),
+            Stk::Swap => self.roll_n(1),
+            Stk::Rot => self.roll_n(2),
             Stk::Drop => {
-                let r = self.pop_nos();
-                self.out.push(mov_reg(TOS, r));
-            }
-            Stk::Swap => {
-                self.settle_if_tight(2); // need NOS + a distinct scratch
-                let n = self.ensure_nos();
-                let t = self.scratch(); // ≠ n (scratch avoids window regs)
-                self.out.push(mov_reg(t, TOS));
-                self.out.push(mov_reg(TOS, n));
-                self.out.push(mov_reg(n, t));
-            }
-            Stk::Over => {
-                self.settle_if_tight(2); // need NOS kept + a push-down reg
-                let _ = self.ensure_nos(); // a = below[0]
-                self.push_down(); // b -> below[0]; a now at below[1]
-                let a = self.below[1];
-                self.out.push(mov_reg(TOS, a));
+                self.ensure(1);
+                let t = self.vs.pop().unwrap();
+                self.free_loc(t);
             }
             Stk::Nip => {
-                if self.below.is_empty() {
-                    self.consumed += 1; // skip the memory NOS
-                } else {
-                    self.below.remove(0);
-                }
-            }
-            Stk::Rot => {
-                // ( a b c -- b c a ): TOS=c below=[b,a]  →  TOS=a below=[c,b]
-                self.settle_if_tight(3);
-                self.ensure_below(2);
-                let a = self.below[1];
-                let rc = self.scratch();
-                self.out.push(mov_reg(rc, TOS)); // rc = c
-                self.out.push(mov_reg(TOS, a)); // TOS = a
-                self.below[1] = self.below[0]; // below[1] = b
-                self.below[0] = rc; // below[0] = c
+                self.ensure(2);
+                let n = self.vs.len();
+                let u = self.vs.remove(n - 2);
+                self.free_loc(u);
             }
             Stk::MinusRot => {
-                // ( a b c -- c a b ): TOS=c below=[b,a]  →  TOS=b below=[a,c]
-                self.settle_if_tight(3);
-                self.ensure_below(2);
-                let b = self.below[0];
-                let rc = self.scratch();
-                self.out.push(mov_reg(rc, TOS)); // rc = c
-                self.out.push(mov_reg(TOS, b)); // TOS = b
-                self.below[0] = self.below[1]; // below[0] = a
-                self.below[1] = rc; // below[1] = c
+                // ( a b c -- c a b )
+                self.ensure(3);
+                let n = self.vs.len();
+                let c = self.vs.pop().unwrap();
+                self.vs.insert(n - 3, c);
             }
             Stk::Tuck => {
-                // ( a b -- b a b ): TOS=b below=[a]  →  TOS=b below=[a, b']
-                self.settle_if_tight(2);
-                self.ensure_below(1);
-                let rc = self.scratch();
-                self.out.push(mov_reg(rc, TOS)); // rc = copy of b
-                self.below.insert(1, rc);
+                // ( a b -- b a b )
+                self.reserve(3);
+                self.ensure(2);
+                let n = self.vs.len();
+                let top = self.vs[n - 1];
+                let c = self.copy_of(top);
+                self.vs.insert(n - 2, c);
+            }
+        }
+    }
+
+    /// `N pick` — copy the item at depth N to TOS (0 = dup, 1 = over).
+    fn pick_n(&mut self, n: u32) {
+        let n = n as usize;
+        self.reserve(n + 2);
+        self.ensure(n + 1);
+        let src = self.vs[self.vs.len() - 1 - n];
+        let c = self.copy_of(src);
+        self.vs.push(c);
+    }
+
+    /// `N roll` — move the item at depth N to TOS (1 = swap, 2 = rot).
+    fn roll_n(&mut self, n: u32) {
+        if n == 0 {
+            return; // identity
+        }
+        let n = n as usize;
+        self.reserve(n + 1);
+        self.ensure(n + 1);
+        let idx = self.vs.len() - 1 - n;
+        let item = self.vs.remove(idx);
+        self.vs.push(item); // pure move — no code
+    }
+
+    /// `add_imm`/`sub_imm` of a single operand by constant `k` (Add/Sub only).
+    fn imm_bin_to(&mut self, operand: Loc, op: Bin, k: i64) -> Option<u32> {
+        let (add, imm) = match op {
+            Bin::Add if (0..=4095).contains(&k) => (true, k as u32),
+            Bin::Add if (-4095..0).contains(&k) => (false, (-k) as u32),
+            Bin::Sub if (0..=4095).contains(&k) => (false, k as u32),
+            Bin::Sub if (-4095..0).contains(&k) => (true, (-k) as u32),
+            _ => return None,
+        };
+        let r = self.to_reg(operand);
+        self.out.push(if add { add_imm(r, r, imm) } else { sub_imm(r, r, imm) });
+        Some(r)
+    }
+
+    fn bin(&mut self, op: Bin) {
+        self.reserve(4);
+        self.ensure(2);
+        let b = self.vs.pop().unwrap(); // TOS
+        let a = self.vs.pop().unwrap(); // NOS
+        // const-fold
+        if let (Loc::Const(x), Loc::Const(y)) = (a, b) {
+            self.vs.push(Loc::Const(op.eval(x, y)));
+            return;
+        }
+        // immediate-fold: result = a <op> b
+        if let Loc::Const(k) = b {
+            if let Some(rd) = self.imm_bin_to(a, op, k) {
+                self.vs.push(Loc::Reg(rd));
+                return;
+            }
+        }
+        if let Loc::Const(k) = a {
+            if op == Bin::Add {
+                if let Some(rd) = self.imm_bin_to(b, Bin::Add, k) {
+                    self.vs.push(Loc::Reg(rd));
+                    return;
+                }
+            }
+        }
+        // general: a <op> b into a register (reuse a's)
+        let ra = self.to_reg(a);
+        let rb = self.to_reg(b);
+        self.out.push(match op {
+            Bin::Add => add_reg(ra, ra, rb),
+            Bin::Sub => sub_reg(ra, ra, rb), // a - b
+            Bin::Mul => mul(ra, ra, rb),
+            Bin::And => and_reg(ra, ra, rb),
+            Bin::Or => orr_reg(ra, ra, rb),
+            Bin::Xor => eor_reg(ra, ra, rb),
+        });
+        self.freer(rb); // b consumed (rb != ra: no aliasing)
+        self.vs.push(Loc::Reg(ra));
+    }
+
+    /// `TOS op= k` (reduced `Lit k, Bin`).
+    fn imm_bin(&mut self, op: Bin, k: i64) {
+        self.reserve(2);
+        self.ensure(1);
+        let a = self.vs.pop().unwrap();
+        if let Loc::Const(x) = a {
+            self.vs.push(Loc::Const(op.eval(x, k)));
+            return;
+        }
+        if let Some(rd) = self.imm_bin_to(a, op, k) {
+            self.vs.push(Loc::Reg(rd));
+            return;
+        }
+        let r = self.to_reg(a);
+        let t = self.alloc();
+        load_imm64(t, k as u64, self.out);
+        self.out.push(match op {
+            Bin::Add => add_reg(r, r, t),
+            Bin::Sub => sub_reg(r, r, t),
+            Bin::Mul => mul(r, r, t),
+            Bin::And => and_reg(r, r, t),
+            Bin::Or => orr_reg(r, r, t),
+            Bin::Xor => eor_reg(r, r, t),
+        });
+        self.freer(t);
+        self.vs.push(Loc::Reg(r));
+    }
+
+    /// `dup` then `op` — the value combined with itself (reduced `Dup, Bin`).
+    fn dup_bin(&mut self, op: Bin) {
+        self.reserve(2);
+        self.ensure(1);
+        let a = self.vs.pop().unwrap();
+        if let Loc::Const(x) = a {
+            self.vs.push(Loc::Const(op.eval(x, x)));
+            return;
+        }
+        match op {
+            Bin::Add => {
+                let r = self.to_reg(a);
+                self.out.push(add_reg(r, r, r)); // 2a
+                self.vs.push(Loc::Reg(r));
+            }
+            Bin::Mul => {
+                let r = self.to_reg(a);
+                self.out.push(mul(r, r, r)); // a*a
+                self.vs.push(Loc::Reg(r));
+            }
+            Bin::And | Bin::Or => self.vs.push(a), // a&a = a|a = a
+            Bin::Sub | Bin::Xor => {
+                self.free_loc(a);
+                self.vs.push(Loc::Const(0)); // a-a = a^a = 0
             }
         }
     }
 
     fn cmp(&mut self, c: Cmp) {
+        self.reserve(4);
         match c {
-            Cmp::ZEq => {
-                self.out.push(cmp_imm(TOS, 0));
-                self.out.push(csetm(TOS, EQ));
-            }
-            Cmp::ZNe => {
-                self.out.push(cmp_imm(TOS, 0));
-                self.out.push(csetm(TOS, NE));
-            }
-            Cmp::ZLt => {
-                self.out.push(cmp_imm(TOS, 0));
-                self.out.push(csetm(TOS, LT));
-            }
-            Cmp::ZGt => {
-                self.out.push(cmp_imm(TOS, 0));
-                self.out.push(csetm(TOS, GT));
+            Cmp::ZEq | Cmp::ZNe | Cmp::ZLt | Cmp::ZGt => {
+                self.ensure(1);
+                let a = self.vs.pop().unwrap();
+                let r = self.to_reg(a);
+                let cond = match c {
+                    Cmp::ZEq => EQ,
+                    Cmp::ZNe => NE,
+                    Cmp::ZLt => LT,
+                    _ => GT,
+                };
+                self.out.push(cmp_imm(r, 0));
+                self.out.push(csetm(r, cond));
+                self.vs.push(Loc::Reg(r));
             }
             _ => {
-                let n = self.pop_nos();
+                self.ensure(2);
+                let b = self.vs.pop().unwrap();
+                let a = self.vs.pop().unwrap();
+                let ra = self.to_reg(a);
+                let rb = self.to_reg(b);
                 let (rn, rm, cond) = match c {
-                    Cmp::Eq => (TOS, n, EQ),
-                    Cmp::Ne => (TOS, n, NE),
-                    Cmp::Lt => (n, TOS, LT), // NOS < TOS
-                    Cmp::Gt => (n, TOS, GT),
-                    Cmp::Le => (n, TOS, LE),
-                    Cmp::Ge => (n, TOS, GE),
-                    Cmp::ULt => (n, TOS, LO),
-                    Cmp::UGt => (n, TOS, HI),
+                    Cmp::Eq => (ra, rb, EQ),
+                    Cmp::Ne => (ra, rb, NE),
+                    Cmp::Lt => (ra, rb, LT), // a < b
+                    Cmp::Gt => (ra, rb, GT),
+                    Cmp::Le => (ra, rb, LE),
+                    Cmp::Ge => (ra, rb, GE),
+                    Cmp::ULt => (ra, rb, LO),
+                    Cmp::UGt => (ra, rb, HI),
                     _ => unreachable!(),
                 };
                 self.out.push(cmp_reg(rn, rm));
-                self.out.push(csetm(TOS, cond));
+                self.out.push(csetm(ra, cond));
+                self.freer(rb);
+                self.vs.push(Loc::Reg(ra));
+            }
+        }
+    }
+
+    fn mem(&mut self, m: Mem) {
+        self.reserve(3);
+        match m {
+            Mem::Fetch => {
+                self.ensure(1);
+                let a = self.vs.pop().unwrap();
+                let r = self.to_reg(a);
+                self.out.push(ldr0(r, r));
+                self.vs.push(Loc::Reg(r));
+            }
+            Mem::CFetch => {
+                self.ensure(1);
+                let a = self.vs.pop().unwrap();
+                let r = self.to_reg(a);
+                self.out.push(ldrb0(r, r));
+                self.vs.push(Loc::Reg(r));
+            }
+            Mem::Store => {
+                // ( x addr -- )
+                self.ensure(2);
+                let addr = self.vs.pop().unwrap();
+                let x = self.vs.pop().unwrap();
+                let raddr = self.to_reg(addr);
+                let rx = self.to_reg(x);
+                self.out.push(str_off(rx, raddr, 0));
+                self.freer(rx);
+                self.freer(raddr);
+            }
+            Mem::CStore => {
+                self.ensure(2);
+                let addr = self.vs.pop().unwrap();
+                let x = self.vs.pop().unwrap();
+                let raddr = self.to_reg(addr);
+                let rx = self.to_reg(x);
+                self.out.push(strb0(rx, raddr));
+                self.freer(rx);
+                self.freer(raddr);
             }
         }
     }
 
     fn local_fetch(&mut self, i: u32) {
-        self.push_down();
-        self.out.push(ldr_off(TOS, LP, i * 8));
+        self.reserve(1);
+        let r = self.alloc();
+        self.out.push(ldr_off(r, LP, i * 8));
+        self.vs.push(Loc::Reg(r));
     }
 
     fn local_store(&mut self, i: u32) {
-        self.out.push(str_off(TOS, LP, i * 8)); // local[i] = TOS
-        let r = self.pop_nos(); // drop TOS, raise NOS
-        self.out.push(mov_reg(TOS, r));
-    }
-
-    fn self_push(&mut self) {
-        self.push_down();
-        self.out.push(ldr_off(TOS, UP, USER_SELF)); // TOS = [UP + user_SELF]
-    }
-
-    /// `N pick` — copy the item at depth N to a new TOS.
-    fn pick_n(&mut self, n: u32) {
-        if n == 0 {
-            return self.stk(Stk::Dup);
-        }
-        let n = n as usize;
-        self.settle_if_tight(n + 1);
-        self.ensure_below(n); // below[0..n-1] resident
-        self.push_down(); // old TOS → below[0]; depth-n item now at below[n]
-        let src = self.below[n];
-        self.out.push(mov_reg(TOS, src));
-    }
-
-    /// `N roll` — move the item at depth N to TOS, shifting the rest down.
-    fn roll_n(&mut self, n: u32) {
-        if n == 0 {
-            return; // 0 roll is identity
-        }
-        let n = n as usize;
-        self.settle_if_tight(n + 1);
-        self.ensure_below(n);
-        let item = self.below[n - 1]; // depth-n item
-        let r = self.scratch();
-        self.out.push(mov_reg(r, TOS)); // r = old TOS (becomes depth 1)
-        self.out.push(mov_reg(TOS, item)); // TOS = depth-n item
-        for i in (1..n).rev() {
-            self.below[i] = self.below[i - 1]; // shift down one depth
-        }
-        self.below[0] = r;
+        self.reserve(2);
+        self.ensure(1);
+        let a = self.vs.pop().unwrap();
+        let r = self.to_reg(a);
+        self.out.push(str_off(r, LP, i * 8));
+        self.freer(r);
     }
 
     fn ivar_fetch(&mut self, off: u32) {
-        self.push_down();
-        let r = self.alloc(); // transient: the SELF base
-        self.out.push(ldr_off(r, UP, USER_SELF));
-        self.out.push(ldr_off(TOS, r, off)); // TOS = [SELF + off]
+        self.reserve(1);
+        let r = self.alloc();
+        self.out.push(ldr_off(r, UP, USER_SELF)); // r = SELF
+        self.out.push(ldr_off(r, r, off)); // r = [SELF + off]
+        self.vs.push(Loc::Reg(r));
     }
 
     fn ivar_store(&mut self, off: u32) {
-        let r = self.scratch(); // SELF base (transient)
-        self.out.push(ldr_off(r, UP, USER_SELF));
-        self.out.push(str_off(TOS, r, off)); // [SELF + off] = TOS
-        let v = self.pop_nos(); // drop TOS, raise NOS
-        self.out.push(mov_reg(TOS, v));
+        self.reserve(2);
+        self.ensure(1);
+        let a = self.vs.pop().unwrap();
+        let rv = self.to_reg(a);
+        let rs = self.alloc();
+        self.out.push(ldr_off(rs, UP, USER_SELF));
+        self.out.push(str_off(rv, rs, off));
+        self.freer(rv);
+        self.freer(rs);
     }
 
-    fn mem(&mut self, m: Mem) {
-        match m {
-            Mem::Fetch => self.out.push(ldr0(TOS, TOS)),
-            Mem::CFetch => self.out.push(ldrb0(TOS, TOS)),
-            Mem::Store => {
-                let v = self.pop_nos();
-                self.out.push(str_off(v, TOS, 0)); // [addr] = value
-                let nt = self.pop_nos();
-                self.out.push(mov_reg(TOS, nt)); // drop addr → new TOS
-            }
-            Mem::CStore => {
-                let v = self.pop_nos();
-                self.out.push(strb0(v, TOS));
-                let nt = self.pop_nos();
-                self.out.push(mov_reg(TOS, nt));
+    fn self_push(&mut self) {
+        self.reserve(1);
+        let r = self.alloc();
+        self.out.push(ldr_off(r, UP, USER_SELF));
+        self.vs.push(Loc::Reg(r));
+    }
+
+    /// Write the virtual stack back to the canonical form (TOS in x0, the rest in
+    /// memory from DSP) and reset. Called before a Call and at the run's end.
+    fn settle(&mut self) {
+        if self.vs.is_empty() {
+            self.ensure(1); // materialize a TOS from entry memory
+        }
+        let l = self.vs.len();
+        let delta = self.consumed - (l as i64 - 1); // DSP change in cells
+        if delta > 0 {
+            self.out.push(add_imm(DSP, DSP, (delta * 8) as u32));
+        } else if delta < 0 {
+            self.out.push(sub_imm(DSP, DSP, ((-delta) * 8) as u32));
+        }
+        // Pass 1: store deep register entries (freeing their regs), reading x0
+        // before it is overwritten by the new TOS.
+        for i in 0..l - 1 {
+            if let Loc::Reg(r) = self.vs[i] {
+                let off = ((l - 2 - i) as u32) * 8;
+                self.out.push(str_off(r, DSP, off));
+                self.freer(r);
             }
         }
+        // The new TOS goes to x0.
+        match self.vs[l - 1] {
+            Loc::Reg(0) => {}
+            Loc::Reg(r) => {
+                self.out.push(mov_reg(TOS, r));
+                self.freer(r);
+            }
+            Loc::Const(n) => load_imm64(TOS, n as u64, self.out),
+        }
+        // Pass 2: store deep constant entries via a now-free scratch register.
+        for i in 0..l - 1 {
+            if let Loc::Const(n) = self.vs[i] {
+                let off = ((l - 2 - i) as u32) * 8;
+                let t = self.alloc();
+                load_imm64(t, n as u64, self.out);
+                self.out.push(str_off(t, DSP, off));
+                self.freer(t);
+            }
+        }
+        self.vs.clear();
+        self.vs.push(Loc::Reg(0));
+        self.used = [false; 32];
+        self.used[0] = true;
+        self.consumed = 0;
     }
 }
 
@@ -512,9 +624,10 @@ pub fn fused_cmp(c: Cmp, out: &mut Vec<u32>) -> u32 {
     }
 }
 
-/// Lower one reduced token run to AArch64 with register windowing (appended to
-/// `out`). Settles before each call and at the end so the canonical TOS=x0 /
-/// rest-in-memory form holds at every window boundary.
+/// Lower one straight-line token run to AArch64 with the deferred virtual-stack
+/// model (appended to `out`). Constants and stack motion stay virtual; code is
+/// emitted only at consume/settle. Settles before each call and at the end so the
+/// canonical TOS=x0 / rest-in-memory form holds at every window boundary.
 pub fn lower(toks: &[Tok], out: &mut Vec<u32>) {
     let mut low = Low::new(out);
     for &t in toks {
@@ -576,3 +689,4 @@ mod tests {
         assert!(r.is_empty());
     }
 }
+
