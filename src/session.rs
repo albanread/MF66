@@ -140,6 +140,8 @@ struct ColonDef {
     locals: Vec<String>,
     /// `:noname` — finish pushes the xt instead of creating a header.
     noname: bool,
+    /// The code address this body will commit to (for `recurse`).
+    self_xt: u64,
 }
 
 /// A pending control-flow mark (compile time).
@@ -256,6 +258,9 @@ impl Mf66Session {
         self.eval(": floats cells ;")?;
         self.eval(": faligned aligned ;")?;
         self.eval(": falign ;")?; // data space is already cell-aligned
+        // Misc Core-ext composed from existing primitives.
+        self.eval(": ?: rot if drop else nip then ;")?; // ( f a b -- a|b )
+        self.eval(": ?negate 0< if negate then ;")?; // ( n1 n2 -- n1|-n1 )
         Ok(())
     }
 
@@ -450,6 +455,48 @@ impl Mf66Session {
                 continue;
             }
             let lk = tok.to_ascii_lowercase(); // Forth is case-insensitive
+            // [if] / [else] / [then] — conditional compilation (token skipping).
+            if lk == "[if]" {
+                let flag = self.pop_data().unwrap_or(0);
+                if flag == 0 {
+                    // skip the true-branch up to the matching [else] or [then]
+                    let mut depth = 0;
+                    for t in tokens.by_ref() {
+                        match t.to_ascii_lowercase().as_str() {
+                            "[if]" => depth += 1,
+                            "[else]" if depth == 0 => break,
+                            "[then]" => {
+                                if depth == 0 {
+                                    break;
+                                }
+                                depth -= 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                continue;
+            }
+            if lk == "[else]" {
+                // reached after a taken true-branch: skip to the matching [then]
+                let mut depth = 0;
+                for t in tokens.by_ref() {
+                    match t.to_ascii_lowercase().as_str() {
+                        "[if]" => depth += 1,
+                        "[then]" => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if lk == "[then]" {
+                continue;
+            }
             // [ … ] literal — compile-time interpretation inside a definition.
             if lk == "[" && self.pending.is_some() {
                 self.bracket_interpret = true;
@@ -691,6 +738,7 @@ impl Mf66Session {
                 };
                 let mut body = Vec::new();
                 crate::aenc::emit_nest(&mut body);
+                let self_xt = self.code.next_addr();
                 self.pending = Some(ColonDef {
                     name,
                     body,
@@ -698,6 +746,7 @@ impl Mf66Session {
                     toks: Vec::new(),
                     locals: Vec::new(),
                     noname: lk == ":noname",
+                    self_xt,
                 });
             } else if lk == "2constant" {
                 let name = tokens
@@ -799,6 +848,12 @@ impl Mf66Session {
         // A bare ivar name (inside a method body) compiles to a SELF-relative fetch.
         if let Some(off) = self.ivar_offset(tok) {
             self.pending.as_mut().unwrap().toks.push(Tok::IvarFetch(off));
+            return Ok(());
+        }
+        // `recurse` — compile a call to the definition currently being built.
+        if tok.eq_ignore_ascii_case("recurse") {
+            let xt = self.pending.as_ref().unwrap().self_xt;
+            self.pending.as_mut().unwrap().toks.push(Tok::Call(xt));
             return Ok(());
         }
         // `super` inside a method: push self and mark the next `->` as a super send.
@@ -1204,6 +1259,7 @@ impl Mf66Session {
         self.selector_id(selector); // assign a stable id
         let mut body = Vec::new();
         crate::aenc::emit_nest(&mut body);
+        let self_xt = self.code.next_addr();
         self.pending = Some(ColonDef {
             name: selector.to_string(), // method bodies reuse `name` to hold the selector
             body,
@@ -1211,6 +1267,7 @@ impl Mf66Session {
             toks: Vec::new(),
             locals: Vec::new(),
             noname: false,
+            self_xt,
         });
         self.method_class = Some(class);
         Ok(())

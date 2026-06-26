@@ -51,6 +51,13 @@ impl CodeArena {
         Ok(CodeArena { region: region as *mut u8, cap, cursor: 0 })
     }
 
+    /// The address the next `commit` will return (16-byte aligned) — used by
+    /// `recurse` to call a definition before its body is committed.
+    pub fn next_addr(&self) -> u64 {
+        let start = (self.cursor + 15) & !15;
+        unsafe { self.region.add(start) as u64 }
+    }
+
     /// Copy `words` in as executable code (16-byte aligned); return its address.
     pub fn commit(&mut self, words: &[u32]) -> Result<u64> {
         let start = (self.cursor + 15) & !15;
