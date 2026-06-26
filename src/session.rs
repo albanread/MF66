@@ -95,6 +95,8 @@ pub struct Mf66Session {
     selectors: Vec<String>,
     /// Named instances → (object base addr, class name).
     objects: HashMap<String, (u64, String)>,
+    /// `value` names → the data cell holding the value (for `to`).
+    values: HashMap<String, u64>,
     /// Class being built between `class`/`subclass` and `end-class`.
     pending_class: Option<ClassInfo>,
     /// While compiling a `:m` method body: the owning class name (ivar scope).
@@ -213,6 +215,7 @@ impl Mf66Session {
             method_class: None,
             super_pending: false,
             bracket_interpret: false,
+            values: HashMap::new(),
             last_receiver_class: None,
             dnu_xt: 0,
             send_xt: 0,
@@ -415,6 +418,23 @@ impl Mf66Session {
     pub fn publish_constant(&mut self, name: &str, value: i64) -> Result<u64> {
         let mut body = Vec::new();
         crate::aenc::emit_lit(value, &mut body); // push old TOS, TOS = value
+        body.push(crate::aenc::ret());
+        let xt = self.code.commit(&body)?;
+        self.push_name(name);
+        self.call("create")?;
+        let header = self.read_user(USER_LATEST);
+        self.write_u64(header + DH_XTPTR, xt);
+        self.write_u8(header + DH_TFA, TFA_TCOL);
+        Ok(xt)
+    }
+
+    /// Publish `name` as a `value` — a word that fetches its data cell at runtime
+    /// (body = spill TOS, load cell addr, ldr). `to name` rewrites the cell.
+    pub fn publish_value(&mut self, name: &str, cell: u64) -> Result<u64> {
+        let mut body = Vec::new();
+        body.push(crate::aenc::str_pre(0, 19, -8)); // push: spill old TOS
+        crate::aenc::load_imm64(0, cell, &mut body); // TOS = cell addr
+        body.push(crate::aenc::ldr0(0, 0)); // TOS = [cell]
         body.push(crate::aenc::ret());
         let xt = self.code.commit(&body)?;
         self.push_name(name);
@@ -754,6 +774,26 @@ impl Mf66Session {
                     .ok_or_else(|| anyhow::anyhow!("`variable` needs a name"))?;
                 let addr = self.allot_cell();
                 self.publish_constant(name, addr as i64)?;
+            } else if lk == "value" {
+                let name = tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("`value` needs a name"))?;
+                let v = self
+                    .pop_data()
+                    .ok_or_else(|| anyhow::anyhow!("`value` needs an initial value"))?;
+                let cell = self.allot_cell();
+                self.write_u64(cell, v as u64);
+                self.publish_value(name, cell)?;
+                self.values.insert(name.to_string(), cell);
+            } else if lk == "to" && self.pending.is_none() {
+                // interpret-mode `to NAME` — store TOS into a value's cell
+                let name = tokens.next().ok_or_else(|| anyhow::anyhow!("`to` needs a name"))?;
+                let cell = *self
+                    .values
+                    .get(name)
+                    .ok_or_else(|| anyhow::anyhow!("`to {name}` — not a value"))?;
+                let v = self.pop_data().ok_or_else(|| anyhow::anyhow!("`to` needs a value"))?;
+                self.write_u64(cell, v as u64);
             } else if lk == ":" || lk == ":noname" {
                 let name = if lk == ":noname" {
                     String::new()
@@ -856,9 +896,16 @@ impl Mf66Session {
 
     /// `to <local>` — compile a store into the named local.
     fn compile_to(&mut self, target: &str) -> Result<()> {
-        // `to <ivar>` inside a method, else `to <local>`.
+        // `to <ivar>` inside a method, else `to <local>`, else `to <value>`.
         if let Some(off) = self.ivar_offset(target) {
             self.pending.as_mut().unwrap().toks.push(Tok::IvarStore(off));
+            return Ok(());
+        }
+        if let Some(&cell) = self.values.get(target) {
+            // store TOS to the value's cell: ( x -- ) emit Lit(cell), Store
+            let d = self.pending.as_mut().unwrap();
+            d.toks.push(Tok::Lit(cell as i64));
+            d.toks.push(Tok::Mem(crate::opt::Mem::Store));
             return Ok(());
         }
         let def = self.pending.as_ref().unwrap();
@@ -1477,6 +1524,7 @@ impl Mf66Session {
         // OOP: keep the root class + stable selector ids; drop user classes/objects.
         self.classes.retain(|k, _| k == "object");
         self.objects.clear();
+        self.values.clear();
         self.pending_class = None;
         self.method_class = None;
         self.super_pending = false;
