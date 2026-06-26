@@ -24,6 +24,7 @@
 @include "logic.masm"
 @include "compare.masm"
 @include "memory.masm"
+@include "strings.masm"
 
 ; forth_main — the only data-stack-representation translation layer.
 ;

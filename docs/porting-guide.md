@@ -75,6 +75,18 @@ kernel uses NO `b.<cond>` anywhere. Instead:
   scope-local label and is fine; only the `.cond` *suffix on `b`* is the trap.
 - Unconditional `b .label` is fine. Loops use `cbz`/`cbnz`/`tbz`/`tbnz` + `b`.
 
+The same mangler trap applies to **any `.suffix` operand inside a proc**:
+- **No NEON `.arr` operands** (`v0.8b`, `cnt v0.16b`, `uaddlv h0, v0.8b`, …): the
+  `.8b` is eaten as a local label and the mnemonic is corrupted. Do bit-counting
+  etc. with **GPR SWAR** (mask + shift + multiply), not NEON. Scalar FP (`d`/`s`
+  registers, `fadd d0,d1,d2`) is fine — no dotted operands.
+- Also unsupported by the a64 encoder: **extended-register operands**
+  (`cmp w11, w0, uxtb`, `add x0, x1, w2, sxtw`). Pre-mask/extend into a scratch
+  first (`and w12, w0, #0xff`; `sxtw x2, w2`) then use the plain register form.
+- Immediate **expressions don't fold**: `#cell - 1` / `#3*cell` reach the encoder
+  literally and fail. Use the concrete value (`#7`, `#24`). `#cell` alone is fine
+  (it's a define substitution, not arithmetic), as is `#-cell` (→ `#-8`).
+
 ### Flag / comparison idioms → `cmp` + `cset`/`csetm`  (critical)
 
 WF66 produces Forth flags (`0` / `-1`) with `sub`/`sbb` or `setcc` tricks. On

@@ -1,0 +1,886 @@
+; MF66 kernel — string / cell-arithmetic primitives (ported from WF66 kernel/strings.masm).
+; Internal form: TOS in x0, NOS at [DSP] (x19). See docs/porting-guide.md.
+
+; aligned  ( addr -- a-addr )    round UP to next cell boundary.
+;     WF66 source: `add rax, cell-1` then `and rax, -cell` — add the
+;     (cell-1) mask, then clear the low bits to round up to 8.
+proc(aligned)
+    add     TOS, TOS, #7            ; addr + (cell-1) = addr + 7  (concrete imm; a64 imm parser takes no arithmetic)
+    and     TOS, TOS, #-cell        ; &= ~7  (-8 = 0xFFFFFFFFFFFFFFF8, valid logical imm)
+    stk(1, 1)
+    next()
+endp()
+
+proc(bounds)
+    ldr     x9,  [DSP]              ; x9  = addr (old NOS)
+    add     x10, x9, TOS           ; x10 = addr + len = lim
+    str     x10, [DSP]             ; NOS = lim
+    mov     TOS, x9                ; TOS = addr = first
+    stk(2, 2)
+    next()
+endp()
+
+; c+place  ( char dest -- )    append one character to a counted string.
+proc(c_plus_place)
+    ldrb    w9,  [TOS]              ; w9  = current count byte at dest (zero-extended), like movzx edx,[rax]
+    ldr     x10, [DSP]             ; x10 = char (NOS), like mov rcx,[rbp]
+    add     w11, w9, #1
+    strb    w11, [TOS]             ; dest count byte += 1, like add byte ptr [rax],1
+    and     w10, w10, #0xff        ; low byte = char, high byte 0 -> the trailing NUL of the 16-bit store
+    add     x12, TOS, x9           ; x12 = dest + old_len
+    strh    w10, [x12, #1]         ; write char then NUL at dest[old_len+1], like mov word ptr [rax+rdx+1],cx
+    ldr     TOS, [DSP, #cell]      ; new TOS = NNOS, like mov rax,[rbp+cell]
+    stk(2, 0)
+    next()
+endp()
+
+; cell-  ( addr -- addr-cell )   decrement TOS by one cell
+proc(cell_minus)
+    sub     TOS, TOS, #cell         ; x0 = addr - 8
+    stk(1, 1)
+    next()
+endp()
+
+; cell+  ( addr -- addr+cell )   ; advance an address by one cell
+proc(cell_plus)
+    add     TOS, TOS, #cell         ; addr += 8 (x86: add rax, cell)
+    stk(1, 1)
+    next()
+endp()
+
+; cells  ( n -- n*cell )   multiply by cell-size (8 on WF64)
+;     WF66 source: `shl rax, 3` — left-shift by log2(cell)=3.
+proc(cells)
+    lsl     TOS, TOS, #3          ; TOS = n * 8  (n << 3)
+    stk(1, 1)
+    next()
+endp()
+
+; cells-  ( addr n -- addr-n*cell )
+proc(cells_minus)
+    lsl     x9, TOS, #3           ; x9 = n * cell  (cell=8, so shift left 3)
+    ldr     x10, [DSP]            ; x10 = NOS (addr)
+    sub     TOS, x10, x9          ; TOS = addr - n*cell
+    stk(2, 1)
+    next()
+endp()
+
+; cells+  ( addr n -- addr+n*cell )
+proc(cells_plus)
+    ldr     x9, [DSP]              ; x9 = NOS = addr
+    add     TOS, x9, TOS, lsl #3   ; TOS = addr + n*cell  (cell = 8 = 1<<3)
+    stk(2, 1)
+    next()
+endp()
+
+; char+  ( c-addr -- c-addr+1 )   advance one char (1 byte)
+;     Chars are byte-sized, so char+ is identical to 1+: add 1 to TOS.
+proc(char_plus)
+    add     TOS, TOS, #1
+    stk(1, 1)
+    next()
+endp()
+
+; chars  ( n -- n )    no-op on byte-sized chars
+;     Identity. Exists so portable Forth code can write `2 chars`
+;     for "two characters' worth of bytes" and have it mean 2.
+proc(chars)
+    stk(1, 1)
+    next()
+endp()
+
+; cmove  ( src dst u -- )    copy u bytes src -> dst, forward
+;     WF66 did `rep movsb` with rdi=dst, rsi=src, rcx=u (TOS=rax).
+;     AArch64 has no rep; hand-roll a forward byte loop. u in TOS (x0),
+;     dst at [DSP], src at [DSP,#cell]. Scratch x9-x12.
+;     NOTE: cannot use `b.<cond>` here — the front-end @scope mangler
+;     corrupts the dotted mnemonic (see s-reverse). Use cbz/cbnz instead.
+proc(cmove)
+    mov     x12, TOS                ; x12 = u (count); free TOS for later refill
+    ldr     x9,  [DSP]              ; x9  = dst (NOS)
+    ldr     x10, [DSP, #cell]       ; x10 = src (NNOS)
+
+.loop:
+    cbz     x12, .done              ; count == 0 -> finished (also handles u=0)
+    ldrb    w11, [x10], #1          ; w11 = *src++  (zero-extended byte)
+    strb    w11, [x9], #1           ; *dst++ = w11
+    sub     x12, x12, #1            ; count--
+    b       .loop
+
+.done:
+    ldr     TOS, [DSP, #16]         ; #16 = 2*cell: raise NNNOS into TOS
+    stk(3, 0)                       ; pop src dst u : add x19, x19, #24
+    next()
+endp()
+
+; cmove>  ( src dst u -- )    copy u bytes src -> dst, BACKWARD
+;     Use when dst > src and ranges overlap; a forward copy would clobber
+;     source bytes before they are read. WF66 did `std; rep movsb` from the
+;     last byte of each range. AArch64 has no rep/direction-flag, so walk a
+;     descending byte loop. Entry: TOS=x0=u, [DSP]=dst, [DSP,#cell]=src,
+;     [DSP,#16]=cell below src (becomes new TOS). `b.<cond>` is unusable
+;     (the @scope mangler corrupts dotted condition suffixes), so guard the
+;     count with cbz and close the loop with cbnz.
+proc(cmove_to)
+    ldr     x9,  [DSP]                 ; x9 = dst
+    ldr     x10, [DSP, #cell]          ; x10 = src
+    cbz     x0, .done                  ; u == 0: copy nothing
+    add     x9,  x9,  x0               ; x9 = dst + u  (one past last dst byte)
+    add     x10, x10, x0               ; x10 = src + u (one past last src byte)
+.loop:
+    ldrb    w11, [x10, #-1]!           ; pre-decrement src ptr, load byte
+    strb    w11, [x9,  #-1]!           ; pre-decrement dst ptr, store byte
+    subs    x0,  x0,  #1               ; count down u
+    cbnz    x0,  .loop                 ; more bytes remain
+.done:
+    ldr     TOS, [DSP, #16]            ; new TOS = cell below src (#16 = 2*cell)
+    stk(3, 0)                          ; pop src, dst, u: add x19, x19, #24
+    next()
+endp()
+
+; compare  ( a1 len1 a2 len2 -- n )    case-sensitive triadic compare.
+;     0 = equal, -1 if a1 < a2, 1 if a1 > a2.
+;
+; Stack layout (TOS cached in x0, DSP points at NOS):
+;   x0 = len2 (TOS)   [DSP] = a2   [DSP,#cell] = len1   [DSP,#16] = a1
+;
+; Strategy mirrors WF66: scan min(len1,len2) bytes; the first differing
+; byte decides (a1<a2 -> -1, a1>a2 -> +1); if the common prefix is equal,
+; the shorter string is less (sign of len1-len2).
+; NOTE: `b.<cond>` is unusable here — the front-end @scope mangler corrupts
+; the dotted condition suffix. Materialize conditions with cset/csel and
+; branch on the value with cbz/cbnz (see kernel/stack.masm s_reverse).
+proc(compare)
+    ldr     x9,  [DSP]              ; x9  = a2 pointer
+    ldr     x10, [DSP, #cell]       ; x10 = len1
+    ldr     x11, [DSP, #16]         ; x11 = a1 pointer (offset 2*cell)
+
+    cmp     x10, x0                ; len1 vs len2 (lengths are non-negative)
+    csel    x12, x10, x0, lt       ; x12 = min(len1, len2) = byte count to scan
+    mov     x13, #0                ; default (equal lengths) result = 0
+    mov     x14, #1
+    csel    x13, x14, x13, gt      ; len1 > len2 -> a1 is greater -> +1
+    mvn     x14, xzr               ; x14 = -1
+    csel    x13, x14, x13, lt      ; len1 < len2 -> a1 is shorter -> -1
+
+    cbz     x12, .done             ; nothing to scan -> length result stands
+.loop:
+    ldrb    w14, [x11], #1         ; a1 byte (unsigned), post-increment a1 ptr
+    ldrb    w15, [x9],  #1         ; a2 byte (unsigned), post-increment a2 ptr
+    cmp     w14, w15               ; unsigned byte compare
+    mov     x14, #1                ; tentative byte result = +1 (a1 > a2)
+    mvn     x10, xzr               ; x10 = -1
+    csel    x14, x10, x14, lo      ; if a1 byte < a2 byte -> -1 else +1
+    cset    x10, ne                ; x10 = 1 iff the bytes differ
+    cbnz    x10, .commit           ; differing byte decides the result
+    subs    x12, x12, #1           ; one fewer byte to compare
+    cbnz    x12, .loop             ; more common bytes remain
+    b       .done                  ; common prefix equal -> length result stands
+.commit:
+    mov     x13, x14               ; byte difference overrides the length result
+.done:
+    mov     x0,  x13               ; TOS = n
+    stk(4, 1)
+    next()
+endp()
+
+; count  ( c-addr -- c-addr+1 u )    read counted string header
+;     A "counted string" in Forth is a length byte followed by chars.
+;     Take the length, advance the address past it.
+proc(count)
+    add     TOS, TOS, #1                   ; TOS = addr+1 (advance past length byte)
+    str     TOS, [DSP, #-cell]            ; new NOS = addr+1 (slot below DSP; stk pushes into it)
+    ldrb    w0,  [TOS, #-1]               ; new TOS = length byte at addr, zero-extended
+    stk(1, 2)                             ; push one cell (sub x19,x19,#cell)
+    next()
+endp()
+
+; count-bits  ( n -- bits )    population count (number of 1 bits)
+;   AArch64 has no scalar GPR popcount, and the NEON idiom is unusable here:
+;   the MF66 front-end lexer treats a `.<arr>` suffix (`.8b`, `.16b`, …) as a
+;   local-label reference, so inside the `proc()` @scope `v0.8b` is mangled to
+;   `v0<scope>$$8b` and the kernel fails to assemble. Use the classic all-GPR
+;   SWAR popcount instead (x9/x10 scratch). The 0x5555…/0x3333…/0x0f0f… masks
+;   are valid AArch64 logical bitmask immediates; the 0x0101010101010101
+;   multiply constant is materialized with movz/movk.
+proc(count_bits)
+    lsr     x9, x0, #1
+    and     x9, x9, #0x5555555555555555      ; x9 = (n >> 1) & 0x5555...
+    sub     x0, x0, x9                       ; n -= that  (2-bit field sums)
+    and     x9, x0, #0x3333333333333333
+    lsr     x10, x0, #2
+    and     x10, x10, #0x3333333333333333
+    add     x0, x9, x10                     ; 4-bit field sums
+    add     x9, x0, x0, lsr #4
+    and     x9, x9, #0x0f0f0f0f0f0f0f0f      ; 8-bit field sums (byte counts)
+    movz    x10, #0x0101                    ; build 0x0101010101010101
+    movk    x10, #0x0101, lsl #16
+    movk    x10, #0x0101, lsl #32
+    movk    x10, #0x0101, lsl #48
+    mul     x9, x9, x10                     ; sum bytes into the top byte
+    lsr     x0, x9, #56                     ; bits -> TOS
+    stk(1, 1)
+    next()
+endp()
+
+; exchange  ( addr1 addr2 -- )    swap the cells at two addresses
+proc(exchange)
+    ldr     x9,  [DSP]              ; x9  = addr1 (NOS)
+    ldr     x10, [TOS]             ; x10 = *addr2  (TOS = addr2)
+    ldr     x11, [x9]             ; x11 = *addr1
+    str     x11, [TOS]            ; *addr2 = old *addr1
+    str     x10, [x9]            ; *addr1 = old *addr2
+    ldr     TOS, [DSP, #cell]    ; reload TOS from NNOS (both addrs dropped)
+    stk(2, 0)
+    next()
+endp()
+
+; fill  ( c-addr u byte -- )    write `byte` into `u` consecutive bytes at c-addr
+;     WF66 used `rep stosb` (rdi=c-addr, rcx=u, al=byte). AArch64 has no rep;
+;     emit a count-first post-indexed strb loop. `rep` tests rcx==0 BEFORE each
+;     store, so the loop guard must be at the top (u=0 writes nothing).
+proc(fill)
+    ldr     x9,  [DSP]              ; x9  = u      (count, NOS)
+    ldr     x10, [DSP, #cell]      ; x10 = c-addr (dst, NNOS)
+                                    ; x0 (TOS) = byte; only the low 8 bits matter
+.loop:
+    cbz     x9, .done               ; count exhausted (also handles u==0)
+    strb    w0, [x10], #1           ; store low byte, post-increment dst by 1
+    sub     x9, x9, #1              ; count down
+    b       .loop
+.done:
+    ldr     TOS, [DSP, #16]        ; #16 = 2*cell: raise NNNOS into TOS
+    stk(3, 0)                       ; pop c-addr, u, byte: add x19, x19, #24
+    next()
+endp()
+
+; istr=  ( a1 len1 a2 len2 -- flag )    ASCII case-insensitive equality.
+;     Mirrors WF66: compare lengths first, then walk the strings from end
+;     toward start. Bytes that differ are folded through the ASCII-only
+;     a-z -> A-Z map (0x61..0x7a minus 0x20); all other bytes pass through.
+;     Stack layout here: TOS(x0)=len2, [DSP]=a2, [DSP+cell]=len1, [DSP+16]=a1.
+;     NOTE: `b.<cond>` is unusable — the @scope local-label mangler corrupts
+;     the cond suffix (see stack.masm s_reverse). All conditionals go through
+;     cset/csetm + cbz/cbnz instead. The 2*cell offset is spelled as the
+;     literal #16 because the a64 encoder needs a literal, not an expression
+;     (see compare.masm / two_over.masm "encoder needs a literal").
+proc(istr_equal)
+    ldr     x9,  [DSP, #cell]           ; x9  = len1 (NNOS)
+    cmp     TOS, x9                     ; len2 (TOS) vs len1
+    cset    x13, ne
+    cbnz    x13, .false                 ; lengths differ -> not equal
+
+    ldr     x9,  [DSP]                  ; x9  = a2 ptr (NOS)
+    ldr     x10, [DSP, #16]             ; x10 = a1 ptr (offset 2*cell = 16)
+    ; x0 (= len, both equal) is the descending byte index/counter
+
+.loop:
+    subs    TOS, TOS, #1                ; i -= 1
+    cset    x13, mi
+    cbnz    x13, .true                  ; index went negative -> every byte matched
+
+    ldrb    w11, [x9, x0]               ; w11 = a2[i]   (zero-extended)
+    ldrb    w12, [x10, x0]              ; w12 = a1[i]
+    cmp     x11, x12
+    cset    x13, eq
+    cbnz    x13, .loop                  ; raw bytes equal -> next
+
+    ; fold a2 byte (x11): if 'a' <= b <= 'z', subtract 0x20
+    cmp     x11, #0x61                  ; 'a'
+    cset    x13, hs                     ; b >= 'a'
+    cmp     x11, #0x7a                  ; 'z'
+    cset    x14, ls                     ; b <= 'z'
+    and     x13, x13, x14
+    cbz     x13, .left_folded
+    sub     x11, x11, #0x20
+
+.left_folded:
+    ; fold a1 byte (x12) the same way
+    cmp     x12, #0x61
+    cset    x13, hs
+    cmp     x12, #0x7a
+    cset    x14, ls
+    and     x13, x13, x14
+    cbz     x13, .right_folded
+    sub     x12, x12, #0x20
+
+.right_folded:
+    cmp     x11, x12
+    cset    x13, eq
+    cbnz    x13, .loop                  ; folded bytes equal -> next
+    ; fall through to .false
+
+.false:
+    mov     TOS, #0
+    b       .done
+
+.true:
+    mov     TOS, #-1                    ; Forth true (all-ones)
+
+.done:
+    stk(4, 1)                           ; pop a1 len1 a2 (net 4->1); flag stays in x0
+    next()
+endp()
+
+; lastchar  ( c-str -- char )    last character of a COUNTED string
+;     Length byte is the first byte at c-str; the last char is at
+;     c-str + length (index includes the count byte). Both loads are
+;     zero-extended (ldrb), matching WF66's movzx.
+proc(lastchar)
+    ldrb    w9, [TOS]               ; x9 = length byte at str[0]   (was movzx rcx,[rax])
+    ldrb    w0, [TOS, x9]           ; TOS = zero-extended byte at str + length
+    stk(1, 1)                       ; ( c-str -- char ): balanced, emits nothing
+    next()
+endp()
+
+; lower  ( addr len -- )    ASCII lowercase a byte slice in place.
+proc(lower)
+    ldr     x9, [DSP]                   ; x9 = addr (NOS); len stays cached in TOS (x0)
+.loop:
+    cbz     x0, .done                   ; len == 0: finished
+    ldrb    w10, [x9]                   ; w10 = current byte
+    sub     w11, w10, #0x41             ; w11 = byte - 'A'
+    cmp     w11, #0x19                  ; 'Z' - 'A' == 25: in ['A','Z'] iff w11 <=u 25
+    cset    x12, ls                     ; x12 = 1 iff unsigned lower-or-same (b.cc banned: dot-suffix mangles)
+    cbz     x12, .skip                  ; not an uppercase letter: leave it
+    add     w10, w10, #0x20             ; to lowercase
+    strb    w10, [x9]                   ; write back in place
+.skip:
+    add     x9, x9, #1                  ; advance addr
+    sub     x0, x0, #1                  ; decrement len
+    b       .loop
+.done:
+    ldr     TOS, [DSP, #cell]           ; raise NNOS into TOS (WF66: mov rax,[rbp+cell])
+    stk(2, 0)                           ; pop addr and len: add x19, x19, #2*cell
+    next()
+endp()
+
+proc(lowercase)
+    str     x30, [sp, #-16]!        ; nest: save caller LR (16B keeps sp aligned)
+    str     TOS, [DSP, #-cell]      ; stash c-addr into the soon-to-be NOS slot
+    stk(1, 2)                       ; push one cell: NOS = saved c-addr, TOS = c-addr
+    bl      count                   ; ( c-addr c-addr -- c-addr c-addr+1 len )
+    bl      lower                   ; ( c-addr c-addr+1 len -- c-addr )
+    ldr     x30, [sp], #16          ; unnest: restore caller LR
+    next()
+endp()
+
+; lsbit  ( n -- lsb )    index of lowest set bit; -1 if n==0
+proc(lsbit)
+    mov     x9, #-1                ; x9 = -1 sentinel (= WF66 `or rcx,-1`)
+    rbit    x10, TOS               ; reverse bits: trailing zeros -> leading zeros
+    clz     TOS, x10               ; count leading zeros of reversed = ctz(n); 64 if n==0
+    cmp     TOS, #64               ; was n == 0? (only n==0 yields a count of 64)
+    csel    TOS, x9, TOS, eq       ; if zero-input, TOS = -1; else keep the bit index (= WF66 `cmovz`)
+    stk(1, 1)
+    next()
+endp()
+
+; -aligned  ( addr -- a-addr )    round DOWN to a cell boundary.
+proc(minus_aligned)
+    and     TOS, TOS, #-cell      ; clear low 3 bits: addr & ~(cell-1) = round down to cell
+    stk(1, 1)                     ; balanced — emits nothing
+    next()
+endp()
+
+; -scan  ( addr len char -- addr' len' )    backward scan from end of buffer.
+;     On hit:  ( m , len-i-1 )  where i = match index, m = addr+i (the matched
+;              char's address) — replicates the exact WF66 computation.
+;     On miss: ( addr-1 , len )  (len unchanged; addr slot discarded by callers).
+;     Empty:   ( addr , 0 ).
+;     NOTE: `b.<cond>` is forbidden here — the front-end @scope mangler corrupts
+;     the dotted suffix; use cbz/cbnz (+cset for the match test) and plain `b`.
+;     No `scasb` on AArch64: explicit post-decrement backward loop. The char is
+;     masked to a byte (x86 compared AL only) and bytes are ldrb zero-extended.
+proc(minus_scan)
+    ldr     x9,  [DSP]              ; x9  = len            (rcx: live count)
+    mov     x10, x9                ; x10 = len            (rdx: saved length)
+    cbz     x9,  .done             ; len == 0 -> return ( addr , 0 )
+    ldr     x11, [DSP, #cell]      ; x11 = addr           (buffer base)
+    add     x12, x11, x9          ; x12 = addr + len
+    sub     x12, x12, #1          ; x12 = addr+len-1     (rdi: last valid byte)
+    and     w15, w0,  #0xff       ; search char, low byte only (x86 used AL)
+.scan:
+    ldrb    w13, [x12]            ; current byte
+    sub     x12, x12, #1          ; ptr--  (post-decrement, std/scasb timing)
+    sub     x9,  x9,  #1          ; count--
+    cmp     w13, w15              ; match?
+    cset    x14, eq               ; x14 = 1 iff equal (no b.cond allowed)
+    cbnz    x14, .matched         ; hit -> compute slice
+    cbnz    x9,  .scan            ; more bytes -> loop; else fall through (miss)
+    b       .store               ; miss: x10=len, x12=addr-1
+.matched:
+    sub     x10, x10, x9          ; rdx = len - remaining = len - i
+    sub     x10, x10, #1         ; len' = len - i - 1
+    add     x12, x12, #1         ; rdi = matched-char address (m)
+.store:
+    str     x12, [DSP, #cell]     ; addr' into the addr slot
+.done:
+    mov     TOS, x10              ; TOS = len'
+    stk(3, 2)                      ; pop char: ( addr len char -- addr' len' )
+    next()
+endp()
+
+; -skip  ( addr len char -- addr len' )    remove TRAILING char-matches
+proc(minus_skip)
+    ldr     x9, [DSP]              ; x9 = len (counter); char is in TOS (low byte)
+    cbz     x9, .L9               ; len == 0 -> nothing to trim, len' = 0
+    ldr     x10, [DSP, #cell]     ; x10 = addr
+    and     w12, w0, #0xff        ; w12 = char low byte (matches x86 cmp [..], al)
+.L1:
+    sub     x9, x9, #1            ; index the last counted byte: addr + x9
+    ldrb    w11, [x10, x9]        ; w11 = *(addr + x9), zero-extended
+    cmp     w11, w12              ; compare byte with char
+    cset    x13, ne              ; x13 = 1 iff mismatch (b.<cond> is mangled by @scope)
+    cbnz    x13, .L2             ; mismatch -> restore counter and stop
+    cbnz    x9, .L1              ; match: loop while counter != 0
+    b       .L9                  ; counter hit 0, all matched: len' = 0
+.L2:
+    add     x9, x9, #1            ; mismatch byte kept: undo the pre-decrement
+.L9:
+    mov     TOS, x9               ; TOS = len'
+    stk(3, 2)                     ; pop one cell: ( addr len' )
+    next()
+endp()
+
+; move  ( src dst u -- )    copy u bytes, picking direction by overlap
+;     Direction choice mirrors WF66: if (dst-src) unsigned <= u, the
+;     ranges overlap such that an ascending copy would clobber unread
+;     source bytes, so copy backward (cmove> semantics); else forward.
+;     x86 chose this with `jbe` (below-or-equal) -> AArch64 `ls`.
+;     No `rep movsb`: hand-rolled byte loops. Both loops are guarded so
+;     u==0 touches nothing. `b.<cond>` is unusable (the @scope mangler
+;     corrupts it; see stack.masm) -> branch via cset/cbz/cbnz + b.
+proc(move)
+    ldr     x9,  [DSP]              ; x9  = dst (NOS)
+    ldr     x10, [DSP, #cell]       ; x10 = src (NNOS)
+    sub     x11, x9, x10            ; x11 = dst - src (unsigned distance)
+    cmp     x11, x0                ; compare (dst-src) against u (TOS)
+    cset    x12, ls                ; x12 = 1 iff (dst-src) u<= u  (x86 `jbe`)
+    cbnz    x12, .backward         ; overlap-forward danger -> copy backward
+
+    ; ── forward copy: src -> dst, ascending, count = u ──
+    cbz     x0, .done              ; u == 0: nothing to copy
+    mov     x13, x0                ; x13 = remaining byte count
+.fwd:
+    ldrb    w14, [x10]             ; w14 = *src
+    strb    w14, [x9]              ; *dst = w14
+    add     x10, x10, #1           ; src++
+    add     x9,  x9,  #1           ; dst++
+    sub     x13, x13, #1           ; count--
+    cbnz    x13, .fwd
+    b       .done
+
+    ; ── backward copy: from the last byte of each range, descending ──
+.backward:
+    cbz     x0, .done              ; u == 0: nothing to copy
+    add     x10, x10, x0           ; src += u
+    add     x9,  x9,  x0           ; dst += u
+    sub     x10, x10, #1           ; src = src + u - 1 (last byte)
+    sub     x9,  x9,  #1           ; dst = dst + u - 1
+    mov     x13, x0                ; x13 = remaining byte count
+.bwd:
+    ldrb    w14, [x10]             ; w14 = *src
+    strb    w14, [x9]              ; *dst = w14
+    sub     x10, x10, #1           ; src--
+    sub     x9,  x9,  #1           ; dst--
+    sub     x13, x13, #1           ; count--
+    cbnz    x13, .bwd
+
+.done:
+    ldr     TOS, [DSP, #16]        ; new TOS = NNNOS (cell below src); #16 = 2*cell
+    stk(3, 0)                      ; pop src dst u
+    next()
+endp()
+
+; msbit  ( n -- msb )    index of highest set bit; -1 if n==0
+;     AArch64 has no `bsr`; use `clz` (count leading zeros): for a 64-bit
+;     value the most-significant set bit is at index 63 - clz(n). For n==0,
+;     clz(0)==64, so 63-64 == -1 — the zero sentinel falls out of the
+;     arithmetic, no conditional move needed (matches WF66's cmovz path).
+proc(msbit)
+    clz     x0, x0                ; x0 = number of leading zero bits (64 if n==0)
+    mov     x9, #63               ; x9 = top bit index for a 64-bit cell
+    sub     x0, x9, x0            ; msb = 63 - clz(n); == -1 when n==0
+    stk(1, 1)
+    next()
+endp()
+
+; naligned  ( addr n -- a-addr )   round UP to an n-byte boundary.
+proc(naligned)
+    sub     x9, TOS, #1            ; x9 = n - 1                (lea rcx,[rax-1])
+    ldr     x10, [DSP]             ; x10 = addr (NOS)          (no mem-operand ALU)
+    add     x9, x9, x10            ; x9 = addr + n - 1         (add rcx,[rbp])
+    neg     TOS, TOS               ; x0 = -n  (= ~(n-1) for power-of-2 n) (neg rax)
+    and     TOS, TOS, x9           ; x0 = (-n) & (addr+n-1)    (and rax,rcx)
+    stk(2, 1)
+    next()
+endp()
+
+; place  ( addr len dest -- )    overwrite a counted destination string.
+;     WF66 zeroes the dest length byte then tail-jumps into +place. Here the
+;     +place body is inlined as a standalone proc (the tmp_b1 stage assembles
+;     each proc independently, so a cross-scope `b plus_place` is not used).
+;     Because the length byte is zeroed first, +place's current counted length
+;     (movzx edx,[rax]) is provably 0, which collapses three things: remaining
+;     capacity is the full 254 (maxcounted-1), the new length byte equals the
+;     clipped copy length (plain strb, no read-modify-add), and the dest write
+;     pointer is dest+0+1 = dest+1. The signed clip to 254 is kept exactly.
+;     Layout: TOS(x0)=dest  [DSP]=len  [DSP,#cell]=addr (source).
+proc(place)
+    strb    wzr, [TOS]              ; dest length byte := 0   (was: mov byte[rax],0)
+    ldr     x9, [DSP]               ; x9 = len (NOS)
+    mov     x10, #254               ; remaining capacity = maxcounted-1 (curlen=0)
+    cmp     x9, x10                 ; signed compare len vs capacity
+    cset    x11, gt                 ; x11 = 1 iff len > 254 (cmovg analog; b.cc is mangled)
+    cbz     x11, .noclip            ; len <= 254 -> no clip
+    mov     x9, x10                 ; clip copy length to 254
+.noclip:
+    strb    w9, [TOS]               ; counted length byte := clipped len (curlen was 0)
+    add     x11, TOS, #1            ; x11 = dest write pointer = dest + curlen(0) + 1
+    ldr     x10, [DSP, #cell]       ; x10 = source addr (NNOS)
+    strb    wzr, [x11, x9]          ; keep trailing NUL at dest+1+len
+.copy:
+    cbz     x9, .done               ; rep movsb: count exhausted?
+    ldrb    w12, [x10], #1          ; load src byte, post-increment src ptr
+    strb    w12, [x11], #1          ; store dest byte, post-increment dest ptr
+    sub     x9, x9, #1              ; one byte copied
+    b       .copy
+.done:
+    ldr     TOS, [DSP, #16]         ; #16 = 2*cell: refill TOS from below the 3 args
+    stk(3, 0)                       ; pop addr, len, dest (net: add x19,x19,#24)
+    next()
+endp()
+
+; +cells  ( n addr -- addr+n*cell )
+proc(plus_cells)
+    ldr     x9, [DSP]                   ; x9 = NOS = n
+    add     TOS, TOS, x9, lsl #3        ; TOS = addr + n*cell   (cell=8 -> lsl #3)
+    stk(2, 1)                           ; pop one cell (net 2 in, 1 out)
+    next()
+endp()
+
+; +place  ( addr len dest -- )    append a string to a counted destination.
+;     Mirrors WF32's counted-string convention: the length byte counts
+;     payload bytes, but the buffer keeps one trailing NUL, so the
+;     append clips at maxcounted - 1 (= 254) payload bytes.
+;     Layout: TOS(x0)=dest  [DSP]=len  [DSP,#cell]=addr (source).
+;     `rep movsb` becomes a post-indexed ldrb/strb loop; b.<cond> is
+;     mangled by the front-end, so the loop guards use cbz/cbnz.
+proc(plus_place)
+    ldr     x9,  [DSP]                ; x9  = incoming len (NOS)
+    ldrb    w10, [TOS]                ; x10 = current counted length (dest[0])
+    mov     x11, #254                 ; maxcounted - 1
+    sub     x11, x11, x10             ; x11 = remaining payload capacity
+    cmp     x9,  x11                  ; signed: len vs remaining room
+    csel    x9,  x11, x9, gt          ; clip append len to remaining (cmovg)
+    add     x12, x10, x9              ; new counted length = curlen + clipped
+    strb    w12, [TOS]                ; store updated counted length byte
+    add     x13, TOS, x10             ; dest payload write ptr ...
+    add     x13, x13, #1              ;   = dest + curlen + 1
+    ldr     x14, [DSP, #cell]         ; x14 = source addr
+    strb    wzr, [x13, x9]            ; keep trailing NUL after the appended bytes
+    cbz     x9,  .done                ; zero-length append: nothing to copy
+.loop:
+    ldrb    w15, [x14], #1            ; load src byte, post-increment src ptr
+    strb    w15, [x13], #1            ; store to dest, post-increment dest ptr
+    sub     x9,  x9,  #1              ; one byte copied
+    cbnz    x9,  .loop                ; repeat until count exhausted
+.done:
+    ldr     TOS, [DSP, #16]           ; #16 = 2*cell: leave TOS in a defined state
+    stk(3, 0)                         ; pop all three input cells
+    next()
+endp()
+
+; scan  ( addr len char -- addr' len' )    advance to first occurrence of char
+;     Mirrors WF66 `repnz scasb`: char is TOS (x0), len = NOS [DSP],
+;     addr = NNOS [DSP,#cell]. On hit, addr' points AT the matched byte and
+;     len' counts from there to the end; on miss addr'=addr+len, len'=0; on
+;     len==0 addr is left unchanged and len'=0.
+proc(scan)
+    ldr     x9,  [DSP]              ; x9  = len  (scasb count, rcx)
+    ldr     x10, [DSP, #cell]       ; x10 = addr (scasb ptr, rdi)
+    uxtb    w11, w0                 ; x11 = char & 0xff (scasb compares al only)
+    cbz     x9,  .done             ; len==0 -> leave addr untouched, len'=0
+.loop:
+    ldrb    w12, [x10]             ; w12 = byte at ptr (zero-extended)
+    add     x10, x10, #1           ; ptr++   (scasb post-increments rdi)
+    sub     x9,  x9,  #1           ; count-- (scasb decrements rcx)
+    cmp     w12, w11               ; byte == char ?
+    cset    x13, eq                ; materialize ZF (b.<cond> is mangled here)
+    cbnz    x13, .found            ; match (ZF=1) -> back up onto it
+    cbnz    x9,  .loop             ; rcx != 0 -> keep scanning
+    b       .store                ; rcx==0, no match: ptr=addr+len, count=0
+.found:
+    add     x9,  x9,  #1           ; re-include the matched byte in the count
+    sub     x10, x10, #1           ; back up so addr' points AT the match
+.store:
+    str     x10, [DSP, #cell]      ; addr' = ptr  (stored into NNOS slot)
+.done:
+    mov     TOS, x9                ; len' = remaining count
+    stk(3, 2)                      ; pop char; result is ( addr' len' )
+    next()
+endp()
+
+; search  ( a1 len1 a2 len2 -- a3 len3 flag )    find needle a2 in haystack a1
+;     On hit:  a3 = match position, len3 = bytes remaining from there, flag = -1.
+;     On miss: a3 = a1, len3 = len1, flag = 0.
+;     Entry layout: TOS(x0)=len2, [DSP]=a2 (needle), [DSP,#8]=len1, [DSP,#16]=a1.
+;     WF66 saved UP (rbx) on the rstack because its inner probe lived in rbx;
+;     here the probe and every temporary fit in caller-saved scratch x9-x15, so
+;     no spill is needed. NOTE: `b.<cond>` is unusable in the kernel front-end
+;     (the @scope local-label mangler corrupts `b.eq` etc.), so loop branches use
+;     cbz/cbnz on a count register or a cset-materialized condition.
+proc(search)
+    cbz     x0, .hit                ; len2 == 0 -> trivial hit (flag = -1), a1/len1 left in place
+    ldr     x10, [DSP, #cell]       ; x10 = len1 (haystack length)
+    cmp     x0, x10                 ; needle longer than haystack? (unsigned; lengths >= 0)
+    cset    x9, hi                  ; x9 = 1 iff len2 > len1
+    cbnz    x9, .miss               ; needle too long -> miss (was: jbe .L6)
+    add     x13, x10, #1
+    sub     x13, x13, x0            ; x13 = span = len1 - len2 + 1  (number of probe positions, > 0)
+    ldr     x12, [DSP, #16]         ; x12 = probe = a1 (haystack base)
+.probe:
+    ldr     x10, [DSP]              ; x10 = needle scan ptr = a2 (reset at each position)
+    mov     x11, x12                ; x11 = haystack scan ptr = current probe
+    mov     x9,  x0                 ; x9  = byte count = len2  (the repz cmpsb count, rcx)
+.cmpb:
+    ldrb    w14, [x10], #1          ; needle byte, post-increment needle ptr
+    ldrb    w15, [x11], #1          ; haystack byte, post-increment probe ptr
+    cmp     w14, w15
+    cset    x14, ne                 ; x14 = 1 iff bytes differ (w14 is dead after the cmp)
+    cbnz    x14, .next              ; mismatch -> abandon this position
+    subs    x9, x9, #1              ; count-- (one needle byte consumed)
+    cbnz    x9, .cmpb               ; more needle bytes -> keep comparing
+    b       .found                  ; all len2 bytes matched here (repz cmpsb -> ZF) -> .L7
+.next:
+    add     x12, x12, #1            ; probe++ (rbx += 1)
+    subs    x13, x13, #1            ; span-- (rdx -= 1)
+    cbnz    x13, .probe             ; positions remain -> try next (jnz .L1)
+.miss:
+    mov     x0, #0                  ; flag = 0  (was: xor rax, rax)
+    add     DSP, DSP, #cell         ; manual stk(4,3) pop: a1/len1 slots survive as a3/len3
+    next()
+.found:
+    ; x12 = match position = a3.  len3 = len1 - (probe - a1).
+    ldr     x9,  [DSP, #16]         ; x9  = a1 (haystack base)
+    sub     x9,  x12, x9            ; x9  = offset = probe - a1
+    ldr     x10, [DSP, #cell]       ; x10 = len1
+    sub     x10, x10, x9            ; x10 = len3 = len1 - offset
+    str     x10, [DSP, #cell]       ; len1 slot <- len3  (becomes new NOS after the pop)
+    str     x12, [DSP, #16]         ; a1 slot   <- a3 = match position (becomes new NNOS)
+.hit:
+    mov     x0, #-1                 ; flag = -1  (was: or rax, -1)
+    stk(4, 3)                       ; pop one cell: add DSP, DSP, #cell
+    next()
+endp()
+
+; skip  ( addr len char -- addr' len' )    advance past leading char-matches
+;     Special-cases char == 0x20 to use "<= space" (skip any blank-ish byte).
+;     TOS(x0)=char, [DSP]=len, [DSP,#cell]=addr.
+proc(skip)
+    ldr     x9,  [DSP]             ; x9  = len  (rcx)
+    cbz     x9,  .L8              ; len == 0 -> nothing to skip, leave len'=0
+    ldr     x10, [DSP, #cell]     ; x10 = addr (rdi)
+    cmp     x0,  #0x20           ; char == space?  (full register, like WF66 cmp rax,0x20)
+    cset    x11, ne
+    cbnz    x11, .gen           ; non-space -> general (exact-match) loop
+
+.sloop:                         ; space case: skip every byte <= 0x20
+    ldrb    w11, [x10]           ; current byte
+    cmp     x11, #0x20
+    cset    x12, hi             ; byte > 0x20 ?  (unsigned 'ja')
+    cbnz    x12, .done          ; non-blank found -> stop (x10/x9 at it)
+    add     x10, x10, #1         ; consume the blank
+    sub     x9,  x9,  #1
+    cbnz    x9,  .sloop         ; more bytes -> continue
+    b       .done               ; all consumed: x9 == 0, x10 == addr+len
+
+.gen:                           ; general case: skip bytes == char
+    and     x13, x0,  #0xff     ; char & 0xff  (scasb compares al only, not all of rax)
+.gloop:
+    ldrb    w11, [x10]           ; current byte (zero-extended)
+    cmp     x11, x13            ; == char low byte ?
+    cset    x12, ne
+    cbnz    x12, .done          ; mismatch -> stop (x10/x9 at the mismatch)
+    add     x10, x10, #1         ; consume the match
+    sub     x9,  x9,  #1
+    cbnz    x9,  .gloop         ; more bytes -> continue
+    ; fell through: x9 == 0, all matched, x10 == addr+len
+
+.done:
+    str     x10, [DSP, #cell]    ; addr' -> NNOS slot (becomes NOS after the pop)
+.L8:
+    mov     TOS, x9              ; len' -> TOS
+    stk(3, 2)                    ; pop one cell: ( addr' len' )
+    next()
+endp()
+
+; /string  ( addr len n -- addr' len' )    advance addr by n, shrink len by n
+;     Clamps n to len when n > 0 and n > len (would underflow); negative/zero n
+;     skips the clamp (matches WF66's `jle .L9`). The skip is expressed
+;     branchlessly: the kernel front-end's @scope mangler corrupts `b.<cond>`
+;     (and the encoder has no no-dot `ble`), so we select instead of branch.
+proc(slash_string)
+    ldr     x9, [DSP]               ; x9 = old len (NOS)
+    cmp     TOS, x9                 ; n vs len, unsigned
+    csel    x10, x9, TOS, hi        ; x10 = (n u> len) ? len : n  (unsigned clamp)
+    cmp     TOS, #0                 ; n vs 0, signed
+    csel    TOS, x10, TOS, gt       ; apply clamp only when n > 0, else keep n
+    ldr     x11, [DSP, #cell]       ; x11 = addr (NNOS slot)
+    add     x11, x11, TOS           ; addr += n'
+    str     x11, [DSP, #cell]       ; write addr' back into the NNOS slot
+    sub     TOS, x9, TOS            ; new len = old len - n'  → TOS
+    stk(3, 2)                       ; pop one cell: addr' becomes NOS, len' is TOS
+    next()
+endp()
+
+; slastchar  ( addr len -- char )    last char of a (addr, len) s-string
+proc(slastchar)
+    ldr     x9, [DSP]              ; x9 = NOS = addr
+    sub     TOS, TOS, #1          ; TOS = len - 1 (index of last byte)
+    ldrb    w0, [x9, TOS]         ; byte at addr + (len-1), zero-extended into x0
+    stk(2, 1)
+    next()
+endp()
+
+; str=  ( a1 len1 a2 len2 -- flag )    case-sensitive equality (-1 / 0)
+;     Stack layout (TOS cached in x0, DSP points at NOS):
+;       x0 = len2 (TOS)   [DSP] = a2   [DSP,#cell] = len1   [DSP,#16] = a1
+;     Mirrors WF66: compare lengths first; if equal and zero -> "" == "" -> -1
+;     (WF66's explicit zero-length-true fix); otherwise walk byte-by-byte and
+;     fail on the first mismatch. Forth flag: -1 equal, 0 not.
+;     NOTE: `b.<cond>` is unusable here — the front-end @scope mangler corrupts
+;     the dotted condition suffix. Materialize conditions with cset and branch
+;     on the value with cbz/cbnz (see kernel/stack.masm s_reverse, compare).
+;     The 2*cell offset is spelled as the literal #16 (the a64 encoder needs a
+;     literal, not an expression).
+proc(str_equal)
+    ldr     x9, [DSP, #cell]        ; x9 = len1
+    cmp     TOS, x9                 ; len2 == len1 ?
+    cset    x13, ne
+    cbnz    x13, .false             ; length mismatch -> not equal
+    cbz     TOS, .true              ; both lengths 0 -> "" == "" -> true
+    ldr     x10, [DSP]              ; x10 = a2 (cursor)
+    ldr     x11, [DSP, #16]         ; x11 = a1 (cursor; offset 2*cell)
+    mov     x12, TOS                ; x12 = count (= len)
+.loop:
+    ldrb    w13, [x11], #1          ; a1[i++]  (zero-extended)
+    ldrb    w14, [x10], #1          ; a2[i++]  (zero-extended)
+    cmp     w13, w14
+    cset    x15, ne
+    cbnz    x15, .false             ; first differing byte -> not equal
+    subs    x12, x12, #1            ; one fewer byte to compare
+    cbnz    x12, .loop              ; more bytes remain
+.true:
+    mov     TOS, #-1                ; Forth true (all-ones)
+    b       .done
+.false:
+    mov     TOS, #0
+.done:
+    stk(4, 1)
+    next()
+endp()
+
+; tr  ( addr len table -- )    translate a buffer in place.
+;     Mirrors WF66/WF32: walk from the end of the buffer toward the start,
+;     use each source byte as an index into the 256-byte translation table,
+;     and write the translated byte back in place.
+;     TOS(x0)=table, [DSP]=len, [DSP,#cell]=addr, [DSP,#16]=cell under args.
+;     NOTE: `b.<cond>` is unusable inside a proc scope (the @scope local-label
+;     mangler corrupts the mnemonic), so the sign test is materialized with
+;     `cset ... ,mi` + `cbnz`, and the loop-continue is a plain `cbnz`.
+proc(tr)
+    ldr     x9,  [DSP]                  ; x9  = len   (was rsi = [rbp])
+    ldr     x10, [DSP, #cell]           ; x10 = addr  (was rdi = [rbp+cell])
+.loop:
+    subs    x9, x9, #1                  ; x9-- and set flags (was `sub rsi,1`)
+    cset    x11, mi                     ; x11 = 1 iff result < 0 (len was 0/exhausted)
+    cbnz    x11, .done                  ; `js .done`: stop before processing index -1
+    ldrb    w12, [x10, x9]             ; w12 = src byte = buf[x9]   (movzx rdx,[rdi+rsi])
+    ldrb    w12, [x0, x12]             ; w12 = table[src]           (movzx rcx,[rax+rdx])
+    strb    w12, [x10, x9]            ; buf[x9] = translated byte   (mov [rdi+rsi],cl)
+    cbnz    x9, .loop                  ; `jnz .loop`: index 0 just done -> fall through
+.done:
+    ldr     TOS, [DSP, #16]           ; new TOS = old cell under the 3 args (2*cell)
+    stk(3, 0)
+    next()
+endp()
+
+; upc  ( char -- char )    ASCII uppercase fold for one byte.
+;     Mirrors WF32's `ucasetab` for the currently-used range: fold
+;     `a`..`z` to `A`..`Z`, leave every other byte unchanged.
+;     Branchless: `b.<cond>` is unusable here (the @scope local-label
+;     mangler corrupts dotted mnemonics, per stack.masm/s_reverse), so the
+;     a..z range test is the unsigned trick (c - 'a') u<= 25, materialized
+;     into a -1/0 mask that gates the 0x20 subtraction.
+proc(upc)
+    and     TOS, TOS, #0xff           ; mask to a byte (matches `and eax,0xff`)
+    sub     x9,  TOS, #0x61           ; x9 = char - 'a'
+    cmp     x9,  #25                  ; in a..z  iff (char-'a') u<= 25 ('z'-'a')
+    csetm   x10, ls                   ; x10 = -1 if lowercase letter, else 0
+    and     x10, x10, #0x20           ; x10 = 0x20 if lowercase, else 0
+    sub     TOS, TOS, x10             ; fold to uppercase (or no-op)
+    stk(1, 1)
+    next()
+endp()
+
+; upper  ( addr len -- )    ASCII uppercase a byte slice in place.
+proc(upper)
+    mov     x9,  TOS                    ; x9  = len   (count, was rcx)
+    ldr     x10, [DSP]                  ; x10 = addr  (cursor, was rdi)
+.loop:
+    cbz     x9,  .done                  ; count == 0 -> finished
+    ldrb    w11, [x10]                  ; w11 = current byte (zero-extended)
+    sub     w12, w11, #0x61             ; w12 = byte - 'a'
+    cmp     w12, #25                    ; in ['a'..'z'] iff (byte-'a') u<= 25
+    cset    x13, ls                     ; x13 = 1 iff lowercase letter (cset+cbz: avoid b.cond)
+    cbz     x13, .skip                  ; not a lowercase letter -> leave it
+    sub     w11, w11, #0x20             ; to uppercase
+    strb    w11, [x10]                  ; write the byte back in place
+.skip:
+    add     x10, x10, #1                ; advance cursor
+    sub     x9,  x9,  #1                ; decrement count
+    b       .loop
+.done:
+    ldr     TOS, [DSP, #cell]           ; new TOS = NNOS (the cell below addr), matches WF66 mov rax,[rbp+cell]
+    stk(2, 0)                           ; pop addr and len: add x19, x19, #2*cell
+    next()
+endp()
+
+; uppercase  ( c-addr -- c-addr )    uppercase a counted string in place.
+;   Mirrors WF66: dup the c-addr, count it to ( c-addr addr len ), upper the
+;   slice in place, then count/upper raise the saved c-addr back into TOS.
+proc(uppercase)
+    str     x30, [sp, #-16]!        ; nest: save uppercase's return addr (bl clobbers x30)
+    str     TOS, [DSP, #-cell]      ; write c-addr to the cell below NOS (future NOS) = dup
+    stk(1, 2)                       ; DSP -= cell ; now ( c-addr c-addr ), TOS still = c-addr
+    bl      count                   ; ( c-addr c-addr -- c-addr addr len )
+    bl      upper                   ; ( c-addr addr len -- c-addr ), uppercases in place
+    ldr     x30, [sp], #16          ; unnest: restore return addr
+    next()
+endp()
+
+; zcount  ( z-addr -- addr len )    NUL-terminated string -> (addr, strlen)
+;     Unlike `count`, the addr is unchanged. WF66 used `repnz scasb` with
+;     rcx=-1 to find the NUL; here we scan bytes directly. On entry x0 holds
+;     z-addr; it survives the scan (cursor uses scratch x9) so it can be
+;     written into the new NOS slot, and the strlen (cursor - start) becomes
+;     the new TOS. NOTE: `b.<cond>` is unusable in a proc scope (the
+;     local-label mangler corrupts the leading-dot suffix), so the scan uses
+;     `cbz`/`b` only.
+proc(zcount)
+    mov     x9, TOS                 ; x9 = scan cursor = original z-addr
+.scan:
+    ldrb    w10, [x9]               ; w10 = current byte (zero-extended)
+    cbz     x10, .done              ; NUL terminator -> stop scanning
+    add     x9, x9, #1              ; advance cursor
+    b       .scan
+.done:
+    sub     x9, x9, TOS             ; x9 = strlen = cursor - original addr
+    str     TOS, [DSP, #-cell]      ; original addr -> new NOS slot (unchanged)
+    stk(1, 2)                       ; net push one cell: sub x19, x19, #cell
+    mov     TOS, x9                 ; new TOS = strlen
+    next()
+endp()
+
