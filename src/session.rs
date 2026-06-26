@@ -101,6 +101,8 @@ pub struct Mf66Session {
     method_class: Option<String>,
     /// One-shot flag: the next `->` is a `super` send (early-bind to the parent).
     super_pending: bool,
+    /// `[` … `]` — interpret tokens while a definition is open (compile-time eval).
+    bracket_interpret: bool,
     /// Static class of the most recently emitted receiver (for early binding).
     last_receiver_class: Option<String>,
     /// Cached xts: (dnu) default method, (send), (send-xt).
@@ -208,6 +210,7 @@ impl Mf66Session {
             pending_class: None,
             method_class: None,
             super_pending: false,
+            bracket_interpret: false,
             last_receiver_class: None,
             dnu_xt: 0,
             send_xt: 0,
@@ -442,6 +445,22 @@ impl Mf66Session {
                 continue;
             }
             let lk = tok.to_ascii_lowercase(); // Forth is case-insensitive
+            // [ … ] literal — compile-time interpretation inside a definition.
+            if lk == "[" && self.pending.is_some() {
+                self.bracket_interpret = true;
+                continue;
+            }
+            if lk == "]" {
+                self.bracket_interpret = false;
+                continue;
+            }
+            if lk == "literal" && self.pending.is_some() {
+                let v = self
+                    .pop_data()
+                    .ok_or_else(|| anyhow::anyhow!("`literal` needs a value"))?;
+                self.pending.as_mut().unwrap().toks.push(Tok::Lit(v));
+                continue;
+            }
             // ' / ['] name — push (interpret) or compile (literal) the word's xt.
             if lk == "'" || lk == "[']" {
                 let name = tokens
@@ -609,7 +628,7 @@ impl Mf66Session {
                 self.last_receiver_class = Some(cls);
                 continue;
             }
-            if self.pending.is_some() {
+            if self.pending.is_some() && !self.bracket_interpret {
                 if lk == ";" {
                     self.finish_colon()?;
                 } else if lk == "{:" {
@@ -1347,6 +1366,7 @@ impl Mf66Session {
         self.method_class = None;
         self.pending_class = None;
         self.super_pending = false;
+        self.bracket_interpret = false;
         self.reset();
     }
 
