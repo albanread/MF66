@@ -1,0 +1,44 @@
+; MF66 kernel — data-space words operating on user_VAR_HERE (the RW/no-exec data
+; bump pointer, grows UP from VAR_BASE toward user_VAR_LIMIT). `here` returns the
+; current pointer; `allot`/`,`/`c,` advance it. Object instances and variable
+; bodies live here.
+
+; here ( -- addr )   the current data-space pointer
+proc(here_word)
+    str     x0, [DSP, #-cell]           ; spill old TOS into the NOS slot
+    ldr     x0, [UP, #user_VAR_HERE]
+    stk(0, 1)
+    next()
+endp()
+
+; allot ( n -- )   reserve n bytes of data space
+proc(allot_word)
+    ldr     x9, [UP, #user_VAR_HERE]
+    add     x9, x9, x0                  ; VAR_HERE += n
+    str     x9, [UP, #user_VAR_HERE]
+    ldr     x0, [DSP]                   ; drop n (raise NOS)
+    stk(1, 0)
+    next()
+endp()
+
+; , ( x -- )   append a cell to data space
+proc(comma_word)
+    ldr     x9, [UP, #user_VAR_HERE]
+    str     x0, [x9]                    ; *VAR_HERE = x
+    add     x9, x9, #cell
+    str     x9, [UP, #user_VAR_HERE]
+    ldr     x0, [DSP]                   ; drop x (raise NOS)
+    stk(1, 0)
+    next()
+endp()
+
+; c, ( c -- )   append one byte to data space
+proc(c_comma_word)
+    ldr     x9, [UP, #user_VAR_HERE]
+    strb    w0, [x9]                    ; *VAR_HERE = c (low byte)
+    add     x9, x9, #1
+    str     x9, [UP, #user_VAR_HERE]
+    ldr     x0, [DSP]                   ; drop c (raise NOS)
+    stk(1, 0)
+    next()
+endp()

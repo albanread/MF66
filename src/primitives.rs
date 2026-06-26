@@ -208,4 +208,9 @@ pub const PRIMITIVES: &[(&str, &str, bool)] = &[
     ("catch", "catch_word", false),
     ("throw", "throw_word", false),
     ("abort", "abort_word", false),
+    // Data space (MF66 dataspace.masm)
+    ("here", "here_word", false),
+    ("allot", "allot_word", false),
+    (",", "comma_word", false),
+    ("c,", "c_comma_word", false),
 ];

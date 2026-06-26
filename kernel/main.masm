@@ -31,6 +31,7 @@
 @include "io.masm"
 @include "float.masm"
 @include "exceptions.masm"
+@include "dataspace.masm"
 
 ; forth_main — the only data-stack-representation translation layer.
 ;
