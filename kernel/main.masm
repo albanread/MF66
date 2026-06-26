@@ -19,6 +19,10 @@
 
 @include "macros.masm"
 @include "prims.masm"
+@include "stack.masm"
+@include "arith.masm"
+@include "logic.masm"
+@include "compare.masm"
 
 ; forth_main — the only data-stack-representation translation layer.
 ;

@@ -260,6 +260,14 @@ x86-only) is gated off; metrics are diagnostic, never a gate.
    interpreter. (`number.masm` straddles the K1/K2 cut — it needs `udiv`; `find`
    needs compare and the 32-bit hash-compare upper-half audit.) *Verify:* REPL
    does integer arithmetic, stack ops, variables, `:`…`;`; corpus level 1.
+   **IN PROGRESS:** the differential corpus harness is live (`tests/corpus.rs` +
+   the 150-file `tests/data/direct/` corpus imported from WF66 — the day-one
+   oracle); `docs/porting-guide.md` + `src/bin/asmcheck.rs` support a
+   workflow-driven per-primitive port (translate → adversarial-verify → corpus
+   gate). **Batch 1 done: 49 boot-critical register-only primitives** (arith 11,
+   compare 20, logic 7, stack 11) → **corpus 50/150 PASS, 0 FAIL**. Remaining:
+   memory + rstack primitives, the hard arith (double-cell/division, batch 2),
+   then dict/number/parse/interpreter + the eval corpus.
 3. **Hard primitives** — arith (128-bit `mul`+`umulh`/`smulh`, `sdiv`/`udiv`),
    compare (flag idioms → `csetm`/`csel`), strings (`bsr/bsf/popcnt`→`clz`/`rbit`/
    `cnt`), execute. *Verify:* full integer ANS core suite vs corpus.

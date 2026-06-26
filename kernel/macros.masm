@@ -40,6 +40,7 @@
 @assign user_STATE       = 0x38      ; interpret/compile (Phase 2)
 @assign user_LATEST      = 0x40      ; dictionary chain head (Phase 2)
 @assign user_HERE        = 0x48      ; dict bump pointer (Phase 2)
+@assign user_PAD         = 0x800     ; scratch region (tests/corpus harness)
 
 ; ── proc/endp/next — the shape of a primitive ───────────────────────────
 ; proc(name): open a scope (so .local labels mangle uniquely), export the

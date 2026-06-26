@@ -35,11 +35,20 @@ must survive a settle-barrier `rt_*` call is callee-saved. `x16`/`x17`/`x18` are
 forbidden in any pool (`MacJit` veneers own x16; x18 is Darwin-reserved). Source
 of truth: [`src/abi.rs`](src/abi.rs).
 
-## Status — Phase 1 (kernel macro library + boot path) ✅
+## Status — Phase 2 (boot headless) — in progress
 
 ```
-$ cargo test          # 11 tests across abi / kernel_lint / phase0 / phase1
+$ cargo test          # abi / kernel_lint / phase0 / phase1 / corpus
 ```
+
+The **differential corpus** (`tests/data/direct/`, 150 `.t` files imported from
+WF66 — the day-one oracle) drives a workflow-based per-primitive port: translate
+the WF66 x86 proc → AArch64, adversarially verify it, then the word's `.t` flips
+NYIMP → PASS (PASS = matches WF66's observed behavior). See
+[docs/porting-guide.md](docs/porting-guide.md). **Batch 1: 49 boot-critical
+register-only primitives** (arith/compare/logic/stack) → **corpus 50/150 PASS, 0
+FAIL**. Next: memory + rstack, hard arith (double-cell/division), then
+dict/number/parse/interpreter.
 
 - **Phase 0** — a hand-written AArch64 word assembles through JASM, loads into
   `MAP_JIT` memory, flips W^X, and executes, incl. an AAPCS64 host callback via a

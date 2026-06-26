@@ -1,0 +1,63 @@
+; MF66 kernel — logic primitives (ported from WF66 kernel/logic.masm).
+; Internal form: TOS in x0, NOS at [DSP] (x19). See docs/porting-guide.md.
+
+; and  ( n1 n2 -- n3 )    bitwise AND. Asm sym `and_` because plain
+;                          `and` is an AArch64 mnemonic too.
+proc(and_)
+    ldr     x9, [DSP]              ; x9 = NOS (n1) — no memory-operand ALU
+    and     TOS, TOS, x9          ; TOS = n2 & n1
+    stk(2, 1)                     ; pop one cell (add x19,x19,#cell)
+    next()
+endp()
+
+; arshift  ( n1 n -- n2 )  arithmetic (signed) right shift
+proc(arshift)
+    mov     x9, TOS                ; x9 = shift count n (was TOS)
+    ldr     TOS, [DSP]             ; TOS = value n1 (NOS)
+    asr     TOS, TOS, x9           ; n2 = n1 >> n  (arithmetic, sign-extending)
+    stk(2, 1)                      ; pop the count cell
+    next()
+endp()
+
+; invert  ( n1 -- n2 )    bitwise NOT (one's complement).
+proc(invert)
+    mvn     TOS, TOS               ; x0 = ~x0  (x86 `not rax`)
+    stk(1, 1)                      ; balanced — emits nothing
+    next()
+endp()
+
+; lshift  ( u1 n -- u2 )  shift u1 left by n bits.
+;     n is TOS (x0), u1 is NOS ([DSP]).  Variable lsl takes its count
+;     from a register; AArch64 lsl masks the count mod 64, matching x86 shl cl.
+proc(lshift)
+    mov     x9, TOS               ; x9 = n (shift count)
+    ldr     TOS, [DSP]            ; TOS = u1 (the value to shift)
+    lsl     TOS, TOS, x9          ; TOS = u1 << n
+    stk(2, 1)
+    next()
+endp()
+
+; or  ( n1 n2 -- n3 )     bitwise OR. Trailing underscore: `or` is reserved.
+proc(or_)
+    ldr     x9, [DSP]              ; x9 = NOS (n1)
+    orr     TOS, TOS, x9          ; TOS = n2 | n1  (OR is commutative)
+    stk(2, 1)
+    next()
+endp()
+
+; rshift  ( u1 n -- u2 )   logical (unsigned) right shift
+proc(rshift)
+    ldr     x9, [DSP]              ; x9 = NOS (u1, the value)
+    lsr     TOS, x9, TOS          ; TOS = u1 >> n (logical; count in x0/TOS)
+    stk(2, 1)
+    next()
+endp()
+
+; xor  ( n1 n2 -- n3 )    bitwise XOR
+proc(xor_)
+    ldr     x9, [DSP]              ; x9 = NOS (n1)
+    eor     TOS, TOS, x9          ; TOS = n2 ^ n1
+    stk(2, 1)
+    next()
+endp()
+

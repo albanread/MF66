@@ -1,0 +1,140 @@
+; MF66 kernel — stack primitives (ported from WF66 kernel/stack.masm).
+; Internal form: TOS in x0, NOS at [DSP] (x19). See docs/porting-guide.md.
+
+; 4drop  ( x1 x2 x3 x4 -- )
+proc(four_drop)
+    ldr     TOS, [DSP, #24]    ; new TOS = cell below x1 (4 down from old TOS)
+    stk(4, 0)                      ; net pop 4 cells: add x19,x19,#4*cell
+    next()
+endp()
+
+; 4dup  ( x1 x2 x3 x4 -- x1 x2 x3 x4 x1 x2 x3 x4 )
+proc(four_dup)
+    ldr     x9,  [DSP]             ; x9  = x3 (NOS)
+    ldr     x10, [DSP, #8]         ; x10 = x2
+    ldr     x11, [DSP, #16]        ; x11 = x1
+    str     TOS, [DSP, #-8]        ; new -1 = x4 (TOS)
+    str     x11, [DSP, #-16]       ; new -2 = x1
+    str     x10, [DSP, #-24]       ; new -3 = x2
+    str     x9,  [DSP, #-32]       ; new -4 = x3
+    stk(4, 8)                      ; net push 4 cells: sub x19,x19,#32
+    next()
+endp()
+
+; s-reverse  ( x[k-1] ... x1 x0 k -- x0 x1 ... x[k-1] )
+;     Reverse the top k stack items in place, then drop k.
+;     k is cached in TOS (x0); the k items live at [DSP] (x0, topmost) ..
+;     [DSP + (k-1)*cell] (x[k-1], bottommost). Two-pointer in-place swap.
+;     NOTE: `b.<cond>` cannot be used here — the kernel front-end's @scope
+;     local-label mangler captures the leading-dot `.hs`/`.eq`/... suffix and
+;     corrupts the mnemonic (`b.hs .done` -> `bs_reverse$$hs ...`). Materialize
+;     the condition with `cset` and branch on the value with `cbnz` instead.
+proc(s_reverse)
+    sub     x9,  DSP, #cell             ; x9 = hi ptr, one slot above the top item
+    add     x10, DSP, x0, lsl #3        ; x10 = lo ptr = DSP + k*cell, one slot below the bottom item
+
+.loop:
+    sub     x10, x10, #cell             ; lo descends toward the top item
+    add     x9,  x9,  #cell             ; hi ascends toward the bottom item
+    cmp     x9,  x10                    ; pointers are addresses -> unsigned compare
+    cset    x11, hs                     ; x11 = 1 iff hi >= lo (unsigned), else 0
+    cbnz    x11, .done                  ; pointers met/crossed: finished
+
+    ldr     x12, [x10]                  ; swap [x10] <-> [x9]
+    ldr     x13, [x9]
+    str     x12, [x9]
+    str     x13, [x10]
+    b       .loop
+
+.done:
+    ldr     TOS, [DSP]                  ; drop k, raise old top item into TOS
+    add     DSP, DSP, #cell             ; pop the count cell (net stack effect)
+    next()
+endp()
+
+; 3drop  ( x1 x2 x3 -- )
+proc(three_drop)
+    ldr     TOS, [DSP, #16]        ; #16 = 2*cell: raise the cell below x1 into TOS
+    stk(3, 0)                      ; pop x1 x2 x3 -> add x19, x19, #24
+    next()
+endp()
+
+; 3dup  ( x1 x2 x3 -- x1 x2 x3 x1 x2 x3 )
+proc(three_dup)
+    ldr     x9,  [DSP]              ; x9  = NOS  (x2)
+    ldr     x10, [DSP, #cell]      ; x10 = NNOS (x1)
+    str     TOS, [DSP, #-cell]     ; old TOS (x3) -> [DSP-1*cell]
+    str     x10, [DSP, #-16]      ; x1           -> [DSP-2*cell]
+    str     x9,  [DSP, #-24]      ; x2           -> [DSP-3*cell]
+    stk(3, 6)                       ; net +3 cells: sub x19,x19,#3*cell; TOS (x3) stays in x0
+    next()
+endp()
+
+; 2drop  ( x1 x2 -- )    drop two cells
+proc(two_drop)
+    ldr     TOS, [DSP, #cell]      ; raise NNOS (item below x1) into TOS
+    stk(2, 0)                      ; pop both cells: add x19, x19, #2*cell
+    next()
+endp()
+
+; 2dup  ( x1 x2 -- x1 x2 x1 x2 )    duplicate top pair
+proc(two_dup)
+    ldr     x9, [DSP]               ; x9 = NOS (x1)
+    str     TOS, [DSP, #-cell]      ; one cell below NOS = TOS (x2)
+    str     x9,  [DSP, #-16]        ; two cells below NOS = x1
+    stk(2, 4)                       ; net +2 cells: DSP -= 2*cell
+    next()
+endp()
+
+; 2nip  ( x1 x2 x3 x4 -- x3 x4 )    drop the deeper pair
+proc(two_nip)
+    ldr     x9, [DSP]              ; x9 = x3 (NOS); TOS(x0) = x4
+    str     x9, [DSP, #16]    ; overwrite deepest slot (x1) with x3
+    stk(4, 2)                      ; pop 2 cells: add x19, x19, #16
+    next()
+endp()
+
+; 2over  ( x1 x2 x3 x4 -- x1 x2 x3 x4 x1 x2 )   copy deeper pair to top
+proc(two_over)
+    ; layout (DSP points at NOS): TOS=x4  [DSP]=x3  [DSP,#cell]=x2  [DSP,#16]=x1
+    str     TOS, [DSP, #-cell]     ; stash x4 into the lower of the two new slots
+    ldr     x9,  [DSP, #16]        ; x9 = x1  (offset 2*cell = 16; encoder needs a literal)
+    ldr     TOS, [DSP, #cell]      ; new TOS = x2
+    str     x9,  [DSP, #-16]       ; x1 into the deeper new slot (becomes new NOS)
+    stk(4, 6)                      ; net +2 cells: sub x19, x19, #16
+    next()
+endp()
+
+; 2swap ( x1 x2 x3 x4 -- x3 x4 x1 x2 )  swap the top two cell pairs
+; Memory layout (TOS cached in x0, DSP points at NOS, stack grows down):
+;   x0=x4  [DSP]=x3  [DSP,#8]=x2  [DSP,#16]=x1
+; Result: x0=x2  [DSP]=x1  [DSP,#8]=x4  [DSP,#16]=x3
+proc(two_swap)
+    ldr     x9,  [DSP]             ; x9  = x3 (NOS)
+    ldr     x10, [DSP, #8]        ; x10 = x2 (NNOS)
+    ldr     x11, [DSP, #16]       ; x11 = x1 (NNNOS)
+    str     x11, [DSP]            ; NOS   = x1
+    str     TOS, [DSP, #8]        ; NNOS  = x4 (old TOS)
+    str     x9,  [DSP, #16]       ; NNNOS = x3
+    mov     TOS, x10              ; TOS   = x2
+    stk(4, 4)                      ; balanced — emits nothing
+    next()
+endp()
+
+proc(two_rot)
+    mov     x9,  TOS               ; x9  = x6 (TOS)
+    ldr     x10, [DSP]             ; x10 = x5
+    ldr     x11, [DSP, #cell]      ; x11 = x4 (offset 1*cell = 8)
+    ldr     x12, [DSP, #16]        ; x12 = x3 (offset 2*cell = 16)
+    ldr     x13, [DSP, #24]        ; x13 = x2 (offset 3*cell = 24)
+    ldr     x14, [DSP, #32]        ; x14 = x1 (offset 4*cell = 32)
+    mov     TOS, x13               ; TOS        = x2
+    str     x14, [DSP]             ; [DSP]      = x1
+    str     x9,  [DSP, #cell]      ; [DSP+1]    = x6
+    str     x10, [DSP, #16]        ; [DSP+2]    = x5
+    str     x11, [DSP, #24]        ; [DSP+3]    = x4
+    str     x12, [DSP, #32]        ; [DSP+4]    = x3
+    stk(6, 6)
+    next()
+endp()
+

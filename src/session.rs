@@ -27,6 +27,10 @@ const USER_SP0: usize = 0x10;
 const USER_RSP_CURRENT: usize = 0x18;
 const USER_LP0: usize = 0x20;
 const USER_FTOS_SAVE: usize = 0x28;
+/// Scratch region inside the user area for memory/string-primitive tests
+/// (`push_pad`/`poke`/`expect_bytes`). Sits above the user-variable table with
+/// headroom for the full Phase 2+ table below it.
+const USER_PAD: u64 = 0x800;
 
 const CELL: usize = 8;
 
@@ -125,12 +129,22 @@ impl Mf66Session {
         ((self.dstack_top - self.current_dsp) / CELL as u64) as usize
     }
 
+    /// Resolve a primitive's asm symbol to its execution token (code address).
+    /// Used by the corpus harness for NYIMP detection.
+    pub fn xt_of(&mut self, asm_sym: &str) -> Result<u64> {
+        self._jit
+            .lookup_addr(asm_sym)
+            .with_context(|| format!("xt_of({asm_sym})"))
+    }
+
+    /// Base of the user-area scratch (PAD) region.
+    pub fn pad_base(&self) -> u64 {
+        self.user_base + USER_PAD
+    }
+
     /// Invoke a primitive by its asm symbol through `forth_main`.
     pub fn call(&mut self, asm_sym: &str) -> Result<()> {
-        let xt = self
-            ._jit
-            .lookup_addr(asm_sym)
-            .with_context(|| format!("lookup_addr({asm_sym})"))?;
+        let xt = self.xt_of(asm_sym)?;
         (self.forth_main)(xt, self.current_dsp, self.rstack_top, self.user_base);
         self.current_dsp = self.read_user(USER_DSP_SAVE);
         Ok(())

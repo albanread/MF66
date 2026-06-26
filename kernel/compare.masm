@@ -1,0 +1,190 @@
+; MF66 kernel — compare primitives (ported from WF66 kernel/compare.masm).
+; Internal form: TOS in x0, NOS at [DSP] (x19). See docs/porting-guide.md.
+
+; =  ( n1 n2 -- flag )   ; n1 == n2 → -1, else 0
+proc(equal)
+    ldr     x9, [DSP]             ; x9 = NOS (n1)
+    cmp     TOS, x9               ; compare n2 (TOS) with n1 (NOS)
+    csetm   TOS, eq               ; Forth flag: -1 if equal, 0 otherwise
+    stk(2, 1)
+    next()
+endp()
+
+; >  ( n1 n2 -- flag )   signed greater-than
+proc(greater)
+    ldr     x9, [DSP]              ; x9 = NOS (n1)
+    cmp     x9, x0                ; compare n1 - n2 (NOS - TOS), signed
+    csetm   x0, gt                ; TOS = -1 if n1 > n2 else 0
+    stk(2, 1)
+    next()
+endp()
+
+; >=  ( n1 n2 -- flag )   signed greater-or-equal
+proc(greater_equal)
+    ldr     x9, [DSP]              ; x9 = NOS (n1)
+    cmp     x9, x0                ; compare n1 - n2  (n2 is TOS in x0)
+    csetm   x0, ge                ; TOS = -1 if n1 >= n2 (signed), else 0
+    stk(2, 1)
+    next()
+endp()
+
+; <  ( n1 n2 -- flag )    signed less-than: NOS < TOS
+proc(less)
+    ldr     x9, [DSP]              ; x9 = NOS (n1)
+    cmp     x9, TOS               ; compare NOS - TOS (signed)
+    csetm   TOS, lt               ; TOS = -1 if n1 < n2 (signed), else 0
+    stk(2, 1)
+    next()
+endp()
+
+; <=  ( n1 n2 -- flag )   ; flag = -1 if NOS <= TOS (signed), else 0
+proc(less_equal)
+    ldr     x9, [DSP]              ; x9 = NOS (n1)
+    cmp     x9, TOS               ; compare NOS against TOS (n2)
+    csetm   TOS, le               ; TOS = -1 if n1 <= n2 (signed), else 0
+    stk(2, 1)
+    next()
+endp()
+
+; max  ( n1 n2 -- max )    signed maximum
+proc(max_)
+    ldr     x9, [DSP]              ; x9 = NOS (n1)
+    cmp     x9, x0                ; compare NOS against TOS (n2)
+    csel    x0, x9, x0, gt        ; if NOS > TOS (signed) keep NOS, else keep TOS
+    stk(2, 1)                     ; pop one cell — ( n1 n2 -- max )
+    next()
+endp()
+
+; min  ( n1 n2 -- min )    signed minimum
+proc(min_)
+    ldr     x9, [DSP]              ; x9 = NOS (n1)
+    cmp     x9, x0                 ; compare NOS against TOS (n2), signed
+    csel    x0, x9, x0, lt         ; TOS = (n1 < n2) ? n1 : n2  → min
+    stk(2, 1)
+    next()
+endp()
+
+; <>  ( n1 n2 -- flag )   ; Forth -1 if n1 != n2, else 0
+proc(not_equal)
+    ldr     x9, [DSP]              ; x9 = NOS (n1)
+    cmp     TOS, x9               ; compare TOS (n2) with NOS (n1)
+    csetm   TOS, ne               ; TOS = -1 if n1 != n2, else 0
+    stk(2, 1)                     ; pop one cell (add x19,x19,#cell)
+    next()
+endp()
+
+; u>  ( u1 u2 -- flag )    unsigned greater-than
+proc(u_greater)
+    ldr     x9, [DSP]           ; x9 = NOS = u1
+    cmp     x9, x0              ; compare u1 (NOS) against u2 (TOS), unsigned
+    csetm   x0, hi              ; flag = -1 if u1 > u2 (unsigned), else 0
+    stk(2, 1)                   ; pop one cell; result stays cached in TOS
+    next()
+endp()
+
+; u>=  ( u1 u2 -- flag )    unsigned greater-than-or-equal
+proc(u_greater_equal)
+    ldr     x9, [DSP]              ; x9 = NOS = u1
+    cmp     x9, TOS               ; compare u1 - u2 (unsigned)
+    csetm   TOS, hs               ; flag = -1 iff u1 >= u2 (carry set / higher-or-same)
+    stk(2, 1)
+    next()
+endp()
+
+; u<  ( u1 u2 -- flag )    unsigned less-than
+proc(u_less)
+    ldr     x9, [DSP]              ; x9 = NOS (u1)
+    cmp     x9, TOS               ; compare u1 against TOS (u2), unsigned
+    csetm   TOS, lo               ; TOS = -1 if u1 < u2 unsigned, else 0
+    stk(2, 1)
+    next()
+endp()
+
+; u<=  ( u1 u2 -- flag )    unsigned less-than-or-equal
+proc(u_less_equal)
+    ldr     x9, [DSP]           ; x9 = NOS = u1
+    cmp     x9, x0              ; compare u1 with u2 (TOS); sets flags for u1 vs u2
+    csetm   x0, ls              ; flag = -1 if u1 <= u2 (unsigned lower-or-same), else 0
+    stk(2, 1)
+    next()
+endp()
+
+; umax  ( u1 u2 -- u3 )    unsigned maximum
+proc(umax)
+    ldr     x9, [DSP]              ; x9 = NOS (u1)
+    cmp     x9, x0                 ; compare u1 (NOS) against u2 (TOS), unsigned
+    csel    x0, x9, x0, hi         ; if u1 u> u2 keep NOS, else keep TOS  → umax
+    stk(2, 1)                      ; pop one cell — ( u1 u2 -- u3 )
+    next()
+endp()
+
+; umin  ( u1 u2 -- u3 )    unsigned minimum
+proc(umin)
+    ldr     x9, [DSP]              ; x9 = NOS (u1)
+    cmp     x9, TOS               ; compare NOS vs TOS (u2) unsigned
+    csel    TOS, x9, TOS, lo      ; if NOS u< TOS pick NOS, else keep TOS
+    stk(2, 1)
+    next()
+endp()
+
+; within  ( n low high -- flag )   true if low <= n < high
+;     Unsigned-compare trick (per ANS Forth): (n - low) u< (high - low).
+;     TOS = high (x0), NOS = low ([DSP]), NNOS = n ([DSP,#cell]).
+proc(within)
+    ldr     x9,  [DSP]              ; x9  = low  (NOS)
+    ldr     x10, [DSP, #cell]       ; x10 = n    (NNOS)
+    sub     x11, x0, x9            ; x11 = high - low
+    sub     x10, x10, x9           ; x10 = n - low
+    cmp     x10, x11              ; sets condition for (n-low) vs (high-low)
+    csetm   x0, lo                ; flag = -1 iff (n-low) u< (high-low), else 0
+    stk(3, 1)
+    next()
+endp()
+
+; 0=  ( n -- flag )   true (-1) if n == 0, else false (0)
+;     WF66 used `sub rax,1; sbb rax,rax` to fabricate -1/0; on AArch64
+;     this is a direct cmp-against-zero + csetm (Forth flag is all-ones).
+proc(zero_equal)
+    cmp     x0, #0
+    csetm   x0, eq            ; x0 = -1 if n==0 else 0
+    stk(1, 1)
+    next()
+endp()
+
+; 0>  ( n -- flag )   true (-1) if n > 0 (signed)
+proc(zero_greater)
+    cmp     TOS, #0                 ; compare n against 0
+    csetm   TOS, gt                 ; TOS = -1 if n > 0 (signed), else 0
+    stk(1, 1)
+    next()
+endp()
+
+; 0<  ( n -- flag )   true (-1) if n < 0
+;     Sign of n is its top bit. `asr x0, x0, #63` smears that sign bit
+;     across all 64 bits: all-ones (-1) if negative, all-zeros (0) otherwise —
+;     exactly a Forth flag. Direct translation of WF66's `sar rax, 63`.
+proc(zero_less)
+    asr     TOS, TOS, #63          ; smear sign bit → -1 if n<0, else 0
+    stk(1, 1)
+    next()
+endp()
+
+; 0max  ( n -- max(n, 0) )    clamp negative to zero
+proc(zero_max)
+    cmp     x0, #0              ; compare n (TOS) against 0
+    csel    x0, x0, xzr, gt     ; keep n if n > 0, else 0
+    stk(1, 1)
+    next()
+endp()
+
+; 0<>  ( n -- flag )   true (-1) if n != 0, else false (0)
+;     WF66 used `add rax,-1; sbb rax,rax` to smear -1/0 (the inverse of 0=).
+;     On AArch64 this is the direct idiom: compare TOS against zero and set
+;     a Forth flag with csetm (all-ones for true), condition `ne`.
+proc(zero_not_equal)
+    cmp     TOS, #0                ; sets Z=1 iff n == 0
+    csetm   TOS, ne                ; TOS = -1 if n != 0, else 0
+    stk(1, 1)                      ; ( n -- flag ): balanced, emits nothing
+    next()
+endp()
+
