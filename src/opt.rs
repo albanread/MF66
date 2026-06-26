@@ -118,146 +118,257 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
     out
 }
 
-const TOS: u32 = 0;
+const TOS: u32 = 0; // x0 — always holds the top of stack within a window
 const DSP: u32 = 19;
-const NOS: u32 = 9; // scratch for the popped second-on-stack
+const POOL: [u32; 7] = [9, 10, 11, 12, 13, 14, 15]; // register window below TOS
 
-/// Lower one reduced token run to AArch64 (appended to `out`).
+/// Register-windowing lowerer (O2). The invariant: TOS is in x0; the next cells
+/// down live in `below` registers (below[0] = NOS); cells beyond the window are in
+/// memory. Memory is touched lazily — only when a value must be pulled in, when
+/// the pool overflows, or at a window boundary (`settle`: before a Call and at the
+/// end). This replaces O1's per-op ldr/str with register-resident stack cells.
+struct Low<'a> {
+    out: &'a mut Vec<u32>,
+    below: Vec<u32>, // registers below TOS; below[0] = NOS
+    consumed: i64,   // memory cells pulled from below the window (cells)
+}
+
+impl<'a> Low<'a> {
+    fn new(out: &'a mut Vec<u32>) -> Self {
+        Low { out, below: Vec::new(), consumed: 0 }
+    }
+
+    /// A pool register not currently in the window (settling first if all are in use).
+    fn alloc(&mut self) -> u32 {
+        if let Some(&r) = POOL.iter().find(|r| !self.below.contains(r)) {
+            return r;
+        }
+        self.settle();
+        POOL[0]
+    }
+
+    /// Remove NOS (below[0]) into a register, pulling it from memory if the window
+    /// is empty. The returned register is no longer part of the window.
+    fn pop_nos(&mut self) -> u32 {
+        if !self.below.is_empty() {
+            return self.below.remove(0);
+        }
+        let r = self.alloc();
+        self.out.push(ldr_off(r, DSP, (self.consumed * 8) as u32));
+        self.consumed += 1;
+        r
+    }
+
+    /// Ensure NOS is resident in the window and return its register (kept in place).
+    fn ensure_nos(&mut self) -> u32 {
+        if self.below.is_empty() {
+            let r = self.alloc();
+            self.out.push(ldr_off(r, DSP, (self.consumed * 8) as u32));
+            self.consumed += 1;
+            self.below.insert(0, r);
+        }
+        self.below[0]
+    }
+
+    /// Push the current TOS down into the window (caller then sets the new TOS).
+    fn push_down(&mut self) {
+        let r = self.alloc();
+        self.out.push(mov_reg(r, TOS));
+        self.below.insert(0, r);
+    }
+
+    /// A transient scratch register (not tracked in the window).
+    fn scratch(&mut self) -> u32 {
+        self.alloc()
+    }
+
+    /// Settle the window if fewer than `need` pool registers are free, so an op
+    /// that holds window cells across an `alloc` won't have them spilled mid-op.
+    fn settle_if_tight(&mut self, need: usize) {
+        if POOL.len() - self.below.len() < need {
+            self.settle();
+        }
+    }
+
+    /// Write the window back to memory in canonical form (TOS stays in x0); reset.
+    fn settle(&mut self) {
+        let l = self.below.len() as i64;
+        let delta = self.consumed - l; // net DSP change, in cells
+        if delta > 0 {
+            self.out.push(add_imm(DSP, DSP, (delta * 8) as u32));
+        } else if delta < 0 {
+            self.out.push(sub_imm(DSP, DSP, ((-delta) * 8) as u32));
+        }
+        for i in 0..self.below.len() {
+            self.out.push(str_off(self.below[i], DSP, (i as u32) * 8)); // below[0]=NOS@[DSP]
+        }
+        self.below.clear();
+        self.consumed = 0;
+    }
+
+    fn lit(&mut self, n: i64) {
+        self.push_down();
+        load_imm64(TOS, n as u64, self.out);
+    }
+
+    fn bin(&mut self, op: Bin) {
+        let r = self.pop_nos();
+        self.out.push(match op {
+            Bin::Add => add_reg(TOS, TOS, r),
+            Bin::Sub => sub_reg(TOS, r, TOS), // NOS - TOS
+            Bin::Mul => mul(TOS, TOS, r),
+            Bin::And => and_reg(TOS, TOS, r),
+            Bin::Or => orr_reg(TOS, TOS, r),
+            Bin::Xor => eor_reg(TOS, TOS, r),
+        });
+    }
+
+    fn imm_bin(&mut self, op: Bin, k: i64) {
+        let small = (0..=4095).contains(&k);
+        let nsmall = (-4095..0).contains(&k);
+        match op {
+            Bin::Add if small => self.out.push(add_imm(TOS, TOS, k as u32)),
+            Bin::Add if nsmall => self.out.push(sub_imm(TOS, TOS, (-k) as u32)),
+            Bin::Sub if small => self.out.push(sub_imm(TOS, TOS, k as u32)),
+            Bin::Sub if nsmall => self.out.push(add_imm(TOS, TOS, (-k) as u32)),
+            _ => {
+                let r = self.scratch();
+                load_imm64(r, k as u64, self.out);
+                self.out.push(match op {
+                    Bin::Add => add_reg(TOS, TOS, r),
+                    Bin::Sub => sub_reg(TOS, TOS, r), // TOS - k
+                    Bin::Mul => mul(TOS, TOS, r),
+                    Bin::And => and_reg(TOS, TOS, r),
+                    Bin::Or => orr_reg(TOS, TOS, r),
+                    Bin::Xor => eor_reg(TOS, TOS, r),
+                });
+            }
+        }
+    }
+
+    fn dup_bin(&mut self, op: Bin) {
+        match op {
+            Bin::Add => self.out.push(add_reg(TOS, TOS, TOS)),
+            Bin::Mul => self.out.push(mul(TOS, TOS, TOS)),
+            Bin::And | Bin::Or => {} // a&a = a|a = a
+            Bin::Sub | Bin::Xor => self.out.push(movz(TOS, 0, 0)), // 0
+        }
+    }
+
+    fn stk(&mut self, s: Stk) {
+        match s {
+            Stk::Dup => {
+                let r = self.alloc();
+                self.out.push(mov_reg(r, TOS));
+                self.below.insert(0, r);
+            }
+            Stk::Drop => {
+                let r = self.pop_nos();
+                self.out.push(mov_reg(TOS, r));
+            }
+            Stk::Swap => {
+                self.settle_if_tight(2); // need NOS + a distinct scratch
+                let n = self.ensure_nos();
+                let t = self.scratch(); // ≠ n (scratch avoids window regs)
+                self.out.push(mov_reg(t, TOS));
+                self.out.push(mov_reg(TOS, n));
+                self.out.push(mov_reg(n, t));
+            }
+            Stk::Over => {
+                self.settle_if_tight(2); // need NOS kept + a push-down reg
+                let _ = self.ensure_nos(); // a = below[0]
+                self.push_down(); // b -> below[0]; a now at below[1]
+                let a = self.below[1];
+                self.out.push(mov_reg(TOS, a));
+            }
+            Stk::Nip => {
+                if self.below.is_empty() {
+                    self.consumed += 1; // skip the memory NOS
+                } else {
+                    self.below.remove(0);
+                }
+            }
+        }
+    }
+
+    fn cmp(&mut self, c: Cmp) {
+        match c {
+            Cmp::ZEq => {
+                self.out.push(cmp_imm(TOS, 0));
+                self.out.push(csetm(TOS, EQ));
+            }
+            Cmp::ZNe => {
+                self.out.push(cmp_imm(TOS, 0));
+                self.out.push(csetm(TOS, NE));
+            }
+            Cmp::ZLt => {
+                self.out.push(cmp_imm(TOS, 0));
+                self.out.push(csetm(TOS, LT));
+            }
+            Cmp::ZGt => {
+                self.out.push(cmp_imm(TOS, 0));
+                self.out.push(csetm(TOS, GT));
+            }
+            _ => {
+                let n = self.pop_nos();
+                let (rn, rm, cond) = match c {
+                    Cmp::Eq => (TOS, n, EQ),
+                    Cmp::Ne => (TOS, n, NE),
+                    Cmp::Lt => (n, TOS, LT), // NOS < TOS
+                    Cmp::Gt => (n, TOS, GT),
+                    Cmp::Le => (n, TOS, LE),
+                    Cmp::Ge => (n, TOS, GE),
+                    Cmp::ULt => (n, TOS, LO),
+                    Cmp::UGt => (n, TOS, HI),
+                    _ => unreachable!(),
+                };
+                self.out.push(cmp_reg(rn, rm));
+                self.out.push(csetm(TOS, cond));
+            }
+        }
+    }
+
+    fn mem(&mut self, m: Mem) {
+        match m {
+            Mem::Fetch => self.out.push(ldr0(TOS, TOS)),
+            Mem::CFetch => self.out.push(ldrb0(TOS, TOS)),
+            Mem::Store => {
+                let v = self.pop_nos();
+                self.out.push(str_off(v, TOS, 0)); // [addr] = value
+                let nt = self.pop_nos();
+                self.out.push(mov_reg(TOS, nt)); // drop addr → new TOS
+            }
+            Mem::CStore => {
+                let v = self.pop_nos();
+                self.out.push(strb0(v, TOS));
+                let nt = self.pop_nos();
+                self.out.push(mov_reg(TOS, nt));
+            }
+        }
+    }
+}
+
+/// Lower one reduced token run to AArch64 with register windowing (appended to
+/// `out`). Settles before each call and at the end so the canonical TOS=x0 /
+/// rest-in-memory form holds at every window boundary.
 pub fn lower(toks: &[Tok], out: &mut Vec<u32>) {
+    let mut low = Low::new(out);
     for &t in toks {
         match t {
-            Tok::Lit(n) => emit_lit(n, out),
-            Tok::Bin(op) => {
-                out.push(ldr_post(NOS, DSP, 8)); // pop NOS into x9
-                bin_nos_tos(op, out);
+            Tok::Lit(n) => low.lit(n),
+            Tok::Bin(op) => low.bin(op),
+            Tok::ImmBin(op, k) => low.imm_bin(op, k),
+            Tok::DupBin(op) => low.dup_bin(op),
+            Tok::Stk(s) => low.stk(s),
+            Tok::Cmp(c) => low.cmp(c),
+            Tok::Mem(m) => low.mem(m),
+            Tok::Call(xt) => {
+                low.settle();
+                emit_call(xt, low.out);
             }
-            Tok::ImmBin(op, k) => imm_bin(op, k, out),
-            Tok::DupBin(op) => dup_bin(op, out),
-            Tok::Stk(s) => stk(s, out),
-            Tok::Cmp(c) => cmp(c, out),
-            Tok::Mem(m) => mem(m, out),
-            Tok::Call(xt) => emit_call(xt, out),
         }
     }
-}
-
-/// `x0 = x9 <op> x0` for Sub (NOS - TOS), else `x0 = x0 <op> x9` (commutative).
-fn bin_nos_tos(op: Bin, out: &mut Vec<u32>) {
-    out.push(match op {
-        Bin::Add => add_reg(TOS, TOS, NOS),
-        Bin::Sub => sub_reg(TOS, NOS, TOS), // NOS - TOS
-        Bin::Mul => mul(TOS, TOS, NOS),
-        Bin::And => and_reg(TOS, TOS, NOS),
-        Bin::Or => orr_reg(TOS, TOS, NOS),
-        Bin::Xor => eor_reg(TOS, TOS, NOS),
-    });
-}
-
-/// `TOS = TOS <op> k`.
-fn imm_bin(op: Bin, k: i64, out: &mut Vec<u32>) {
-    let in_imm12 = (0..=4095).contains(&k);
-    let neg_imm12 = (-4095..0).contains(&k);
-    match op {
-        Bin::Add if in_imm12 => out.push(add_imm(TOS, TOS, k as u32)),
-        Bin::Add if neg_imm12 => out.push(sub_imm(TOS, TOS, (-k) as u32)),
-        Bin::Sub if in_imm12 => out.push(sub_imm(TOS, TOS, k as u32)),
-        Bin::Sub if neg_imm12 => out.push(add_imm(TOS, TOS, (-k) as u32)),
-        _ => {
-            load_imm64(NOS, k as u64, out); // k -> x9
-            out.push(match op {
-                Bin::Add => add_reg(TOS, TOS, NOS),
-                Bin::Sub => sub_reg(TOS, TOS, NOS), // TOS - k
-                Bin::Mul => mul(TOS, TOS, NOS),
-                Bin::And => and_reg(TOS, TOS, NOS),
-                Bin::Or => orr_reg(TOS, TOS, NOS),
-                Bin::Xor => eor_reg(TOS, TOS, NOS),
-            });
-        }
-    }
-}
-
-/// `dup` then `op`: the value combined with itself.
-fn dup_bin(op: Bin, out: &mut Vec<u32>) {
-    match op {
-        Bin::Add => out.push(add_reg(TOS, TOS, TOS)), // 2*a
-        Bin::Mul => out.push(mul(TOS, TOS, TOS)),     // a*a
-        Bin::And | Bin::Or => {}                       // a&a = a|a = a (no-op)
-        Bin::Sub | Bin::Xor => out.push(movz(TOS, 0, 0)), // a-a = a^a = 0
-    }
-}
-
-fn stk(s: Stk, out: &mut Vec<u32>) {
-    match s {
-        Stk::Dup => out.push(str_pre(TOS, DSP, -8)),
-        Stk::Drop => out.push(ldr_post(TOS, DSP, 8)),
-        Stk::Swap => {
-            out.push(ldr0(NOS, DSP)); // x9 = NOS
-            out.push(str_off(TOS, DSP, 0)); // NOS = TOS
-            out.push(mov_reg(TOS, NOS)); // TOS = old NOS
-        }
-        Stk::Over => {
-            out.push(ldr0(NOS, DSP)); // x9 = NOS (a)
-            out.push(str_pre(TOS, DSP, -8)); // push TOS (b)
-            out.push(mov_reg(TOS, NOS)); // TOS = a
-        }
-        Stk::Nip => out.push(add_imm(DSP, DSP, 8)), // drop NOS
-    }
-}
-
-fn cmp(c: Cmp, out: &mut Vec<u32>) {
-    match c {
-        // zero-compares: only TOS
-        Cmp::ZEq => {
-            out.push(cmp_imm(TOS, 0));
-            out.push(csetm(TOS, EQ));
-        }
-        Cmp::ZNe => {
-            out.push(cmp_imm(TOS, 0));
-            out.push(csetm(TOS, NE));
-        }
-        Cmp::ZLt => {
-            out.push(cmp_imm(TOS, 0));
-            out.push(csetm(TOS, LT));
-        }
-        Cmp::ZGt => {
-            out.push(cmp_imm(TOS, 0));
-            out.push(csetm(TOS, GT));
-        }
-        // binary compares: NOS vs TOS
-        _ => {
-            out.push(ldr_post(NOS, DSP, 8)); // x9 = NOS
-            let (rn, rm, cond) = match c {
-                Cmp::Eq => (TOS, NOS, EQ),  // symmetric
-                Cmp::Ne => (TOS, NOS, NE),
-                Cmp::Lt => (NOS, TOS, LT),  // NOS < TOS
-                Cmp::Gt => (NOS, TOS, GT),
-                Cmp::Le => (NOS, TOS, LE),
-                Cmp::Ge => (NOS, TOS, GE),
-                Cmp::ULt => (NOS, TOS, LO),
-                Cmp::UGt => (NOS, TOS, HI),
-                _ => unreachable!(),
-            };
-            out.push(cmp_reg(rn, rm));
-            out.push(csetm(TOS, cond));
-        }
-    }
-}
-
-fn mem(m: Mem, out: &mut Vec<u32>) {
-    match m {
-        Mem::Fetch => out.push(ldr0(TOS, TOS)), // x0 = [x0]
-        Mem::CFetch => out.push(ldrb0(TOS, TOS)),
-        Mem::Store => {
-            out.push(ldr_post(NOS, DSP, 8)); // x9 = value (NOS)
-            out.push(str_off(NOS, TOS, 0)); // [addr] = value
-            out.push(ldr_post(TOS, DSP, 8)); // raise new TOS (drop addr)
-        }
-        Mem::CStore => {
-            out.push(ldr_post(NOS, DSP, 8));
-            out.push(strb0(NOS, TOS));
-            out.push(ldr_post(TOS, DSP, 8));
-        }
-    }
+    low.settle();
 }
 
 #[cfg(test)]
