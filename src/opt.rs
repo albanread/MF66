@@ -224,6 +224,20 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
                 // immediate-fold: ... Lit k, Bin -> ImmBin(op, k)
                 if let Some(Tok::Lit(k)) = out.last().copied() {
                     out.pop();
+                    // immediate-immediate chaining: a preceding same-op immediate
+                    // absorbs this one. `(x op k1) op k2 = x op (k1∘k2)`; for + and
+                    // - the magnitudes add (x-k1-k2 = x-(k1+k2)), the rest use op.
+                    if let Some(Tok::ImmBin(prev, k1)) = out.last().copied() {
+                        if prev == op {
+                            let combined = match op {
+                                Bin::Sub => k1.wrapping_add(k),
+                                _ => op.eval(k1, k),
+                            };
+                            out.pop();
+                            out.push(Tok::ImmBin(op, combined));
+                            continue;
+                        }
+                    }
                     out.push(Tok::ImmBin(op, k));
                     continue;
                 }
