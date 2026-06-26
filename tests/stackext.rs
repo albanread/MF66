@@ -29,3 +29,19 @@ fn out(s:&str)->String{ Mf66Session::new().unwrap().eval_out(s).unwrap() }
     s.eval(": sum3 rot + + ;").unwrap();
     assert_eq!(s.eval_out("10 20 30 sum3 .").unwrap(), "60 ");
 }
+
+#[test] fn const_index_pick_roll_compiled() {
+    let mut s = Mf66Session::new().unwrap();
+    // N pick with literal N → static motion (0=dup,1=over,2=copy NNOS)
+    s.eval(": p0 0 pick ;").unwrap();
+    assert_eq!(s.eval_out("9 p0 . .").unwrap(), "9 9 ");      // dup
+    s.eval(": p2 2 pick ;").unwrap();
+    assert_eq!(s.eval_out("10 20 30 p2 . . . .").unwrap(), "10 30 20 10 "); // copy depth-2 (10)
+    // N roll with literal N → static permutation (2 roll = rot)
+    s.eval(": r2 2 roll ;").unwrap();
+    assert_eq!(s.eval_out("1 2 3 r2 . . .").unwrap(), "1 3 2 ");
+    s.eval(": r1 1 roll ;").unwrap();
+    assert_eq!(s.eval_out("5 9 r1 . .").unwrap(), "5 9 ");    // swap → 9 5 on stack, print 5 9
+    s.eval(": r3 3 roll ;").unwrap();
+    assert_eq!(s.eval_out("1 2 3 4 r3 . . . .").unwrap(), "1 4 3 2 "); // move depth-3 (1) to top
+}

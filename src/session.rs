@@ -715,6 +715,23 @@ impl Mf66Session {
             return Ok(());
         }
         let lk = tok.to_ascii_lowercase();
+        // Constant-index pick/roll: `N pick` / `N roll` with a literal N becomes
+        // static stack motion in the window (no runtime index, no kernel call) —
+        // the "everything is pick" model made concrete.
+        if matches!(lk.as_str(), "pick" | "roll") {
+            if let Some(Tok::Lit(n)) = self.pending.as_ref().and_then(|d| d.toks.last()).copied() {
+                if (0..=6).contains(&n) {
+                    self.pending.as_mut().unwrap().toks.pop(); // drop the literal index
+                    let t = if lk == "pick" {
+                        Tok::PickN(n as u32)
+                    } else {
+                        Tok::RollN(n as u32)
+                    };
+                    self.pending.as_mut().unwrap().toks.push(t);
+                    return Ok(());
+                }
+            }
+        }
         // cmp-branch fusion: a comparison immediately before if/until/while folds
         // into one cmp + b.<cond> (no -1/0 flag materialized).
         if matches!(lk.as_str(), "if" | "until" | "while") {

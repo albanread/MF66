@@ -65,6 +65,8 @@ pub enum Tok {
     IvarFetch(u32),   // push [SELF + off]  (OOP instance variable)
     IvarStore(u32),   // [SELF + off] = TOS; drop
     SelfPush,         // push the current receiver (user_SELF)
+    PickN(u32),       // copy the item at depth N to TOS (0=dup, 1=over, …)
+    RollN(u32),       // move the item at depth N to TOS (1=swap, 2=rot, …)
     Call(u64),
 }
 
@@ -405,6 +407,37 @@ impl<'a> Low<'a> {
         self.out.push(ldr_off(TOS, UP, USER_SELF)); // TOS = [UP + user_SELF]
     }
 
+    /// `N pick` — copy the item at depth N to a new TOS.
+    fn pick_n(&mut self, n: u32) {
+        if n == 0 {
+            return self.stk(Stk::Dup);
+        }
+        let n = n as usize;
+        self.settle_if_tight(n + 1);
+        self.ensure_below(n); // below[0..n-1] resident
+        self.push_down(); // old TOS → below[0]; depth-n item now at below[n]
+        let src = self.below[n];
+        self.out.push(mov_reg(TOS, src));
+    }
+
+    /// `N roll` — move the item at depth N to TOS, shifting the rest down.
+    fn roll_n(&mut self, n: u32) {
+        if n == 0 {
+            return; // 0 roll is identity
+        }
+        let n = n as usize;
+        self.settle_if_tight(n + 1);
+        self.ensure_below(n);
+        let item = self.below[n - 1]; // depth-n item
+        let r = self.scratch();
+        self.out.push(mov_reg(r, TOS)); // r = old TOS (becomes depth 1)
+        self.out.push(mov_reg(TOS, item)); // TOS = depth-n item
+        for i in (1..n).rev() {
+            self.below[i] = self.below[i - 1]; // shift down one depth
+        }
+        self.below[0] = r;
+    }
+
     fn ivar_fetch(&mut self, off: u32) {
         self.push_down();
         let r = self.alloc(); // transient: the SELF base
@@ -498,6 +531,8 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>) {
             Tok::IvarFetch(off) => low.ivar_fetch(off),
             Tok::IvarStore(off) => low.ivar_store(off),
             Tok::SelfPush => low.self_push(),
+            Tok::PickN(n) => low.pick_n(n),
+            Tok::RollN(n) => low.roll_n(n),
             Tok::Call(xt) => {
                 low.settle();
                 emit_call(xt, low.out);
