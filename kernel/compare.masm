@@ -216,13 +216,16 @@ endp()
 ;     analogue of WF66's cmp + sbb), which leaves N,Z,C,V set for a full
 ;     signed compare; `csetm ge` then fabricates the Forth flag (-1/0).
 proc(d_greater)
-    ldr     x9,  [DSP]              ; x9  = d2.low
-    ldr     x10, [DSP, #cell]       ; x10 = d1.high
-    ldr     x11, [DSP, #16]        ; x11 = d1.low  (offset 2*cell = 16)
-    subs    x12, x11, x9           ; d1.low - d2.low (sets borrow/carry)
-    sbcs    x12, x10, x0           ; d1.high - d2.high - borrow → flags = d1 vs d2
-    csetm   x0, ge                 ; -1 if d1 >= d2 (signed), else 0
-    stk(4, 1)                       ; pop three cells; flag stays cached in TOS
+    ; d1 > d2  ⟺  d2 < d1, so compute d2 - d1 and test signed `lt` — which (unlike
+    ; `gt`) does not depend on Z, whose value after a 128-bit sbcs reflects only
+    ; the high cell. (The original `ge` on d1-d2 made d> non-strict on equal.)
+    ldr     x9,  [DSP, #16]        ; x9  = d1.low
+    ldr     x10, [DSP]             ; x10 = d2.low
+    subs    x10, x10, x9           ; d2.low - d1.low
+    ldr     x11, [DSP, #cell]      ; x11 = d1.high
+    sbcs    x10, x0, x11           ; d2.high - d1.high - borrow → flags = d2 vs d1
+    csetm   x0, lt                 ; -1 if d2 < d1 (i.e. d1 > d2, strict) — ANS d>
+    stk(4, 1)
     next()
 endp()
 

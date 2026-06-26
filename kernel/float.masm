@@ -181,7 +181,7 @@ proc(floor_word)
     next()
 endp()
 proc(fround_word)
-    frintn  FTOS, FTOS                   ; round to nearest, ties to even
+    frinta  FTOS, FTOS                   ; round to nearest, ties away from zero (WF66)
     next()
 endp()
 proc(ftrunc_word)

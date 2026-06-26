@@ -29,4 +29,4 @@ push 0
 push 10
 push 0
 call d_greater
-expect -1
+expect 0

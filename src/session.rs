@@ -287,6 +287,7 @@ impl Mf66Session {
         self.eval(": -leading begin dup if over c@ 32 = else 0 then while 1 /string repeat ;")?;
         self.eval(": starts-with? rot over < if 2drop drop 0 else tuck compare 0= then ;")?;
         self.eval(": contains? search nip nip ;")?;
+        self.eval(": blank 32 fill ;")?; // ( c-addr u -- ) fill with spaces
         Ok(())
     }
 
