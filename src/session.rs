@@ -214,6 +214,35 @@ impl Mf66Session {
         self.call("publish_primitive")
     }
 
+    /// Interpret Forth `text`: for each whitespace-delimited token, find+execute
+    /// it, else parse it as a number (in the current `base`) and push it, else
+    /// error. Leaves results on the data stack. (Bring-up: tokenizing/number
+    /// parsing is Rust-side for now; the kernel-side parse + interpret loop comes
+    /// with output + the WF66 front-end.)
+    pub fn eval(&mut self, text: &str) -> Result<()> {
+        let base = self.read_user(UVAR_BASE) as u32;
+        for tok in text.split_whitespace() {
+            self.push_name(tok);
+            self.call("find_name")?;
+            if self.stack().first() == Some(&-1) {
+                // found: ( … nt -1 ) -> drop flag, nt -> xt, execute
+                self.call("drop_")?;
+                self.call("name_to_interpret")?;
+                self.call("execute")
+                    .with_context(|| format!("execute {tok}"))?;
+            } else {
+                // not found: ( … c-addr u 0 ) -> drop all three, then it must be a number
+                self.call("drop_")?;
+                self.call("drop_")?;
+                self.call("drop_")?;
+                let n = parse_forth_int(tok, base)
+                    .ok_or_else(|| anyhow::anyhow!("undefined word: {tok}"))?;
+                self.push(n);
+            }
+        }
+        Ok(())
+    }
+
     /// Publish every kernel primitive (the `PRIMITIVES` table) into the dictionary.
     fn bootstrap_dictionary(&mut self) -> Result<()> {
         for &(name, sym, immediate) in crate::primitives::PRIMITIVES {
@@ -262,4 +291,18 @@ impl Drop for Mf66Session {
 /// Locate `kernel/main.masm` relative to the crate root.
 fn kernel_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernel/main.masm")
+}
+
+/// Parse a Forth integer literal in `base` (2..=36), allowing a leading `-`.
+fn parse_forth_int(tok: &str, base: u32) -> Option<i64> {
+    let base = base.clamp(2, 36);
+    let (neg, digits) = match tok.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, tok),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mag = i64::from_str_radix(digits, base).ok()?;
+    Some(if neg { mag.wrapping_neg() } else { mag })
 }
