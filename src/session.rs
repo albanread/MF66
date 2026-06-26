@@ -6,9 +6,12 @@
 //! (`push`/`call`/`stack`), mirroring WF66's `Wf64Session`.
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+
+use crate::opt::Tok;
 use wfasm::backend::Loader;
 use wfasm::native_macos::MacJit;
 use wfasm::Assembler;
@@ -71,6 +74,10 @@ pub struct Mf66Session {
     pending: Option<ColonDef>,
     /// Set when `bye` is seen, to stop the REPL.
     bye: bool,
+    /// Optimizer vocabulary: primitive xt → the token(s) it inlines to.
+    vocab: HashMap<u64, Vec<Tok>>,
+    /// Word count of the most recently compiled colon body (for optimizer tests).
+    last_body_words: usize,
 }
 
 /// In-progress colon definition: the word name, the accumulated body words, and
@@ -79,6 +86,9 @@ struct ColonDef {
     name: String,
     body: Vec<u32>,
     cf: Vec<Cf>,
+    /// Accumulated straight-line token run (flushed → reduced → lowered into
+    /// `body` at each control-flow boundary and at `;`).
+    toks: Vec<Tok>,
 }
 
 /// A pending control-flow mark (compile time).
@@ -140,6 +150,8 @@ impl Mf66Session {
             code,
             pending: None,
             bye: false,
+            vocab: HashMap::new(),
+            last_body_words: 0,
         };
 
         s.write_user(USER_RSP_CURRENT, rstack_top);
@@ -161,6 +173,7 @@ impl Mf66Session {
         // kernel primitive so it is findable by its Forth name.
         s.call("init_dictionary_overlay")?;
         s.bootstrap_dictionary()?;
+        s.build_vocab()?;
         Ok(s)
     }
 
@@ -194,6 +207,12 @@ impl Mf66Session {
     /// Base of the user-area scratch (PAD) region.
     pub fn pad_base(&self) -> u64 {
         self.user_base + USER_PAD
+    }
+
+    /// Instruction-word count of the most recently compiled colon body. Lets
+    /// tests confirm the optimizer shrank the code (const-fold/inline/fuse).
+    pub fn last_body_words(&self) -> usize {
+        self.last_body_words
     }
 
     /// Invoke a primitive by its asm symbol through `forth_main`.
@@ -283,7 +302,12 @@ impl Mf66Session {
                     .ok_or_else(|| anyhow::anyhow!("`:` needs a name"))?;
                 let mut body = Vec::new();
                 crate::aenc::emit_nest(&mut body);
-                self.pending = Some(ColonDef { name: name.to_string(), body, cf: Vec::new() });
+                self.pending = Some(ColonDef {
+                    name: name.to_string(),
+                    body,
+                    cf: Vec::new(),
+                    toks: Vec::new(),
+                });
             } else {
                 self.interpret_token(tok)?;
             }
@@ -338,21 +362,85 @@ impl Mf66Session {
             lk.as_str(),
             "if" | "else" | "then" | "begin" | "until" | "while" | "repeat" | "do" | "loop" | "+loop"
         ) {
+            // Lower the accumulated straight-line run before the branch boundary.
+            self.flush_toks();
             return self.compile_control(&lk);
         }
         let base = self.read_user(UVAR_BASE) as u32;
         match self.xt_of_forth_name(tok)? {
             Some(xt) => {
-                let def = self.pending.as_mut().unwrap();
-                crate::aenc::emit_call(xt, &mut def.body);
+                let toks = self.vocab.get(&xt).cloned().unwrap_or_else(|| vec![Tok::Call(xt)]);
+                self.pending.as_mut().unwrap().toks.extend(toks);
             }
             None => {
                 let n = parse_forth_int(tok, base)
                     .ok_or_else(|| anyhow::anyhow!("undefined word: {tok}"))?;
-                let def = self.pending.as_mut().unwrap();
-                crate::aenc::emit_lit(n, &mut def.body);
+                self.pending.as_mut().unwrap().toks.push(Tok::Lit(n));
             }
         }
+        Ok(())
+    }
+
+    /// Reduce + lower the accumulated token run into the body, then clear it.
+    fn flush_toks(&mut self) {
+        if let Some(def) = self.pending.as_mut() {
+            if !def.toks.is_empty() {
+                let reduced = crate::opt::reduce(&def.toks);
+                crate::opt::lower(&reduced, &mut def.body);
+                def.toks.clear();
+            }
+        }
+    }
+
+    /// Build the optimizer vocabulary: primitive asm symbol → inline token(s).
+    fn build_vocab(&mut self) -> Result<()> {
+        use crate::opt::{Bin::*, Cmp::*, Mem::*, Stk::*};
+        let table: &[(&str, &[Tok])] = &[
+            ("plus", &[Tok::Bin(Add)]),
+            ("minus", &[Tok::Bin(Sub)]),
+            ("times", &[Tok::Bin(Mul)]),
+            ("and_", &[Tok::Bin(And)]),
+            ("or_", &[Tok::Bin(Or)]),
+            ("xor_", &[Tok::Bin(Xor)]),
+            ("dup_", &[Tok::Stk(Dup)]),
+            ("drop_", &[Tok::Stk(Drop)]),
+            ("swap_", &[Tok::Stk(Swap)]),
+            ("over_", &[Tok::Stk(Over)]),
+            ("nip_", &[Tok::Stk(Nip)]),
+            ("equal", &[Tok::Cmp(Eq)]),
+            ("not_equal", &[Tok::Cmp(Ne)]),
+            ("less", &[Tok::Cmp(Lt)]),
+            ("greater", &[Tok::Cmp(Gt)]),
+            ("less_equal", &[Tok::Cmp(Le)]),
+            ("greater_equal", &[Tok::Cmp(Ge)]),
+            ("u_less", &[Tok::Cmp(ULt)]),
+            ("u_greater", &[Tok::Cmp(UGt)]),
+            ("zero_equal", &[Tok::Cmp(ZEq)]),
+            ("zero_not_equal", &[Tok::Cmp(ZNe)]),
+            ("zero_less", &[Tok::Cmp(ZLt)]),
+            ("zero_greater", &[Tok::Cmp(ZGt)]),
+            ("fetch", &[Tok::Mem(Fetch)]),
+            ("store", &[Tok::Mem(Store)]),
+            ("c_fetch", &[Tok::Mem(CFetch)]),
+            ("c_store", &[Tok::Mem(CStore)]),
+            ("one_plus", &[Tok::Lit(1), Tok::Bin(Add)]),
+            ("one_minus", &[Tok::Lit(1), Tok::Bin(Sub)]),
+            ("two_plus", &[Tok::Lit(2), Tok::Bin(Add)]),
+            ("two_minus", &[Tok::Lit(2), Tok::Bin(Sub)]),
+            ("two_times", &[Tok::Lit(2), Tok::Bin(Mul)]),
+            ("cell_plus", &[Tok::Lit(8), Tok::Bin(Add)]),
+            ("cells", &[Tok::Lit(8), Tok::Bin(Mul)]),
+            ("char_plus", &[Tok::Lit(1), Tok::Bin(Add)]),
+            ("negate", &[Tok::Lit(-1), Tok::Bin(Mul)]),
+            ("invert", &[Tok::Lit(-1), Tok::Bin(Xor)]),
+        ];
+        let mut vocab = HashMap::new();
+        for (sym, toks) in table {
+            if let Ok(xt) = self.xt_of(sym) {
+                vocab.insert(xt, toks.to_vec());
+            }
+        }
+        self.vocab = vocab;
         Ok(())
     }
 
@@ -438,11 +526,13 @@ impl Mf66Session {
     /// Finish the pending colon definition: emit unnest+ret, commit the body to
     /// the code arena, create the header, and point it at the body (tfa = colon).
     fn finish_colon(&mut self) -> Result<()> {
+        self.flush_toks(); // lower the final straight-line run
         let mut def = self.pending.take().expect("finish_colon with no pending def");
         if !def.cf.is_empty() {
             anyhow::bail!("unbalanced control flow in `{}`", def.name);
         }
         crate::aenc::emit_unnest_ret(&mut def.body);
+        self.last_body_words = def.body.len();
         let xt = self.code.commit(&def.body)?;
         // Header (in the RW dict heap) via (create), then patch xt + type tag.
         self.push_name(&def.name);

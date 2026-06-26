@@ -16,6 +16,7 @@ pub mod aenc;
 pub mod asm_macros;
 pub mod codearena;
 pub mod jit;
+pub mod opt;
 pub mod primitives;
 pub mod runtime;
 pub mod session;

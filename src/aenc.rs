@@ -154,6 +154,66 @@ pub fn emit_plus_loop(out: &mut Vec<u32>, top: usize) {
     out.push(add_imm(RP, RP, 16));
 }
 
+// ── Optimizer lowering encoders ───────────────────────────────────────────
+/// `mul Xd, Xn, Xm`.
+pub fn mul(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x9B00_7C00 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `and Xd, Xn, Xm`.
+pub fn and_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x8A00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `orr Xd, Xn, Xm`.
+pub fn orr_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+    0xAA00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `sub Xd, Xn, #imm12`.
+pub fn sub_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
+    0xD100_0000 | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `cmp Xn, Xm`  (= subs xzr, Xn, Xm).
+pub fn cmp_reg(rn: u32, rm: u32) -> u32 {
+    0xEB00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | 31
+}
+/// `cmp Xn, #imm12`.
+pub fn cmp_imm(rn: u32, imm12: u32) -> u32 {
+    0xF100_0000 | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | 31
+}
+/// `csetm Xd, <cond>`  (Forth flag: all-ones if cond else 0 = csinv Xd,xzr,xzr,!cond).
+pub fn csetm(rd: u32, cond: u32) -> u32 {
+    let inv = cond ^ 1; // invert low bit of the condition
+    0xDA80_0000 | (31 << 16) | ((inv & 0xF) << 12) | (31 << 5) | (rd & 0x1F)
+}
+/// `ldrb Wt, [Xn]`.
+pub fn ldrb0(rt: u32, rn: u32) -> u32 {
+    0x3940_0000 | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+/// `strb Wt, [Xn]`.
+pub fn strb0(rt: u32, rn: u32) -> u32 {
+    0x3900_0000 | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+/// `neg Xd, Xm`  (= sub Xd, xzr, Xm).
+pub fn neg(rd: u32, rm: u32) -> u32 {
+    0xCB00_03E0 | ((rm & 0x1F) << 16) | (rd & 0x1F)
+}
+/// `mvn Xd, Xm`  (= orn Xd, xzr, Xm).
+pub fn mvn(rd: u32, rm: u32) -> u32 {
+    0xAA20_03E0 | ((rm & 0x1F) << 16) | (rd & 0x1F)
+}
+
+// AArch64 condition codes.
+pub const EQ: u32 = 0;
+pub const NE: u32 = 1;
+pub const HS: u32 = 2; // unsigned >=
+pub const LO: u32 = 3; // unsigned <
+pub const HI: u32 = 8; // unsigned >
+pub const LS: u32 = 9; // unsigned <=
+pub const GE: u32 = 10;
+pub const LT: u32 = 11;
+pub const GT: u32 = 12;
+pub const LE: u32 = 13;
+pub const MI: u32 = 4; // negative
+
 const SCRATCH: u32 = 9; // x9
 
 /// Compile a Forth `IF`/`UNTIL`/`WHILE` flag test: consume TOS (raise NOS),
@@ -206,6 +266,23 @@ mod cf_tests {
         // constants (fixed bits match `llvm-mc -triple=aarch64-apple-darwin`).
         assert_eq!(tbz(11, 63, 2), 0xB6F8_004B);
         assert_eq!(tbz(9, 5, 2), 0x3628_0049);
+    }
+
+    #[test]
+    fn opt_encoders_match_assembler() {
+        assert_eq!(vec![mul(0, 0, 9)], asm("mul x0, x0, x9"));
+        assert_eq!(vec![and_reg(0, 0, 9)], asm("and x0, x0, x9"));
+        assert_eq!(vec![orr_reg(0, 0, 9)], asm("orr x0, x0, x9"));
+        assert_eq!(vec![sub_imm(0, 0, 5)], asm("sub x0, x0, #5"));
+        assert_eq!(vec![cmp_reg(9, 0)], asm("cmp x9, x0"));
+        assert_eq!(vec![cmp_imm(0, 0)], asm("cmp x0, #0"));
+        assert_eq!(vec![csetm(0, EQ)], asm("csetm x0, eq"));
+        assert_eq!(vec![csetm(0, LT)], asm("csetm x0, lt"));
+        assert_eq!(vec![ldrb0(0, 0)], asm("ldrb w0, [x0]"));
+        assert_eq!(vec![strb0(9, 0)], asm("strb w9, [x0]"));
+        assert_eq!(vec![neg(0, 0)], asm("neg x0, x0"));
+        assert_eq!(vec![mvn(0, 0)], asm("mvn x0, x0"));
+        assert_eq!(vec![ldr_post(9, 19, 8)], asm("ldr x9, [x19], #8"));
     }
 }
 
