@@ -83,9 +83,29 @@ FP/LR.
   Forth word); the crash handler (§6) must walk the Forth return stack manually.
 
 **Darwin call-out rule (⚠):** the Forth return stack on `sp` is frequently at
-8-mod-16, but AAPCS64 requires `sp` 16-byte aligned at every `bl`/`blr`. The
-`aapcs_call` macro must **actively re-align sp** (save, `and sp,sp,#-16`, call,
-restore) on every host call-out — per-call overhead the naïve plan omitted.
+8-mod-16, but AAPCS64 requires `sp` 16-byte aligned at every `bl`/`blr`.
+
+`sp` alignment is a **framing concern, optimized like `coalesce_dsp`** — track it
+as data, guarantee it, emit fix-ups only where they are actually needed:
+
+- **MVP / correctness first:** `aapcs_call` re-aligns defensively (save sp, `and
+  sp,sp,#-16`, call, restore) so it is *always* correct regardless of caller
+  parity. This is the Phase-1 implementation. Never call out with `sp` misaligned.
+- **Optimized (Phase 5+):** the return stack only moves by *statically known*
+  cell deltas (each `>r`/`r>`/nest/unnest is ±8, every word entry/exit is a fixed
+  frame). So the compiler can carry an **`sp`-alignment parity** through the IR
+  exactly as `coalesce_dsp` carries the running DSP delta, and **elide the
+  realign at any call site where `sp` is provably 16-aligned** (e.g. an even
+  number of return-stack pushes since the last known-aligned point, or a word
+  that maintains a 16-aligned frame). The realign is emitted **only** at sites
+  where parity is unknown or odd — minimal fix-ups, never blanket overhead, while
+  the invariant (aligned at every `bl`) is preserved by construction.
+
+This makes alignment a tracked property of the deferred-assembly buffer rather
+than a per-call tax: the same "defer, track the delta, emit the minimal
+adjustment at the window edge" discipline `coalesce_dsp`/`window_fuse` already
+use. (Open: model alignment parity as a 1-bit lattice on the `Instr` stream, with
+calls/labels/Raw spans as the points where unknown parity forces a realign.)
 
 Why this mapping: everything that must survive a settle-barrier rt_* call (DSP,
 UP, LP, FTOS, FSP, both promotion pools) is **callee-saved**, so the
@@ -222,8 +242,9 @@ x86-only) is gated off; metrics are diagnostic, never a gate.
    callback through a far-call veneer, and a DSP-relative data-stack idiom all run;
    `src/abi.rs` encodes the register homes + pool invariants.
 1. **Kernel macro library + ABI** (`macros.masm` K0) — register homes (§2),
-   `aapcs_call` (with sp realign), `forth_main` prologue/epilogue (save
-   x19–x28, x30, d8–d15). *Verify:* a 2-word kernel runs via `forth_main`.
+   `aapcs_call` (**defensive** sp realign — always-correct; parity-elision is a
+   Phase-5+ optimization, §2), `forth_main` prologue/epilogue (save x19–x28, x30,
+   d8–d15). *Verify:* a 2-word kernel runs via `forth_main`.
 2. **Boot headless** — ⚠ port by **boot-criticality, not mechanical-vs-hard**:
    macros + stack + rstack + memory + the *subset* of arith (`+ - */mod`) and
    compare (`= < 0= 0<`) that `number`/`find` need + dict-find + number + parse +
@@ -236,11 +257,14 @@ x86-only) is gated off; metrics are diagnostic, never a gate.
 4. **FP + math** — `float`/`fmath`, libm via `aapcs_call`, FTOS=d8, FSP=x22.
    *Verify:* FP suite matches within IEEE-754 identity.
 5. **Optimizer back-end** — §3 + ⚠§4: `ArchReg`/`RegFile`, `lower()`→`Instr`,
-   AArch64 `render()`, re-tuned promote/fuse thresholds, NZCV-liveness guard.
-   Kernel peephole (`compile.masm` K4) stays **disabled** (its backward scan
-   assumes fixed x86 sizes; accept ~5–10% leaf loss; the Rust reducer has most of
-   the win). *Verify:* round-trip tests; reducer cross-check; optimized ==
-   unoptimized == corpus observable state.
+   AArch64 `render()`, re-tuned promote/fuse thresholds, NZCV-liveness guard, and
+   **sp-alignment-parity tracking** (§2 — elide redundant `aapcs_call` realigns
+   where `sp` is provably 16-aligned, like `coalesce_dsp` for DSP). Kernel
+   peephole (`compile.masm` K4) stays **disabled** (its backward scan assumes
+   fixed x86 sizes; accept ~5–10% leaf loss; the Rust reducer has most of the
+   win). *Verify:* round-trip tests; reducer cross-check; optimized == unoptimized
+   == corpus observable state; **no `bl`/`blr` ever reached with misaligned sp**
+   (alignment-elision soundness check).
 6. **GC** — §5: Forth `HeapLayout`, tagged-root scanner, the kernel-wide tag
    invariant + `enter_native`/`leave_native`. *Verify:* allocation churn survives
    forced minor/major/full with no corruption; no live root dropped.
