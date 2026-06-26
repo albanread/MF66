@@ -45,10 +45,14 @@ The **differential corpus** (`tests/data/direct/`, 150 `.t` files imported from
 WF66 — the day-one oracle) drives a workflow-based per-primitive port: translate
 the WF66 x86 proc → AArch64, adversarially verify it, then the word's `.t` flips
 NYIMP → PASS (PASS = matches WF66's observed behavior). See
-[docs/porting-guide.md](docs/porting-guide.md). **Batch 1: 49 boot-critical
-register-only primitives** (arith/compare/logic/stack) → **corpus 50/150 PASS, 0
-FAIL**. Next: memory + rstack, hard arith (double-cell/division), then
-dict/number/parse/interpreter.
+[docs/porting-guide.md](docs/porting-guide.md).
+
+**The full integer / memory / string / number primitive layer is ported and
+differentially verified — corpus 147/150 PASS, 0 FAIL** (161 kernel primitives
+across arith/compare/logic/stack/memory/strings/number/dict). The remaining 3
+need subsystems not yet built: `float_subset`+`fractal_iter` (FP → Phase 4) and
+`self` (oop). Next: the dict/find/number/parse/interpreter substrate that lights
+up a live REPL + the eval corpus.
 
 - **Phase 0** — a hand-written AArch64 word assembles through JASM, loads into
   `MAP_JIT` memory, flips W^X, and executes, incl. an AAPCS64 host callback via a

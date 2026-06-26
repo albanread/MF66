@@ -196,29 +196,20 @@ proc(count)
 endp()
 
 ; count-bits  ( n -- bits )    population count (number of 1 bits)
-;   AArch64 has no scalar GPR popcount, and the NEON idiom is unusable here:
-;   the MF66 front-end lexer treats a `.<arr>` suffix (`.8b`, `.16b`, …) as a
-;   local-label reference, so inside the `proc()` @scope `v0.8b` is mangled to
-;   `v0<scope>$$8b` and the kernel fails to assemble. Use the classic all-GPR
-;   SWAR popcount instead (x9/x10 scratch). The 0x5555…/0x3333…/0x0f0f… masks
-;   are valid AArch64 logical bitmask immediates; the 0x0101010101010101
-;   multiply constant is materialized with movz/movk.
+;   AArch64 has no scalar GPR popcount, so use the NEON idiom: park the value
+;   in a vector register, `cnt` each byte, then horizontal-add the byte counts.
+;   v0 is caller-saved scratch and `.8b` touches only its low 64 bits, so this
+;   never disturbs FTOS (d8, callee-saved low 64) — see the q8–q15 ban in
+;   docs/design/mf66-apple-silicon.md.
+;   (Earlier this was a SWAR fallback because the front-end @scope mangler
+;   captured the leading-dot `.8b` arrangement suffix and corrupted `v0.8b`
+;   into `v0count_bits$$8b`; that JASM front-end bug is now fixed — a `.<arr>`
+;   suffix glued to a register passes through verbatim.)
 proc(count_bits)
-    lsr     x9, x0, #1
-    and     x9, x9, #0x5555555555555555      ; x9 = (n >> 1) & 0x5555...
-    sub     x0, x0, x9                       ; n -= that  (2-bit field sums)
-    and     x9, x0, #0x3333333333333333
-    lsr     x10, x0, #2
-    and     x10, x10, #0x3333333333333333
-    add     x0, x9, x10                     ; 4-bit field sums
-    add     x9, x0, x0, lsr #4
-    and     x9, x9, #0x0f0f0f0f0f0f0f0f      ; 8-bit field sums (byte counts)
-    movz    x10, #0x0101                    ; build 0x0101010101010101
-    movk    x10, #0x0101, lsl #16
-    movk    x10, #0x0101, lsl #32
-    movk    x10, #0x0101, lsl #48
-    mul     x9, x9, x10                     ; sum bytes into the top byte
-    lsr     x0, x9, #56                     ; bits -> TOS
+    fmov    d0, TOS                ; v0 low 64 = n  (v0 = caller-saved scratch)
+    cnt     v0.8b, v0.8b           ; per-byte popcount: each byte -> its set-bit count (0..8)
+    addv    b0, v0.8b              ; horizontal-add the 8 byte counts -> b0 (0..64), upper lanes zeroed
+    fmov    TOS, d0                ; total bits back into TOS (x0); addv cleared the high bits
     stk(1, 1)
     next()
 endp()

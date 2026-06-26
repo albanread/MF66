@@ -1,0 +1,229 @@
+; MF66 kernel — number conversion (ported from WF66 kernel/number.masm).
+; Internal form: TOS in x0, NOS at [DSP] (x19). See docs/porting-guide.md.
+
+; base@  ( -- base )    fetch the current numeric base.
+proc(base_fetch)
+    str     TOS, [DSP, #-cell]      ; spill cached TOS into the new NOS slot
+    ldr     TOS, [UP, #user_BASE]   ; TOS <- current numeric base
+    stk(0, 1)                       ; net push: sub x19, x19, #cell
+    next()
+endp()
+
+; base!  ( base -- )    store the current numeric base.
+proc(base_store)
+    str     TOS, [UP, #user_BASE]   ; user BASE ← new base value (was in TOS)
+    ldr     TOS, [DSP]              ; raise NOS into TOS (pop)
+    stk(1, 0)                       ; emits `add x19, x19, #cell`
+    next()
+endp()
+
+; base  ( -- addr )    return the address of the current numeric base.
+proc(base_word)
+    str     TOS, [DSP, #-cell]      ; push old TOS down into the new NOS slot
+    add     TOS, UP, #user_BASE     ; TOS = &BASE (lea [UP + user_BASE]); user_BASE = 0
+    stk(0, 1)                       ; net push: DSP -= cell
+    next()
+endp()
+
+; decimal  ( -- )    set BASE to 10.
+proc(decimal_word)
+    mov     x9, #10                 ; AArch64 has no store-immediate; stage 10 in a scratch
+    str     x9, [UP, #user_BASE]    ; BASE := 10
+    stk(0, 0)
+    next()
+endp()
+
+; digit  ( char base -- n flag )
+;     Convert one ASCII digit in the given base. On success: replace
+;     (char base) with (n -1). On failure: leave the original char in
+;     NOS and return 0 as the flag, matching WF32's stack shape.
+;     TOS (x0) = base, NOS [DSP] = char. The digit value is computed in
+;     w9 with 32-bit ops (mirrors WF66's ecx), which zero-extend x9 so
+;     the final unsigned compare against the 64-bit base in x0 is clean.
+;     b.<cond> is corrupted by the @scope mangler, so every conditional
+;     branch is `cset`/`subs` + `cbz`/`cbnz` (the kernel idiom).
+proc(digit)
+    ldr     w9, [DSP]              ; w9 = char (NOS), zero-extended into x9
+    subs    w9, w9, #0x30         ; w9 = char - '0'; C clear (lo) iff char < '0'
+    cset    x10, lo               ; x10 = 1 iff char < '0'  (WF66 `jb .false`)
+    cbnz    x10, .false
+    cmp     w9, #9                ; '0'..'9' ?
+    cset    x10, ls               ; x10 = 1 iff (char-'0') u<= 9  (`jbe .maybe_ok`)
+    cbnz    x10, .maybe_ok
+    sub     w9, w9, #7            ; letter: 'A'(0x41) -> 10, etc.
+    cmp     w9, #10               ; reject gap between '9' and 'A'
+    cset    x10, lo               ; x10 = 1 iff result u< 10  (`jb .false`)
+    cbnz    x10, .false
+.maybe_ok:
+    cmp     x9, x0                ; digit value vs base (unsigned, full 64-bit)
+    cset    x10, hs               ; x10 = 1 iff digit u>= base  (`jae .false`)
+    cbnz    x10, .false
+    str     x9, [DSP]             ; NOS = n (the digit value)
+    mov     x0, #-1               ; TOS = flag -1 (success)
+    b       .done
+.false:
+    mov     x0, #0                ; TOS = flag 0; NOS left as original char
+.done:
+    stk(2, 2)                     ; ( char base -- n flag ): balanced, emits nothing
+    next()
+endp()
+
+; number?  ( c-addr u -- n -1 | c-addr u 0 )
+;     Try to parse the bytes at c-addr as a signed integer in BASE.
+;     On success: replace (c-addr u) with (n -1).
+;     On failure: leave (c-addr u) and push 0 (preserve-on-failure, like
+;     find-name, so quit's dispatch can chain find-name -> number? -> error).
+;
+;     Reg map (WF66 -> MF66): r10 orig c-addr stays live in [DSP]; r11 orig u
+;     is stashed at [DSP,#-cell] up front so the failure path needs no register
+;     copy of it (frees x10 as a loop predicate temp). x11=working len (rcx),
+;     x12=working addr (rsi), x13=base (rdi), x14=accumulator (r8),
+;     x15=sign (r9), x9/x10=byte/digit + predicate scratch (rax/rdx).
+proc(number_q)
+    ldr     x12, [DSP]              ; x12 = working addr (orig c-addr stays in [DSP])
+    str     TOS, [DSP, #-cell]      ; stash original u below the stack for the failure path
+    mov     x11, TOS               ; x11 = working len (rcx)
+    cbz     x11, .invalid          ; empty string is not a number
+    mov     x14, #0                ; accumulator (r8)
+    mov     x15, #0                ; sign flag (r9): 0 = positive
+    ldr     x13, [UP, #user_BASE]  ; numeric base (rdi)
+
+    ; Optional leading minus.
+    ldrb    w9, [x12]              ; w9 = *addr (zero-extended), like movzx rax,[rsi]
+    sub     x10, x9, #0x2d         ; '-' ?
+    cbnz    x10, .check_dollar     ; not '-': fall through to prefix checks
+    mov     x15, #1               ; sign = negative
+    add     x12, x12, #1          ; addr++
+    sub     x11, x11, #1          ; len--
+    cbz     x11, .invalid         ; "-" by itself is not a number
+
+    ; Optional $ prefix (forces hex base, may follow -).
+.check_dollar:
+    ldrb    w9, [x12]              ; reload first byte at current addr
+    sub     x10, x9, #0x24         ; '$' ?
+    cbnz    x10, .check_0x
+    mov     x13, #16              ; force hex for this literal
+    add     x12, x12, #1
+    sub     x11, x11, #1
+    cbz     x11, .invalid         ; "$" or "-$" alone is not a number
+    b       .digits
+
+    ; Optional 0x / 0X prefix (forces hex base, may follow -).
+.check_0x:
+    cmp     x11, #2               ; need at least two chars for "0x..."
+    cset    x10, lo               ; len < 2 ?
+    cbnz    x10, .digits
+    sub     x10, x9, #0x30        ; first byte (still in x9) == '0' ?
+    cbnz    x10, .digits
+    ldrb    w10, [x12, #1]        ; second byte
+    orr     w10, w10, #0x20       ; fold 'X' (0x58) -> 'x' (0x78)
+    sub     x10, x10, #0x78       ; == 'x' ?
+    cbnz    x10, .digits
+    mov     x13, #16              ; force hex
+    add     x12, x12, #2
+    sub     x11, x11, #2
+    cbz     x11, .invalid         ; "0x" or "-0x" alone is not a number
+
+.digits:
+    cbz     x11, .accept          ; consumed all bytes -> number is good
+    ldrb    w9, [x12]             ; w9 = next byte (zero-extended)
+    cmp     x9, #0x30             ; '0'
+    cset    x10, lo               ; below '0' -> not a digit
+    cbnz    x10, .invalid
+    cmp     x9, #0x39             ; '9'
+    cset    x10, ls               ; <= '9' (unsigned) -> numeric, skip the letter fixup
+    cbnz    x10, .deascii
+    and     x9, x9, #-33          ; clear case bit (& 0xDF): fold a-z to A-Z
+    cmp     x9, #0x41             ; 'A'
+    cset    x10, lo               ; below 'A' -> invalid
+    cbnz    x10, .invalid
+    sub     x9, x9, #7            ; bridge the '9'..'A' gap so the next sub yields 10..
+
+.deascii:
+    sub     x9, x9, #0x30         ; ASCII -> digit value
+    cmp     x9, x13               ; value vs base
+    cset    x10, hs               ; value >= base (unsigned) -> digit not valid in BASE
+    cbnz    x10, .invalid
+    mul     x14, x14, x13         ; acc *= base   (was imul r8,rdi)
+    add     x14, x14, x9          ; acc += digit
+    add     x12, x12, #1          ; addr++
+    sub     x11, x11, #1          ; len--
+    b       .digits
+
+.accept:
+    cbz     x15, .positive        ; sign == 0 -> leave acc positive
+    neg     x14, x14             ; apply the leading minus
+.positive:
+    str     x14, [DSP]            ; NOS slot (was c-addr) <- n
+    mov     TOS, #-1             ; TOS <- true flag
+    stk(2, 2)                    ; 2 in, 2 out -- balanced, emits nothing
+    next()
+
+.invalid:
+    ; Preserve (c-addr u); push 0 on top. Original u is already at [DSP,#-cell]
+    ; (stashed on entry) and c-addr is untouched in [DSP], so just set the flag
+    ; and grow the stack by one cell.
+    mov     TOS, #0              ; TOS <- 0 (failure flag)
+    stk(2, 3)                    ; net push one cell (sub x19, x19, #cell)
+    next()
+endp()
+
+; octal  ( -- )    set BASE to 8.
+proc(octal_word)
+    mov     x9, #8                  ; AArch64 has no store-immediate; stage 8 in a scratch
+    str     x9, [UP, #user_BASE]    ; user_BASE = 0x00; BASE := 8
+    stk(0, 0)                       ; ( -- ): no net stack effect, emits nothing
+    next()                          ; = ret
+endp()
+
+proc(to_number)
+    cbz     x0, .done                  ; len == 0: nothing to convert (TOS=len, [DSP]=addr already correct)
+    mov     x11, x0                    ; x11 = remaining len  (was rcx)
+    ldr     x10, [DSP]                 ; x10 = current addr   (was rsi)
+    ldr     x13, [UP, #user_BASE]      ; x13 = numeric base   (was rdi)
+    ldr     x15, [DSP, #cell]          ; x15 = accumulator high half
+    ldr     x9,  [DSP, #16]            ; x9  = accumulator low half (#16 = 2*cell)
+
+.loop:
+    ldrb    w12, [x10]                 ; w12 = *addr (zero-extended byte), was movzx eax,[rsi]
+    cmp     w12, #0x30                 ; compare with '0'
+    cset    w14, lo                    ; w14 = (char < '0')
+    cbnz    w14, .stop                 ; below '0' -> stop
+    cmp     w12, #0x39                 ; compare with '9'
+    cset    w14, ls                    ; w14 = (char <= '9') unsigned
+    cbnz    w14, .deascii              ; plain decimal digit
+    and     w12, w12, #0xffffffdf      ; fold case (clear bit 5): == `and eax,0xdf` over a zero-extended byte (bic-imm not encodable)
+    cmp     w12, #0x41                 ; compare with 'A'
+    cset    w14, lo
+    cbnz    w14, .stop                 ; below 'A' -> stop (punctuation between '9' and 'A')
+    sub     w12, w12, #7               ; letter adjust so the next sub yields 10,11,...
+.deascii:
+    sub     w12, w12, #0x30            ; ASCII -> digit value (subtract '0')
+    cmp     x12, x13                   ; digit vs base (unsigned), was cmp rax,rdi / jae
+    cset    w14, hs                    ; w14 = (digit >= base)
+    cbnz    w14, .stop                 ; digit not valid in this base -> stop
+
+    ; ud = ud*base + digit, double-cell (x15:x9 = high:low). Mirrors WF66's two
+    ; `mul rdi` halves: low64(high*base) + high64(low*base) feed the new high,
+    ; low64(low*base)+digit feeds the new low, carry propagates with adds/adc.
+    mul     x14, x15, x13              ; x14 = low64(high * base)   (high contribution A)
+    umulh   x15, x9,  x13              ; x15 = high64(low * base)   (high contribution B); old high consumed
+    add     x14, x14, x15              ; x14 = A + B (excess >128 bits discarded, as WF66 does)
+    mul     x9,  x9,  x13              ; x9  = low64(low * base)    (new low, pre-digit)
+    adds    x9,  x9,  x12              ; new low = low*base + digit, sets carry
+    adc     x15, x14, xzr              ; new high = (A + B) + carry
+
+    add     x10, x10, #1               ; addr++
+    subs    x11, x11, #1               ; len--
+    cbnz    x11, .loop                 ; more bytes -> continue
+
+.stop:
+    mov     TOS, x11                   ; TOS = remaining len (was mov rax,rcx)
+    str     x10, [DSP]                 ; NOS = current addr  (was mov [rbp],rsi)
+    str     x9,  [DSP, #16]            ; write back accumulator low half
+    str     x15, [DSP, #cell]          ; write back accumulator high half
+.done:
+    stk(4, 4)                          ; net zero: emits nothing (4 in, 4 out)
+    next()
+endp()
+

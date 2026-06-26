@@ -1,0 +1,30 @@
+; MF66 kernel — dictionary helpers (ported from WF66 kernel/dict.masm).
+; Internal form: TOS in x0, NOS at [DSP] (x19). See docs/porting-guide.md.
+
+; largest  ( addr count -- max-addr max )
+;     Scan `count` cells starting at `addr`, returning the address of the
+;     largest cell and its value. Faithful port of WF66's dict helper.
+;     Entry: TOS=x0=count, [DSP]=addr (NOS). WF66 seeds best value = 0 and
+;     updates only on a STRICTLY-GREATER (signed) cell, so on equal maxima
+;     the FIRST one wins (pinned by largest.t case 2). stk(2,2) is balanced.
+proc(largest)
+    mov     x9,  TOS                ; x9  = count
+    ldr     x10, [DSP]              ; x10 = current addr (NOS)
+    mov     x11, #0                 ; x11 = best value = 0
+    mov     x12, x10               ; x12 = best addr = start
+.loop:
+    cbz     x9,  .done              ; count == 0 -> finished (guards underflow)
+    ldr     x13, [x10]             ; x13 = *addr (current cell value)
+    cmp     x13, x11               ; current vs best (signed)
+    csel    x11, x13, x11, gt      ; best value = current if current > best
+    csel    x12, x10, x12, gt      ; best addr  = this  if current > best
+    add     x10, x10, #cell        ; advance to next cell
+    sub     x9,  x9,  #1           ; count--
+    b       .loop
+.done:
+    str     x12, [DSP]             ; NOS = best addr (max-addr)
+    mov     TOS, x11               ; TOS = best value (max)
+    stk(2, 2)                       ; ( addr count -- max-addr max ): balanced
+    next()
+endp()
+
