@@ -13,6 +13,7 @@
 
 pub mod abi;
 pub mod aenc;
+pub mod crash;
 pub mod asm_macros;
 pub mod codearena;
 pub mod jit;

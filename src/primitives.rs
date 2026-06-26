@@ -226,4 +226,10 @@ pub const PRIMITIVES: &[(&str, &str, bool)] = &[
     ("depth", "depth_word", false),
     ("pick", "pick_word", false),
     ("roll", "roll_word", false),
+    // Pictured numeric output (MF66 numout.masm)
+    ("<#", "pic_start", false),
+    ("hold", "hold_word", false),
+    ("#", "pic_digit", false),
+    ("#>", "pic_end", false),
+    ("sign", "sign_word", false),
 ];

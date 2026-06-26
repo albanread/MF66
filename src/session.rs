@@ -41,6 +41,9 @@ const USER_SP0: usize = 0x68;
 const USER_RSP_CURRENT: usize = 0x70;
 const USER_HANDLER: usize = 0x80;
 const USER_SELF: usize = 0x1830;
+const USER_HOLD: usize = 0x1838;
+const USER_HOLD_END: usize = 0x1840;
+const HOLD_END_OFF: usize = 0x1900; // hold buffer grows down from here (0x1880..0x1900)
 const USER_LP0: usize = 0x15B0;
 const USER_FP0: usize = 0x1210;
 const USER_FSP: usize = 0x1218;
@@ -216,6 +219,8 @@ impl Mf66Session {
         s.write_user(USER_FP0, base + FP_STACK_TOP as u64);
         s.write_user(USER_FSP, base + FP_STACK_TOP as u64);
         s.write_user(USER_HANDLER, 0); // no active catch handler
+        s.write_user(USER_HOLD_END, base + HOLD_END_OFF as u64);
+        s.write_user(USER_HOLD, base + HOLD_END_OFF as u64);
         s.write_user(USER_HOST_RSP, 0);
         s.write_user(USER_DSP_SAVE, dstack_top);
         s.write_user(UVAR_BASE, 10); // decimal default
@@ -233,7 +238,15 @@ impl Mf66Session {
         s.bootstrap_dictionary()?;
         s.build_vocab()?;
         s.oop_boot()?;
+        s.bootstrap_lib()?;
         Ok(s)
+    }
+
+    /// Standard library words defined in Forth at boot (the lib/core.f analogue).
+    fn bootstrap_lib(&mut self) -> Result<()> {
+        // #s: convert all remaining digits (at least one) for pictured output.
+        self.eval(": #s begin # dup 0= until ;")?;
+        Ok(())
     }
 
     /// One-time OOP setup: the user_SELF slot, the `cell` constant, the root
@@ -442,18 +455,68 @@ impl Mf66Session {
                 }
                 continue;
             }
+            // s" …" — compile/push a string literal (addr len). Stored in data
+            // space at compile time. (Whitespace-tokenized, so runs of spaces in
+            // the literal collapse to one — fine for the corpus's uses.)
+            if lk == "s\"" || lk == ".\"" {
+                let mut bytes: Vec<u8> = Vec::new();
+                loop {
+                    let t = tokens
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("unterminated {tok}"))?;
+                    let done = t.ends_with('"');
+                    let piece = if done { &t[..t.len() - 1] } else { t };
+                    if !bytes.is_empty() {
+                        bytes.push(b' ');
+                    }
+                    bytes.extend_from_slice(piece.as_bytes());
+                    if done {
+                        break;
+                    }
+                }
+                let addr = self.read_user(USER_VAR_HERE);
+                for (i, b) in bytes.iter().enumerate() {
+                    self.write_u8(addr + i as u64, *b);
+                }
+                let len = bytes.len() as u64;
+                self.write_user(USER_VAR_HERE, (addr + len + 7) & !7); // align up
+                if lk == ".\"" {
+                    // ." …" — print immediately (interpret) or compile type
+                    if self.pending.is_some() {
+                        let d = self.pending.as_mut().unwrap();
+                        d.toks.push(Tok::Lit(addr as i64));
+                        d.toks.push(Tok::Lit(len as i64));
+                        let xt = self.xt_of("type_word")?;
+                        self.pending.as_mut().unwrap().toks.push(Tok::Call(xt));
+                    } else {
+                        self.push(addr as i64);
+                        self.push(len as i64);
+                        self.call("type_word")?;
+                    }
+                } else if self.pending.is_some() {
+                    let d = self.pending.as_mut().unwrap();
+                    d.toks.push(Tok::Lit(addr as i64));
+                    d.toks.push(Tok::Lit(len as i64));
+                } else {
+                    self.push(addr as i64);
+                    self.push(len as i64);
+                }
+                continue;
+            }
             // Receiver tracking for early binding: any token other than `->`
             // begins a fresh receiver context.
             if lk != "->" {
                 self.last_receiver_class = None;
             }
+            // OOP method send — unless `->` has been defined as an ordinary word
+            // (e.g. the ANS tester's result separator), which then takes priority.
+            if lk == "->" && self.xt_of_forth_name("->")?.is_none() {
+                let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`->` needs a selector"))?;
+                self.oop_send(s)?;
+                continue;
+            }
             // ── OOP parsing words (valid in both interpret and compile state) ──
             match lk.as_str() {
-                "->" => {
-                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`->` needs a selector"))?;
-                    self.oop_send(s)?;
-                    continue;
-                }
                 ":m" => {
                     let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`:m` needs a name"))?;
                     self.oop_begin_method(s)?;
@@ -1240,6 +1303,16 @@ impl Mf66Session {
     }
 
     /// Clear the data stack and restore post-boot defaults.
+    /// Abandon any half-finished colon/method definition and clear the stacks —
+    /// used to recover after an error when running an external test transcript.
+    pub fn reset_input(&mut self) {
+        self.pending = None;
+        self.method_class = None;
+        self.pending_class = None;
+        self.super_pending = false;
+        self.reset();
+    }
+
     pub fn reset(&mut self) {
         self.current_dsp = self.dstack_top;
         self.write_user(USER_DSP_SAVE, self.dstack_top);

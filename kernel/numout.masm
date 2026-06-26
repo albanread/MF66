@@ -1,0 +1,62 @@
+; MF66 kernel — pictured numeric output (<# # #s #> hold sign), single-cell.
+; The hold buffer grows DOWN from user_HOLD_END; user_HOLD is the current front.
+
+; <# ( -- )   begin a pictured conversion (reset the hold pointer)
+proc(pic_start)
+    ldr     x9, [UP, #user_HOLD_END]
+    str     x9, [UP, #user_HOLD]
+    next()
+endp()
+
+; hold ( c -- )   prepend a character to the hold buffer
+proc(hold_word)
+    ldr     x9, [UP, #user_HOLD]
+    sub     x9, x9, #1
+    strb    w0, [x9]
+    str     x9, [UP, #user_HOLD]
+    ldr     x0, [DSP]                   ; drop c, raise NOS
+    stk(1, 0)
+    next()
+endp()
+
+; # ( u -- u' )   convert one digit (u mod base) and prepend it
+proc(pic_digit)
+    ldr     x10, [UP, #user_BASE]
+    udiv    x9, x0, x10                 ; x9 = u / base
+    msub    x11, x9, x10, x0            ; x11 = u mod base
+    add     x12, x11, #0x30             ; '0' + rem
+    add     x13, x11, #0x57             ; 'a' - 10 + rem
+    cmp     x11, #10
+    csel    x12, x12, x13, lo           ; rem < 10 ? digit : letter
+    ldr     x14, [UP, #user_HOLD]
+    sub     x14, x14, #1
+    strb    w12, [x14]
+    str     x14, [UP, #user_HOLD]
+    mov     x0, x9                      ; u' = u / base
+    next()
+endp()
+
+; #> ( u -- c-addr len )   end conversion, yield the string
+proc(pic_end)
+    ldr     x9, [UP, #user_HOLD]        ; c-addr
+    ldr     x10, [UP, #user_HOLD_END]
+    sub     x10, x10, x9                ; len
+    str     x9, [DSP, #-cell]!          ; push c-addr (becomes NOS); drops u
+    mov     x0, x10                     ; TOS = len
+    next()
+endp()
+
+; sign ( n -- )   if n<0, prepend '-'
+proc(sign_word)
+    cmp     x0, #0
+    b.ge    .pos
+    ldr     x9, [UP, #user_HOLD]
+    sub     x9, x9, #1
+    mov     w10, #0x2D                  ; '-'
+    strb    w10, [x9]
+    str     x9, [UP, #user_HOLD]
+.pos:
+    ldr     x0, [DSP]                   ; drop n
+    stk(1, 0)
+    next()
+endp()

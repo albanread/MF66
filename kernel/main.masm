@@ -34,6 +34,7 @@
 @include "dataspace.masm"
 @include "oop.masm"
 @include "stackext.masm"
+@include "numout.masm"
 
 ; forth_main — the only data-stack-representation translation layer.
 ;

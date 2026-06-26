@@ -10,6 +10,7 @@ description = "MF66 — an Apple Silicon (macOS arm64) re-implementation of WF66
 # `default-features = false` (no LLVM). See docs/design/mf66-apple-silicon.md.
 wfasm = { path = "../JASM/rust", default-features = false }
 anyhow = "1"
+libc = "0.2"
 
 [lib]
 name = "mf66"
@@ -22,3 +23,6 @@ debug = 1
 
 [profile.release]
 lto = "thin"
+
+[dev-dependencies]
+libc = "0.2"

@@ -80,6 +80,8 @@
 @assign user_VAR_HERE    = 0x1820    ; RW/no-exec data-space bump pointer (grows UP)
 @assign user_VAR_LIMIT   = 0x1828    ; high limit of data space
 @assign user_SELF        = 0x1830    ; OOP current receiver (object base addr)
+@assign user_HOLD        = 0x1838    ; pictured-numeric-output hold pointer (grows down)
+@assign user_HOLD_END    = 0x1840    ; high end of the hold buffer
 
 ; ── Dictionary header layout (dh_*) — BYTE-IDENTICAL to WF66 (cell=8) ────
 ; Base = address in LATEST and in each dh_link. nt = base+dh_nt; xt = dh_xtptr.
