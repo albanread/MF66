@@ -46,4 +46,9 @@ impl Mf66Jit {
     pub unsafe fn lookup_fn<F: Copy>(&mut self, name: &str) -> Result<F> {
         self.loader.lookup_fn(name)
     }
+
+    /// Resolve `name` to its placed address (assembling + relocating if needed).
+    pub fn lookup_addr(&mut self, name: &str) -> Result<u64> {
+        self.loader.lookup_addr(name)
+    }
 }
