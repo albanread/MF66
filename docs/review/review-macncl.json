@@ -1,0 +1,75 @@
+{
+ "subsystem": "MacNCL GC (newgc-core) and REPL/IDE - Reusable for MF66 Forth Port",
+ "purpose": "MacNCL is a working Apple Silicon (aarch64-apple-darwin) port of NewCormanLisp featuring a generational page-heap GC (`newgc-core`) and a Cocoa+Core Graphics/Core Text IDE. The GC is production-hardened, multi-mutator, and already arm64-clean. The REPL is a platform-neutral eval harness (Session.eval) with a macOS-specific Cocoa windowing layer. MF66 (Forth) can reuse both by providing a Forth-flavored adapter for root scanning (the only language-specific integration point) and plugging its own eval-string primitive into the existing output-capture and REPL transcript infrastructure.",
+ "arch_os_assumptions": [
+  {
+   "location": "/Users/oberon/claudeprojects/locus/vendor/newgc-core/src/lisp_layout.rs:1-121",
+   "assumption": "3-bit tagging scheme (Tag::Fixnum, Tag::Cons, Tag::Symbol, Tag::Vector, Tag::Function, Tag::String, Tag::Immediate, Tag::Forward) specific to Lisp; MF66 will supply its own HeapLayout impl with Forth tagging"
+  },
+  {
+   "location": "/Users/oberon/claudeprojects/MacNCL/src/ncl-driver/src/main.rs:55-132",
+   "assumption": "macOS Cocoa windowing (NSApplication/NSWindow/NSEvent) via objc2-app-kit; Linux/Windows builds omit mac-gui feature entirely"
+  },
+  {
+   "location": "/Users/oberon/claudeprojects/MacNCL/src/ncl-runtime/src/brk.rs:40-450",
+   "assumption": "Windows SEH crash handler (SetUnhandledExceptionFilter) + stack unwind via RtlVirtualUnwind; non-Windows gets no-op stubs. macOS doesn't use this."
+  },
+  {
+   "location": "/Users/oberon/claudeprojects/locus/vendor/newgc-core/Cargo.toml:26-40",
+   "assumption": "Windows VirtualAlloc (Win32_System_Memory) for elastic static area + Unix libc mmap; arm64-darwin uses libc path"
+  },
+  {
+   "location": "/Users/oberon/claudeprojects/MacNCL/src/ncl-runtime/src/igui_mac/window.rs",
+   "assumption": "Cocoa window management and Metal surface rendering for the IDE; requires feature mac-gui and objc2 bindings"
+  }
+ ],
+ "reusable_asis": [
+  "newgc-core page heap engine (PageHeap<L>) and multi-mutator coordinator (GcCoordinator) \u2014 zero changes needed; just specialize with Forth's HeapLayout impl instead of LispLayout",
+  "HeapHeader (8-byte type + length + GC bits packed), HeapType enum (Symbol/Vector/Function/String/BigNum/Float/Ratio/Complex), CardTable (soft write-barrier marking) \u2014 all platform and language neutral",
+  "crash.rs panic hook + (Windows-only) SEH filter with symbolized backtrace \u2014 reusable as-is if MF66 runs on Windows; arm64-darwin can skip the SEH part",
+  "output.rs thread-local capture buffer (begin_capture/end_capture/emit) \u2014 used by Session.eval to route (format t ...) output into the REPL transcript; Forth eval must call the same API",
+  "Session.eval(src: &str) -> Result<String, EvalError> contract and eval-loop structure (read \u2192 eval_value \u2192 output \u2192 format) \u2014 pattern reusable; Forth replaces lowering + JIT with forth compilation",
+  "REPL::handle_event -> Option<source_string> abstraction \u2014 completely eval-agnostic; same transcript, input line, history, bracket-balance check work for Forth",
+  "IdeAction::Eval(String) dispatch and output/error/info logging paths in Ide and Repl \u2014 platform-neutral rendering via SurfaceCmd IR; no Lisp coupling",
+  "macOS Cocoa windowing layer (window::run / window::present / window::open_window) and Core Graphics/Core Text text rendering \u2014 works unchanged for any language"
+ ],
+ "port_changes": [
+  {
+   "what": "Implement HeapLayout trait for Forth (Forth-specific tagging, word classification, object layout descriptors)",
+   "where": "Create forth-layout.rs in newgc-core or MF66 crate, matching signature at /Users/oberon/claudeprojects/locus/vendor/newgc-core/src/lisp_layout.rs:36-121",
+   "effort": "small",
+   "detail": "Forth word format differs from Lisp 3-bit tags; must define Tag enum, classify() dispatch, ObjectLayout description of pointer field ranges. ~150 lines if Forth uses similar tagging; more if tag-free pointer representation needed. Test with newgc-core's synthetic tests (can reuse test harness)."
+  },
+  {
+   "what": "Forth eval entry point (like Session::eval for Lisp) \u2014 parse/compile Forth source, execute, capture output, format result",
+   "where": "MF66 runtime; integrate with output.rs capture API, call begin_capture/end_capture around each compiled word execution",
+   "effort": "medium",
+   "detail": "Session.eval reads Value (Lisp reader output), calls macroexpand, lower, JIT. Forth path: parse XT (execution token) from source, lookup or compile definition, call native code, catch errors, format return stack / exception. Must match Session::eval signature for REPL driver compatibility."
+  },
+  {
+   "what": "Root scanning adapter (equivalent to RootScanner in newgc-core/src/page_heap/scanner.rs:23-42) for Forth stack layout",
+   "where": "MF66 GC integration; provide closure to GcCoordinator::collect_minor/collect_major that visits Forth parameter stack and return stack roots",
+   "effort": "small",
+   "detail": "NCL provides `visit_roots: F` closure to collect_minor; MF66 must enumerate Forth stacks (data stack TOS, return stack, local variables if any). RootScanner::visit(&mut Word) already exists; just wire Forth stack pointers as the root set. ~30 lines."
+  },
+  {
+   "what": "Disable Windows SEH handler (brk.rs) for arm64-darwin, keep UNIX panic hook only",
+   "where": "/Users/oberon/claudeprojects/MacNCL/src/ncl-runtime/src/brk.rs:40-57",
+   "effort": "small",
+   "detail": "install_crash_handler() has #[cfg(windows)] guard on real work; macOS already falls through to no-op. MF66 can call this unchanged; it will compile correctly on arm64-darwin."
+  },
+  {
+   "what": "Forth shims for iGui IDE (equivalent to ncl-runtime/src/igui_mac/shims.rs) \u2014 optional graphics canvas access",
+   "where": "MF66 igui integration; define Forth words to call back into render canvas commands (DrawLine, FillRect, etc.)",
+   "effort": "large",
+   "detail": "NCL routes (on-window \u2026) Lisp handlers through dispatch_gui_event -> %dispatch-event -> Lisp. MF66 can use the same event flow; just provide a Forth equivalent of dispatch_gui_event in ncl-compiler/src/lib.rs:193-207. Canvas rendering already works (SurfaceCmd is portable)."
+  }
+ ],
+ "risks": [
+  "Word tagging collision: if Forth's immediate / pointer tag encoding overlaps ambiguously with newgc-core's WordKind classification, root visitors will misinterpret Forth immediates as heap pointers. Mitigation: make HeapLayout::classify() precise and test against all Forth word types.",
+  "Root set completeness: missing a live root (e.g., pinned in a register across a nested eval) causes use-after-free post-GC. Forth's calling convention (TOS in register, RSP/RBP for stacks) means every eval/call boundary must declare stack snapshot to GC. Mitigation: stateless mutator.enter_native() / leave_native() calls bracket FFI; same discipline for eval.",
+  "Static area exhaustion: defun'd Functions in NCL are interned strings; Forth equivalent (compiled word definitions, interned symbols) live in static area. 1 GB default may be tight for large Forth codebases. Mitigation: tunable via env var (NCL_STATIC_MB); no change needed to GC.",
+  "Crash handler on non-Windows: brk.rs::install_crash_handler() is a no-op on macOS; excellent. But if MF66 adds Windows support later, the crash filter won't know how to symbolize JIT'd Forth code (register_jit_symbol is NCL-specific). Mitigation: supply a Forth equivalent of the JIT registry (newgc_core::crash.rs doesn't depend on NCL; just install_seh_filter() is Windows-only).",
+  "IDE eval loop latency: run_mac_gui's central event loop calls session.eval() synchronously, blocking the AppKit thread if eval takes > 16 ms. A long-running Forth loop (e.g., 1000000 iterations) will freeze the window. Mitigation: existing pattern (same for NCL); no Forth-specific risk, but note architectural limitation."
+ ]
+}

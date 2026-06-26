@@ -1,0 +1,6 @@
+# MF66 tests share process-global JIT state: one MAP_JIT executable region per
+# session and a per-thread W^X (`pthread_jit_write_protect_np`) mode. Parallel
+# tests in one process race on both. Single-threaded is the only correct default
+# (mirrors WF66's .cargo/config.toml rationale).
+[env]
+RUST_TEST_THREADS = "1"

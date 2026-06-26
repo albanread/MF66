@@ -1,0 +1,24 @@
+[package]
+name = "mf66"
+version = "0.0.1"
+edition = "2021"
+description = "MF66 — an Apple Silicon (macOS arm64) re-implementation of WF66, a token-IR optimizing STC Forth. JIT-compiled via the JASM AArch64 backend, no LLVM."
+
+[dependencies]
+# The LLVM-free JASM backend: the native AArch64 encoder (`a64::A64Encoder`)
+# and the MAP_JIT loader (`native_macos::MacJit`). Same crate WF66 uses, same
+# `default-features = false` (no LLVM). See docs/design/mf66-apple-silicon.md.
+wfasm = { path = "../JASM/rust", default-features = false }
+anyhow = "1"
+
+[lib]
+name = "mf66"
+path = "src/lib.rs"
+
+# Process-global JIT/loader state (one executable region + W^X per thread) means
+# tests must not run concurrently in one process. See the .cargo config.
+[profile.dev]
+debug = 1
+
+[profile.release]
+lto = "thin"

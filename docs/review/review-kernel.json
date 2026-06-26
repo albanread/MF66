@@ -1,0 +1,253 @@
+{
+ "subsystem": "STC Forth Kernel (WF66)",
+ "purpose": "WF66 is a 13.6k-line x86-64 MASM Intel-syntax STC (subroutine-threaded code) Forth kernel compiled by JASM. It implements integer/float/GC/locals/OOP primitives with the Forth machine cached in registers (RAX=TOS, RBP=DSP, RBX=UP, RSP=return-stack, R15=LP, XMM15=FTOS). The kernel uses aggressive idioms specific to x86 (lea for addressing, rdx:rax for 128-bit multiply/divide, rep movs for bulk copy, flag-based conditionals via sbb/setcc, and cmov for branch-free code). An AArch64 rewrite must map these 10 registers, translate all 30+ files of arithmetic/memory/stack/control primitives, and port 3K+ lines of complex Windows/x87/Win64-ABI-coupled code.",
+ "arch_os_assumptions": [
+  {
+   "location": "macros.masm:2-27",
+   "assumption": "x86-64 register conventions: RAX=TOS, RBP=DSP, RBX=UP, RSP=return-stack, R15=LP, R12-14=scratch. Windows 64-bit ABI call clobbers RAX/RCX/RDX/R8-11; preserves RBP/RBX/RSP/R12-15."
+  },
+  {
+   "location": "main.masm:96-102",
+   "assumption": "Win64 ABI: RCX/RDX/R8/R9 for first 4 integer args; RAX for return value. XMM6-15 callee-saved; xmm15 is FTOS (FP TOS) and must survive forth_main boundaries via user_FTOS_SAVE."
+  },
+  {
+   "location": "macros.masm:313-330",
+   "assumption": "win64_call macro: RSP 16-byte align + 32-byte shadow space before call; R12 spill slot."
+  },
+  {
+   "location": "main.masm:102-227",
+   "assumption": "forth_main entry: 8 byte-cell; prologue saves R15 (LP), R13-14 (reserved), R12 (Win64 temp), RSI/RDI, RBP (DSP), RBX (UP); spills xmm6-15 (160 bytes) to host stack."
+  },
+  {
+   "location": "rstack.masm:1-21",
+   "assumption": "Return-stack primitives (>r, r>, 2>r, etc.) use pop/push dance around user data because RSP IS the return stack (STC: CPU call/ret IS the dispatcher)."
+  },
+  {
+   "location": "stack.masm:174-186",
+   "assumption": "2swap uses xchg rbp,rsp trick \u2014 x86-specific ability to swap data/return-stack pointers atomically for fast multi-cell ops."
+  },
+  {
+   "location": "arith.masm:222-231",
+   "assumption": "cqo + idiv for signed division; rdx:rax implicit for 64-bit multiply/divide (mul qword, imul qword, idiv \u2014 x86 widening implicit."
+  },
+  {
+   "location": "compare.masm:24-77",
+   "assumption": "sbb/setcc idioms: `sub rax,1; sbb rax,rax` collapses carry-flag to -1|0 without branches (WF32 style, faithful port)."
+  },
+  {
+   "location": "float.masm:1-28",
+   "assumption": "XMM15=FTOS (FP top of stack, cached like RAX), XMM0/XMM1 for function args (Win64). FP math via msvcrt (sqrt, sin, cos, etc.) with Win64 ABI calls."
+  },
+  {
+   "location": "memory.masm:18-21",
+   "assumption": "@ (fetch): single MOV instruction with TOS as address (x86 RIP-relative or absolute). rep movsb (lines 193-216 rstack.masm) for bulk byte copy."
+  },
+  {
+   "location": "strings.masm:24-49",
+   "assumption": "popcnt, bsr, bsf \u2014 BMI instructions (Haswell+). lsb/msbit rely on cmovz for zero-input saturation."
+  },
+  {
+   "location": "locals.masm:50-59",
+   "assumption": "R15=LP (locals pointer), grows downward. [r15+disp32] addressing mode for local frame access (x86 feature)."
+  },
+  {
+   "location": "compile.masm:104-119",
+   "assumption": "rel32 call encoding (5 bytes): VirtualAlloc2 guarantees kernel/dict within \u00b12 GB so rel32 always fits; no indirect call needed."
+  },
+  {
+   "location": "fmath.masm:35-60",
+   "assumption": "msvcrt math funcs clobber volatile regs; win64_call + xmm register shuffles (xmm0=arg, xmm1=arg2, xmm0=result)."
+  },
+  {
+   "location": "execute.masm:31-46",
+   "assumption": "execute: tail-jump (jmp rcx, not call) to save CALL/RET pair; 3-way depth check (DSP < SP0, ==, >) with jae/ja branching."
+  },
+  {
+   "location": "igui_gfx.masm (not sampled)",
+   "assumption": "Direct gfx calls via iGui batch system; likely Win32/Direct2D renderer bindings (GDI/bitmap buffers)."
+  },
+  {
+   "location": "interp.masm (not fully sampled)",
+   "assumption": "Interpreter dispatch loop; likely uses direct threading or call-based dispatch; Win64 ABI calls throughout."
+  },
+  {
+   "location": "dict.masm (975 lines)",
+   "assumption": "Dictionary overlay: hash buckets, header chain walks. dn_hash is dword (4-byte) hash; inline word-header matching."
+  },
+  {
+   "location": "parse.masm:376 lines",
+   "assumption": "Token parsing, WORD primitive, counted-string handling \u2014 inline MASM loops over c-addr/u pairs (rep movs family, lodsb)."
+  },
+  {
+   "location": "number.masm:268 lines",
+   "assumption": "Number parsing: base conversion via multiplication/division (uses cqo, idiv, etc.)."
+  },
+  {
+   "location": "GC (491 lines)",
+   "assumption": "GC root scan walks HEAPPTR slots (user_HEAPPTR_BASE, user_HEAPPTR_NEXT). Likely uses rep movsq for bulk heap updates."
+  },
+  {
+   "location": "agents.masm:168 lines",
+   "assumption": "Green threads: stack switching via rsp/rbp manipulation; agent fiber scheduler in Rust (rt_agent_* calls)."
+  },
+  {
+   "location": "compile.masm:3230 lines",
+   "assumption": "Peephole optimizer: backward-scans HERE for prior instr patterns (literal fold: call do_lit;.quad; rewind+imm-form). Heavily x86-specific (cmp+setcc+movzx fusion, lea addressing, etc.)."
+  },
+  {
+   "location": "strings_managed.masm:1896 lines",
+   "assumption": "Managed strings: tagged pointer scheme (3-bit tag); rt_string_* calls + xmm register use for IEEE-754 float parsing."
+  }
+ ],
+ "port_changes": [
+  {
+   "what": "Register allocation mapping",
+   "where": "macros.masm:41-43, all primitives",
+   "effort": "medium",
+   "detail": "Map x86 regs to AArch64: RAX\u2192x0 (int TOS), RBP\u2192x19 (DSP, callee-saved), RBX\u2192x20 (UP, callee-saved), RSP\u2192sp (return stack), R15\u2192x21 (LP, callee-saved). Use x1-x7 for Win64-equiv volatiles (arg regs clobbered on calls); x8-x18 for scratch (volatile). XMM15\u2192d31 (FP TOS, callee-saved). AArch64 ABI: x0-x7 integer args, x8-x15 volatile, x19-28 callee-saved. Rewrite all instructions to 64-bit ldr/str, add/sub, orr, movz/movk sequences."
+  },
+  {
+   "what": "Call/return ABI",
+   "where": "macros.masm:313-330 (win64_call), main.masm:102-227 (forth_main)",
+   "effort": "large",
+   "detail": "AArch64 AAPCS64 vs Win64 differ: args are x0-x7 (same slot count, different reg order); no shadow space; RSP must stay 16-aligned but at call point (not before). Rewrite win64_call to: save LR (x30), align sp, call, restore. forth_main prologue: save x19-28 + x30 + d8-d15 (FP calle-saved). No xmm6-15 spill needed (d8-15 are already callee-saved by AAPCS64). Load UP from x2 arg (not x9)."
+  },
+  {
+   "what": "Data-stack pointer addressing",
+   "where": "All files: lea addr,[rax+rax*scale] patterns",
+   "effort": "small",
+   "detail": "x86 lea does [base+idx*scale+disp] in one instr. AArch64 must: add tmp,x0,x0,lsl #3 (load-address form using ADD). Or use ldr/str with pre/post-index (e.g., ldr x1,[x19,#-8]!). Rewrite all cell+, cells+, cells_minus, aligned addressing."
+  },
+  {
+   "what": "Integer multiply/divide (rdx:rax)",
+   "where": "arith.masm:29-36, 313-391, 397-416",
+   "effort": "small",
+   "detail": "x86 mul/imul implicitly produce rdx:rax (128 bits). AArch64: mul x0,x0,x1 (64\u00d764\u219264, no high half). For 128-bit: umulh/smulh for high bits. um*, m*, um/mod, sm/rem, fm/mod, */mod must: mov x1,x0; ldr x0,[x19]; mul x0,x0,x1; umulh x1,x0,x1; (x0=low, x1=high). Rewrite idiv\u2192sdiv, div\u2192udiv, add RDX carry-ins via conditional moves or separate register."
+  },
+  {
+   "what": "Flag operations (sbb/setcc/cmov)",
+   "where": "compare.masm, logic.masm, parts of arith.masm",
+   "effort": "medium",
+   "detail": "x86 sbb rax,rax smears carry to -1|0. AArch64 cset x0,cc (set on carry); csneg x0,x0,x0,cc inverts. setcc (jcc+movzx+neg) becomes cset. cmov \u2192 csel/csneg. Many compare.masm lines 24-77 (0=, 0<, 0>, =, <, >, <=, >=, u<, u>, min, max, within, d=, d<, du<, etc.) require per-instruction csel replacement. Lines 146-177 (unsigned compares) use cmp + sbb pattern \u2192 cset x0,cc; neg x0,x0."
+  },
+  {
+   "what": "Shift operations (variable count in CL)",
+   "where": "logic.masm:44-75",
+   "effort": "small",
+   "detail": "x86 shl/shr/sar rax,cl only work with count in CL register. AArch64 lsl/lsr/asr x0,x0,x1 (any register). No CL constraint. Rewrite lines 44-75 (lshift, rshift, arshift) to remove mov rcx,rax; mov rax,[rbp]; shl rax,cl \u2192 mov x1,x0; ldr x0,[x19]; lsl x0,x0,x1."
+  },
+  {
+   "what": "rep movsq/movsb bulk copy",
+   "where": "rstack.masm:181-219 (n>r, nr>), parse.masm, number.masm",
+   "effort": "medium",
+   "detail": "x86 rep movsq copies (rsi\u2192rdi) by rcx*8. AArch64 has no rep prefix: emit loop: ldr x0,[x1],#8; str x0,[x2],#8; subs x3,x3,#1; b.ne loop. Or use memcpy Rust fn call. Affects n>r (line 181), nr> (line 199), and string operations. Mark affected lines in parse, number, strings."
+  },
+  {
+   "what": "x87/XMM FP ops",
+   "where": "float.masm:1-160, fmath.masm:1-78",
+   "effort": "small",
+   "detail": "No x87 in WF66 (uses XMM15 for FTOS + xmm0/xmm1 for args). AArch64: fmov d0,d31 (move FTOS to arg); fmov d31,d0 (move result). movsd\u2192ldr/str (d-register load/store). No msvcrt on Apple Silicon (different libc); use libm equivalents. Add conditional compilation for platform FP funcs (not a code-rewrite, but a link-level change)."
+  },
+  {
+   "what": "Addressing modes (RIP-relative, absolute, indexed)",
+   "where": "compile.masm:150-192 (peephole watermarks), locals.masm:156-220, all memory accesses",
+   "effort": "medium",
+   "detail": "x86 mov rax,[rip+d32] (RIP-relative for PIC). AArch64: adr x0,label (page-relative, \u00b11 MB) or ldr x0,=label (literal pool). 64-bit absolute \u2192 movz+movk chain (4 instrs) or ldr x0,=N. [r15+d32] becomes ldur x0,[x21,#disp] (if disp \u2264 \u00b1255, pre/post-index) or add x0,x21,x1; ldr x0,[x0]. Peephole fusion logic (literal_fold, dup_fuse, cmp_fuse, var_fusion) at lines 150-192 must account for AArch64 variable-size instr encodings."
+  },
+  {
+   "what": "Reserved registers (callee-saved, pin-pool)",
+   "where": "macros.masm:41-43, locals.masm:70, compile.masm:33-34",
+   "effort": "small",
+   "detail": "x86 r9/r10/r11 are Win64-volatile, reserved for register-pinning loop optimization (user_PIN_PLAN, lines 193-199 macros.masm, compile.masm lines 1800+). AArch64 x9-x15 are volatile (call-clobbered). Pin-pool must stay alive across calls; either: keep in callee-saved (x22-x28, but only 7 avail) or spill to user area like Win64 does. Likely: use fewer pin regs (x22,x23,x24) for 3-reg pinning, or accept less optimization."
+  },
+  {
+   "what": "SEH exception handling",
+   "where": "main.masm:180-178 (.throw_return), execute.masm:48-65 (catch/throw unwinding)",
+   "effort": "large",
+   "detail": "WF64 uses Win64 SEH (user_HANDLER frame on rstack, rip+2GB rel32 to .throw_return). AArch64/ARM64EC on Windows uses the ARM64 exception model (PDATA/XDATA unwind info, but same rstack-based semantics for Forth). Linux/macOS ARM64 has no SEH equivalent \u2014 must implement manual frame chain (like Forth's own HANDLER, already done in code, but SEH unwinding via OS is gone). For Apple Silicon: pure manual unwinding (Forth's catch/throw/rstack frame chain is sufficient, already in user area). For Windows ARM64: Windows will provide ARM64EC SEH, but winding/unwinding must emit XDATA."
+  },
+  {
+   "what": "Instruction encoding variability",
+   "where": "compile.masm:104-142 (rel32 call), all JIT code emission",
+   "effort": "medium",
+   "detail": "x86 call rel32 is always 5 bytes. AArch64: bl rel26 is always 4 bytes (\u00b1128 MB), or blr x1 (4 bytes, indirect). dict heap is ~128 MB within kernel \u2192 rel26 fits. Rewrite compile_comma to emit: mov x1,xt (implicit via RIP-relative or movz+movk if >64 MB away); bl xt-rel (or movk+blr). Peephole optimizers (literal_fold, dup_fuse, cmp_fuse) must account for variable instr sizes when scanning/rewindinging."
+  },
+  {
+   "what": "Bit scan (bsr/bsf) and population count",
+   "where": "strings.masm:24-49 (count_bits, msbit, lsbit)",
+   "effort": "small",
+   "detail": "x86 bsr=bit-scan-reverse, bsf=bit-scan-forward; cmovz for zero saturation. AArch64: clz (count-leading-zeros, opposite of msbit), ctz (count-trailing-zeros). msbit = 63 - clz(x); lsbit = ctz(x). popcnt x0,x0 \u2192 cnt x0,x0 (count bits). No exact clz=bsr equivalence (bsr undefined on 0, clz also undefined \u2014 use cmovz pattern: clz x0,x0; cmp x0,64; csel x0,x0,#-1,ne)."
+  },
+  {
+   "what": "String operations and word parsing",
+   "where": "strings.masm:120+, parse.masm, number.masm",
+   "effort": "medium",
+   "detail": "Heavy use of lodsb (load string byte, auto-increment rsi), stosb, rep movsb. AArch64: ldrb x0,[x1],#1; strb x0,[x2],#1; loop. No lodsb equiv; use ldr with post-index. Bulk copies via loop (see rep movsq above). Also byte comparisons (cmp al,cl) \u2192 cmp x0,x1 (still works, just 64-bit cmp). ~200+ lines in parse.masm + strings.masm affected."
+  },
+  {
+   "what": "OOP/dictionary hash",
+   "where": "dict.masm (975 lines), oop.masm (285 lines)",
+   "effort": "medium",
+   "detail": "dict.masm: dn_hash is dword (4-byte) hash (dn_hash:=0x18C8, line 259). Inline word-header matching uses 32-bit hash compares. oop.masm: class_vt dispatch, vtable reads. Both are pure addressing + loads/stores, no x86-specific idioms except lea (already covered). Mechanical translation mostly. Dict overlay search (hash buckets) uses cmp loops \u2014 no changes."
+  },
+  {
+   "what": "Windows API bindings",
+   "where": "kernel/win32/*.masm (not in sample), main.masm:32-40 comment",
+   "effort": "small",
+   "detail": "The kernel today calls only Rust runtime fns (rt_* in runtime_decls.masm). No direct Win32/kernel32 calls in the sampled code. win32/kernel32.masm bindings are commented as 'on demand'. AArch64 ARM64EC Windows would need ARM64 Win32 bindings, but that's generated (not hand-coded MASM). macOS/Linux ARM64: pure Rust FFI, no Windows API needed."
+  },
+  {
+   "what": "Test harness & Rust integration",
+   "where": "src/lib.rs (not sampled), src/runtime.rs",
+   "effort": "small",
+   "detail": "forth_main entry point signature (target_xt, logical_dsp_in, rsp_top, user_base) stays the same; AArch64 just uses x0-x3 regs instead of rcx/rdx/r8/r9. Rust-side codegen (register-pinning plan, WF66 token IR, GC) unaffected. JASM assembler (wfasm crate) must emit AArch64 opcodes; that's a separate port (likely partial \u2014 JASM generates arm64 already for MacM1 testing, per memory notes)."
+  },
+  {
+   "what": "Peephole optimizer windows (fusion rewind)",
+   "where": "compile.masm:164-192 (watermark tracking), lines 143-240 (literal fold, dup fuse, cmp fuse, addr fusion)",
+   "effort": "large",
+   "detail": "WF66 peepholes scan backwards from HERE, identify prior instr pattern, rewind to rewind_target, re-emit cheaper sequence. x86: mov [rbp-8],rax; sub rbp,8; lea rax,[rip+d] \u2192 mov rax,[rip+d] (RIP-relative load). On AArch64, variable-length instruction sequences and addressing modes break the assumption that instr N has fixed size. Must either: (a) track byte-offset watermarks precisely (hard, many encoding variants); (b) disable peephole fusion for ARM64 (safe, loses ~5-10% perf for leaf words); (c) use larger peephole unit (emit block-end marker, fuse whole block, not sliding window). Recommend (b) for MVP, (c) for opt phase."
+  },
+  {
+   "what": "FTOS save/restore and FP stack alignment",
+   "where": "main.masm:155-196 (FTOS spill/reload), fmath.masm:32-60 (FP call wrappers)",
+   "effort": "small",
+   "detail": "user_FTOS_SAVE is 8-byte qword (IEEE-754 double). movsd [user_FTOS_SAVE],xmm15 \u2192 str d31,[x20,#offset] (FP store register). No alignment issues on AArch64 (d-regs are 64-bit). FP call wrappers: movsd xmm0,xmm15 \u2192 fmov d0,d31. win64_call with 32-byte shadow space \u2192 AAPCS64 no shadow, just RSP alignment (already covered in ABI section)."
+  },
+  {
+   "what": "Locals frame (R15/LP) addressing",
+   "where": "locals.masm:24-219",
+   "effort": "small",
+   "detail": "R15 is x21 (callee-saved). sub r15,rcx*8 \u2192 lsl x1,x0,#3; sub x21,x21,x1. [r15+offset] \u2192 ldr x0,[x21,#offset] (if offset \u2264 255 and 8-byte aligned) or ldur (unaligned, \u00b1255). check_local_emit (line 166) emits inline: mov [rbp-8],rax; mov rax,[r15+disp] \u2192 str x0,[x19,#-8]; ldr x0,[x21,#disp]. 15-byte \u2192 8-12 byte sequence (AArch64 instrs are 4 bytes each). Watermark fusion at line 196-250 (read offset, emit sequence) must recompute for AArch64 sizes."
+  }
+ ],
+ "reusable_asis": [
+  "Dictionary header layout (dh_link, dh_ct, dh_xtptr, dh_comp, dh_vfa, dh_nt, dh_name) \u2014 all cell-addressed memory offsets, no arch dependence.",
+  "User-area layout (user_BASE, user_STATE, user_HERE, user_DSP_SAVE, user_HANDLER, HEAPPTR slots, locals-frame stack) \u2014 pure memory offsets, no embedded x86 instructions.",
+  "Forth semantics (STC threading model, call/ret dispatch, TOS-cached convention, data-stack encoding) \u2014 abstract, applies to AArch64.",
+  "Token-IR format and Rust-side optimizer (docs/design/wf66_dual_level_reducer.md) \u2014 Rust, not asm.",
+  "Literal IR tokens, float-literal IR, local-frame IR recording (rt_ir_lit, rt_ir_word, rt_ir_open_locals calls) \u2014 function signatures and semantics unchanged; only calling convention (x0-x7 vs rcx/rdx/r8/r9) varies.",
+  "GC design and HEAPPTR walking (evac.visit_cell, mark/sweep phases) \u2014 Rust-side, not asm.",
+  "String/managed-object tag scheme (3-bit tag + 61-bit pointer) \u2014 pure data layout, no x86 idioms.",
+  "OOP class structure and vtable dispatch (class_super, class_isize, class_vt fields) \u2014 pure struct layout; vtable look-up is ldr+ldr+call, works on AArch64.",
+  "Dictionary overlay bucket chain (wl_bucket_count, dn_bucket_next, dn_header) \u2014 hash-bucket logic is loop-based loads/compares, no x86 specifics.",
+  "Catch/throw handler frame layout ([UP+user_HANDLER], [rsp+0]=DSP, [rsp+cell]=old_handler, [rsp+2*cell]=resume_ip) \u2014 works on AArch64, only unwinding mechanism changes (manual vs SEH).",
+  "Variable create stub shape (24 bytes: body address, stub, padding) \u2014 memory layout is arch-independent; RIP-relative addr\u2192absolute address mapping needed.",
+  "Parse/number-conversion algorithms (digit scanning, base conversion loops) \u2014 logic is portable; rep movsb \u2192 loop, lodsb \u2192 ldr+post-index, same effect.",
+  "Interpreter dispatch (interpret_source, parse_name, find_name, STATE check, compile vs execute path) \u2014 pure control flow, not arch-specific.",
+  "Register-pinning IR (user_PIN_BUF, user_PIN_PLAN records: action, payload) \u2014 Rust side generates plan; kernel emits access instrs from rt_pin_emit_access calls."
+ ],
+ "risks": [
+  "Peephole optimization window (compile.masm:150-192, 1800+ lines) depends on fixed x86 instr sizes. AArch64 adds variable-size immediates (movz+movk chains for 64-bit), so watermark logic (user_LAST_LIT_END, user_LAST_CMP_END, user_LAST_ADDR_END) breaks. Scanning backward from HERE to find prior emit-point cannot assume fixed offset. Mitigation: (a) disable peephole fusion for ARM64 (5-10% perf loss, safe); (b) emit explicit block-end markers instead of implicit size assumption; (c) track instr-by-instr during compile, not via byte-offset watermarks.",
+  "Register allocation for pinning (user_PIN_PLAN, rt_pin_emit_access) assumes x9/x10/x11 are volatile call-clobbered (Win64 Win64 volatile regs). AArch64 x9-x15 are volatile, but only 7 available (vs 3 on Win64). If kernel uses all 7 for pinning, less room for scratch in primitives. Mitigation: limit pin-pool to 3-4 regs (x22-x24 callee-saved), accept lower pin coverage.",
+  "SEH unwinding on Windows ARM64 requires XDATA unwind tables (Microsoft ARM64EC runtime requirement). Forth's manual rstack-based catch/throw works on bare-metal AArch64 (Linux/macOS), but Windows ARM64 host integration may need OS-level SEH. Mitigation: (a) document that Windows ARM64 needs ARM64EC unwind info generation (JASM assembler responsibility); (b) on macOS/Linux ARM64, pure manual unwinding is sufficient.",
+  "JASM (wfasm crate) assembler must target AArch64. Current state unknown (memory notes mention MacM1 testing, so partial AArch64 support may exist). If JASM ARM64 backend is incomplete (missing reloc types, pseudoinstrs, macros), porting is blocked. Mitigation: audit wfasm arm64 module; fallback to external ARM64 assembler (GNU as) if needed.",
+  "Win64 math library (msvcrt.dll: sqrt, sin, cos, etc.) not available on macOS/Linux ARM64. Rewrite fmath.masm calls to use libm (system libc). iOS restrictions on calling C functions may apply. Mitigation: conditional compilation (cfg flags for platform math), or pure-Forth implementations (slower but portable).",
+  "rep movsq pattern (rstack.masm:193, 216, strings.masm, number.masm, parse.masm \u2014 estimated 200+ lines) has no direct ARM64 equivalent. Manual loop expansion is straightforward but verbose. Risk: missing one loop during port \u2192 silent mem-corruption or infinite loops. Mitigation: mechanically replace all rep movsq \u2192 while loop; use a code-gen script or macro.",
+  "Stack alignment: x86-64 expects RSP 16-byte aligned at call sites; Win64 adds 32-byte shadow space. AArch64 AAPCS64 expects SP 16-byte aligned at call sites (no shadow). Forth's manual rstack management (push/pop) must maintain alignment. If rstack is odd-sized at a call, misalignment. Mitigation: pad rstack init to ensure 16-byte alignment; audit boot code (Rust side).",
+  "Calling Rust fns (rt_emit, rt_type, rt_read_line, etc.) changes calling convention (x0-x7 vs rcx/rdx/r8/r9). Each callsite must rewrite arg setup. Estimate: 50+ call sites across all .masm files. Mitigation: JASM macro (win64_call \u2192 aarch64_call), auto-rewrite args.",
+  "Locals-frame byte-offset addressing assumes 32-bit signed displacement (x86 disp32). AArch64 ldur/stur has \u00b19-bit signed (\u00b1255 bytes). Locals table (user_LOCALS_TABLE, 16 slots \u00d7 32 bytes = 512 bytes max) fits, but larger frames fail. Mitigation: if frame > 256 bytes, emit add x0,x21,x1; ldr x0,[x0] (3 instrs instead of 1), or use 64-bit offset in a register.",
+  "Dictionary header matching in find_name likely uses dword-sized hash (4 bytes, dn_hash at line 259 macros.masm). cmp eax,imm32 works in x86; AArch64 cmp x0,imm32 (zero-extended, ok). But if code path uses 32-bit cmp eax,\u2026 and relies on upper-half zero, must ensure movz/lsr. Mitigation: audit dict.masm for 32-bit cmp patterns; rewrite if needed.",
+  "Interrupt/exception handling via int 3 (brk macro, macros.masm:379). AArch64 equivalent is brk #0. Win64 SEH catches int 3 and advances RIP; AArch64 brk does not. Debugging breakpoints on ARM64 may not work the same way (depends on OS debugger). Mitigation: disable brk macro for release builds; document that debugging differs."
+ ]
+}

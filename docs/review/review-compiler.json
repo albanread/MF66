@@ -1,0 +1,158 @@
+{
+ "subsystem": "WF66 Token-IR Optimizing Compiler",
+ "purpose": "WF66 (mod.rs, ~3500 lines) is a Forth compiler frontend that captures token-IR from colon definitions (`:` \u2026 `;` bodies), optimizes it through constant folding, strength reduction, and dead-code elimination, lowers to x86-64 Intel-syntax MASM text for the wfasm/rasm assembler, and applies a multi-pass deferred-assembly pipeline (rbp-coalescing, window fusion for auto-pick, hot-cell promotion) to produce position-independent machine code bytes. Phase 0 covers token-level IR capture and optimization through structured lowering; control flow and inlining are deferred to later phases.",
+ "arch_os_assumptions": [
+  {
+   "location": "mod.rs:22-24",
+   "assumption": "Data-stack ABI: RAX = TOS (top of stack), RBP = DSP (data-stack pointer, points at NOS, grows down by 8-byte cells). Native code entered with this convention live."
+  },
+  {
+   "location": "mod.rs:29",
+   "assumption": "FP stack pointer lives in memory at [RBX + 0x1218] (user_FSP, rbx = UP), not a register. Every FP op reloads/stores it."
+  },
+  {
+   "location": "mod.rs:816-824",
+   "assumption": "Literal load optimization: 0 -> xor eax,eax (x86); 1..u32::MAX -> mov eax,imm (zero-extended); small negatives -> mov rax,imm (sign-extended); else movabs rax,imm64 (10B x86 instruction)."
+  },
+  {
+   "location": "mod.rs:849-869",
+   "assumption": "Multiply constant strength reduction: imul rax,rax for square; shl for powers of 2; lea rax,[rax+rax*k] for 3/5/9; imul rax,k otherwise. x86-specific LEA addressing mode."
+  },
+  {
+   "location": "mod.rs:376-405",
+   "assumption": "Comparison codegen: setcc (x86 byte set on condition) + movzx + neg to materialize -1/0 flags; jcc (x86 conditional jump) with inverted conditions for control fusion."
+  },
+  {
+   "location": "mod.rs:886",
+   "assumption": "Lowering always emits .intel_syntax noprefix preamble for x86-64 assembler."
+  },
+  {
+   "location": "mod.rs:1280-1302",
+   "assumption": "Deferred-assembly Instr enum: AdjustDsp (add/sub rbp), LoadCell/StoreCell (mov [rbp+disp]), RegMove (mov reg,reg), CellAlu (op reg,[rbp+disp] or op [rbp+disp],reg \u2014 x86-only memory-operand forms). These hardcode x86 register/memory model."
+  },
+  {
+   "location": "mod.rs:1340-1406",
+   "assumption": "parse_instrs lexes x86 mnemonics: add/sub rbp (DSP adjust), mov with [rbp\u00b1disp] operands, arithmetic mnemonics (add/sub/imul/and/or/xor). Non-rbp memory ([rax], indexed) stays Raw."
+  },
+  {
+   "location": "mod.rs:1682-1683",
+   "assumption": "Window fusion scratch pool hardcoded: rsi/rdi/r8/r9/rcx/rdx. r10/r11 reserved for hot-cell promotion (separate pool). x86-64 calling convention (r10/r11 caller-saved)."
+  },
+  {
+   "location": "mod.rs:1780-1781",
+   "assumption": "Hot-cell promotion pool hardcoded: r10/r11 (two x86-64 caller-saved registers disjoint from fusion's six-register pool)."
+  },
+  {
+   "location": "mod.rs:234-257",
+   "assumption": "FP lowering: FTOS in xmm15 (x86-64 SSE register), xmm0 as scratch. FP ops mirror kernel (addsd, subsd, mulsd, divsd, movsd). FSP reloaded/stored on each op (before coalescing)."
+  },
+  {
+   "location": "mod.rs:1002-1003",
+   "assumption": "Call lowering: movabs rcx,xt ; call rcx (x86 indirect call via register; absolute address load required for position independence)."
+  }
+ ],
+ "port_changes": [
+  {
+   "what": "Register model (TOS, DSP, FP stack pointer locations)",
+   "where": "mod.rs:22-24, 29, every emit function, deferred-assembly buffer (Instr enum lines 1280-1302)",
+   "effort": "large",
+   "detail": "On AArch64: TOS typically lives in x0 (not rax); DSP typically in x28/x29 or a dedicated register (not rbp). FP stack pointer (FSP) may be in x27 or another permanent register instead of [rbx+offset]. Retarget: (1) introduce ArchReg enum mapping {TOS, DSP, FpPtr, Scratch0-5, Promo0-1} to abstract reg names; (2) replace hardcoded rax/rbp/rbx/xmm15 with queries; (3) regenerate every emit_* function to accept ArchReg bindings; (4) Instr enum must be generic over register names (String or ArchReg). (5) All 12 pool names (fusion + promotion) must be supplied at compile time, not hardcoded."
+  },
+  {
+   "what": "Instruction format and addressing modes",
+   "where": "mod.rs:1340-1406 (parse_instrs), 1411-1442 (render), 1382 (mnemonic list)",
+   "effort": "huge",
+   "detail": "parse_instrs pattern-matches Intel-syntax strings (add rbp, mov [rbp+disp], arithmetic mnemonics). AArch64 uses completely different syntax (no memory operands to ALU; loads/stores are separate; different branch instructions; no memory-indirect calls). Retarget: (1) parse_instrs must tokenize arch-agnostic: recognize DSP-adjust, cell-load, cell-store, reg-move, alu-on-cell patterns from an AST (not text); (2) fuse_window, promote_run, coalesce_dsp operate on the Instr AST (already arch-neutral); (3) render(instrs) generates target-arch text: on AArch64 emit ldr/str for LoadCell, separate add x<N>,x<N>,imm12 for AdjustDsp, ldr x0,[x28,<disp>] for memory-operand alu, etc. (4) Mnemonic list (add/sub/imul/and/or/xor) maps to AArch64 equivalents (add, sub, and, orr, eor; no imul \u2014 use mul for multiply). Hard part: x86 memory-operand instructions (e.g., add reg,[rbp+disp]) have no 1:1 AArch64 equivalent \u2014 must decompose to load + alu + store, losing fusion's micro-optimization."
+  },
+  {
+   "what": "Strength reduction for multiply",
+   "where": "mod.rs:857-876 (emit_imm_op)",
+   "effort": "medium",
+   "detail": "x86 multiply-by-constant uses shl (bit shift), lea (load-effective-address), and imul. AArch64 has no shl with immediate > 63; use lsl (logical shift left) instead. lea rax,[rax+rax*k] (addressing mode) has no AArch64 equivalent \u2014 substitute add + mul or use add x0,x0,x0,lsl #k patterns. Power-of-2 multiply via shl/lsl works identically (one instruction). Non-power-of-2 (3/5/9/general) requires more instructions or a multiply library call."
+  },
+  {
+   "what": "Comparison and conditional branching",
+   "where": "mod.rs:376-405 (CmpOp methods: setcc, inv_jcc), 1048-1087 (emit_cmp_ctl), 1099-1160 (emit_ctl)",
+   "effort": "large",
+   "detail": "x86 uses setcc (set byte on condition), movzx (zero-extend), neg (to materialize -1/0 Forth flags), and jcc (conditional jump). AArch64 uses cset (set on condition, 0 or 1 only, not -1/0 Forth semantics \u2014 must negate to get all-bits), and b.cc (conditional branch). Retarget: (1) CmpOp::emit and CmpOp::setcc must produce AArch64-compatible code (cset + neg, or inline the comparison into the branch so fusion still works); (2) emit_cmp_ctl and emit_ctl switch from jcc to b.cc mnemonics; (3) flag materialization (setcc\u2192movzx\u2192neg) requires different instruction sequence (cset usually sufficient, but Forth needs -1 not 1, so negate). Condition codes differ subtly: AArch64 lt/le/gt/ge are signed, lo/ls/hi/hs are unsigned \u2014 verify all CmpOp::inv_jcc branches map correctly."
+  },
+  {
+   "what": "FP stack model and xmm register",
+   "where": "mod.rs:234-327 (FpOp, FpStackOp, FpMemOp emit functions), 951-959 (FpLit)",
+   "effort": "medium",
+   "detail": "x86-64 uses xmm15 for FTOS (FP top-of-stack) and [rbx+0x1218] for FSP (FP stack pointer in memory). AArch64 has d31 or another VFP register for FTOS (or keep in memory for simplicity). FSP stays in memory [up+offset]. Retarget: (1) replace xmm15 with an abstract FP register (d0-d31 on AArch64); (2) addsd\u2192fadd, subsd\u2192fsub, mulsd\u2192fmul, divsd\u2192fdiv (AArch64 scalar FP mnemonics); (3) movsd\u2192fmov or ldr d<N>,<addr> depending on addressing mode. AArch64 has no direct memory-operand FP instructions, so all FP cell accesses must decompose (load value, operate, store). FSP-coalescing still applies (keep FSP pointer in a register across FP runs) \u2014 same algorithm, different register."
+  },
+  {
+   "what": "DSP coalescing and rbp-relative addressing",
+   "where": "mod.rs:1486-1528 (coalesce_dsp), 1310-1334 (mem_rbp, parse_rbp_mem)",
+   "effort": "medium",
+   "detail": "coalesce_dsp defers add/sub rbp adjusts and rewrites [rbp+disp] offsets by a running delta (sound because rbp is stable at barriers). On AArch64, the DSP register is not rbp. Retarget: (1) mem_rbp and parse_rbp_mem become DSP-agnostic (take a register parameter); (2) coalesce_dsp already operates on Instr (arch-neutral AST after retargeting parse_instrs), so no change needed *if* Instr uses abstract register names. (3) Offset arithmetic is identical \u2014 no x86/AArch64 difference."
+  },
+  {
+   "what": "Window fusion: parallel-move synthesis",
+   "where": "mod.rs:1557-1767 (window_fuse, fuse_window)",
+   "effort": "small",
+   "detail": "window_fuse symbolically simulates a barrier-free window (pure stack shuffles) to a net register/slot map, then emits minimal parallel moves. The algorithm is arch-neutral \u2014 works on Instr records (not x86 text). After Instr retargeting, window_fuse generates the same Instr AST, which render (different per arch) converts to target asm. The scratch pool (fusion's 6 registers + promotion's 2) is supplied per-arch, so pool.len() checks still work. No change needed *if* Instr is arch-agnostic after the render step."
+  },
+  {
+   "what": "Hot-cell promotion: register assignment",
+   "where": "mod.rs:1780-1864 (promote_hot_cells, promote_run)",
+   "effort": "small",
+   "detail": "promote_hot_cells identifies read-only multiply-accessed cells within an rbp-stable run and promotes them to registers (r10/r11 on x86-64, platform-supplied on AArch64). Algorithm is arch-neutral (operates on Instr, selects from a supplied pool). Retarget: (1) PROMO_POOL supplied per-arch instead of hardcoded [\"r10\", \"r11\"]; (2) Instr must abstract register names; (3) rest of promote_run is unchanged."
+  },
+  {
+   "what": "Literal load encoding",
+   "where": "mod.rs:815-824 (emit_load_imm)",
+   "effort": "medium",
+   "detail": "x86 has multiple encodings: xor eax,eax for 0 (2B), mov eax,imm32 for 1..u32::MAX (5B, zero-extend), mov rax,imm32 sign-extended (7B), movabs rax,imm64 (10B). AArch64 has: movz x0,imm16 (lsl #0/16/32/48) or movn + movk chains for arbitrary 64-bit values. No single instruction covers all; must generate different sequences per constant range. Retarget: (1) emit_load_imm becomes arch-specific; (2) x86 version stays; (3) AArch64 version uses movz + movk. Trade-off: AArch64 often requires 2-4 instructions where x86 needs 1-2; impact on code size and schedule."
+  },
+  {
+   "what": "Indirect call via register (Call token lowering)",
+   "where": "mod.rs:1001-1003",
+   "effort": "small",
+   "detail": "x86 uses movabs rcx,xt ; call rcx. AArch64 uses movz x16,imm16 ; movk x16,imm16,lsl #16 ; movk x16,imm16,lsl #32 ; movk x16,imm16,lsl #48 ; blr x16 (or ldr x16,[pc,imm] if in range, then blr). The register used must be one not live at the call (x16 is commonly used for this on AArch64). Retarget: (1) emit_load_imm variant for x16 (or a scratch register); (2) switch call instruction from call rcx to blr x16. Position independence (no RIP-relative) already satisfied \u2014 movabs/movz chains produce absolute-address immediates."
+  },
+  {
+   "what": "Assembly integration (wfasm/rasm call)",
+   "where": "mod.rs:2131 (wfasm::rasm::assemble(&asm))",
+   "effort": "huge",
+   "detail": "The lowered asm text is passed to wfasm::rasm::assemble (the native macro-assembler, part of WF66's own build). AArch64 retarget requires: (1) a parallel AArch64 branch of wfasm (or a unified assembler accepting both x86 and AArch64 syntax); (2) MASM Intel-syntax switching (.intel_syntax noprefix at line 886) replaced with AArch64-native syntax (no prefix directive needed); (3) symbol table and linking unchanged (both architectures return module.symbols and module.code). This is OUT OF SCOPE for WF66 \u2014 it requires a separate wfasm AArch64 port (see separate audit). WF66's responsibility: (1) generate valid AArch64 asm text per the render() pipeline; (2) call wfasm::rasm::assemble_aarch64 (new function) or detect arch and dispatch. (3) Test round-trip: render(parse_instrs(x)) == x for AArch64 (like the x86 tests)."
+  },
+  {
+   "what": "Deferred-assembly round-trip test",
+   "where": "mod.rs:2223-2248 (lowered_body_assembles_through_rasm and related tests)",
+   "effort": "small",
+   "detail": "Tests verify render(parse_instrs(asm)) == asm (byte-for-byte identity). Retarget: (1) add AArch64 test variants using same Token \u2192 lower \u2192 parse_instrs \u2192 render \u2192 assemble flow; (2) verify round-trip holds for AArch64 asm text; (3) validate assembled code byte lengths. Tests are currently x86-only; new arm64 versions needed."
+  }
+ ],
+ "reusable_asis": [
+  "Token enum (mod.rs:475-567) \u2014 token-IR is arch-neutral (Lit, Inline, Stack, Mem, Ctl, Cmp, CmpCtl, FpBin, FpStack, FpMem, Call, LocalFetch, LocalStore, etc.). Directly reusable for AArch64.",
+  "IrBuilder (mod.rs:574-695) \u2014 the IR builder captures tokens independently of arch. Reusable as-is.",
+  "Reduction engine (mod.rs:1177-1259, reduce_tail, reduce_pair, reduce) \u2014 shift-reduce optimizer on tokens. Rules like const-fold, DCE, imm-fold, dup-fuse, compare\u2192branch are all arch-neutral (operate on Token values, not assembly). Reusable as-is.",
+  "const_fold (mod.rs:731-750) \u2014 token-level constant folding (Lit a, Lit b, Inline(op) \u2192 Lit (a op b)). Fop::eval wraps i64 arithmetic (platform-neutral). Reusable as-is.",
+  "Fop::eval (mod.rs:50-59) \u2014 wrapping 64-bit arithmetic for ADD/SUB/MUL/AND/OR/XOR. Platform-neutral. Reusable as-is.",
+  "fold_fp_abs_mem (mod.rs:1903-1923) \u2014 fuses Lit(addr) + FpMem(FFetch) \u2192 FpFetchAbs(addr). Token-level rewrite. Reusable as-is.",
+  "is_deferrable (mod.rs:1871-1901) \u2014 checks whether a token span is Phase 0 deferrable. Predicate on Token enum only. Reusable as-is.",
+  "compile_definition entry point (mod.rs:1262-1265) \u2014 orchestrates reduce(tokens) \u2192 lower(...) \u2192 assemble. Lower must be retargeted (produces arch-specific asm text), but the entry point orchestration is arch-neutral after that.",
+  "CellAlu instruction (Instr enum, mod.rs:1295-1300) \u2014 represents alu op with one cell operand ([rbp+disp]). On AArch64, decomposed to load+alu+store by render. The Instr record is arch-neutral (no x86 specifics); only render changes.",
+  "Instruction records as AST (Instr enum, mod.rs:1280-1302) \u2014 once parse_instrs is retargeted to produce arch-agnostic Instr records, all subsequent passes (coalesce_dsp, window_fuse, promote_hot_cells, render) see a unified AST. The algorithm is arch-neutral; only the final render step emits arch-specific text.",
+  "Metrics collection (mod.rs:1956-2105, record_metrics, CompileMetrics) \u2014 counts deferrable words, instruction counts, memory accesses, register usage. Arch-agnostic (operates on Instr AST). Reusable; register pool counts may differ per arch.",
+  "Control-flow lowering logic (mod.rs:1048-1161, emit_cmp_ctl, emit_ctl) \u2014 the FSM for matching BEGIN/UNTIL, IF/THEN, etc. is arch-neutral. Only the branch emission (jcc \u2192 b.cc) must change; the label generation and control-stack management reuse.",
+  "CtlFrame enum (mod.rs:440-443) \u2014 tracks open IF/BEGIN frames. Arch-neutral. Reusable as-is."
+ ],
+ "risks": [
+  "x86-64 register hardcoding pervasive: rax, rbp, rbx, rcx, rdx, rsi, rdi, r8-r11, xmm15 are baked into emit_* functions, parse_instrs pattern matching, window_fuse scratch pool, and promote_hot_cells. A single missed reference will generate silently wrong AArch64 code or fail to parse at the Instr stage.",
+  "Deferred-assembly Instr buffer is x86-centric: LoadCell/StoreCell model assumes [rbp+disp] addressing; CellAlu assumes memory operands to ALU. AArch64 has no memory operands to arithmetic \u2014 render must decompose, losing fusion's optimization opportunity. Code quality regresses.",
+  "Parse_instrs tokenizes Intel-syntax strings; no intermediate AST. Retargeting requires either: (1) emit AST instead of text from lower() (large refactor), or (2) two separate parse_instrs implementations (x86 and AArch64), with shared fuse/promote logic. Option 2 creates maintenance burden (fix in two places).",
+  "Literal-load encoding varies per constant; emit_load_imm is tightly tuned for x86 code size. AArch64 movz+movk chains may require 2-4 instructions. No automatic fallback if wfasm refuses an imm64 \u2014 WF66 will crash.",
+  "Window fusion symbolic simulation assumes a flat register namespace (rax, rsi, r10, etc. are strings). AArch64 register classes matter (x0-x30 vs sp vs zero). Promoted values must respect register families; current code will assign any Instr::LoadCell dst to pool[idx] blindly.",
+  "Hot-cell promotion pool r10/r11 is hardcoded; assumes x86-64 calling convention (caller-saved). AArch64 calling convention differs (x0-x7 caller-saved, x19-x28 callee-saved). Must change pool *and* sound-check: ensure promoted registers aren't clobbered across barriers.",
+  "Call lowering (movabs rcx,xt ; call rcx) assumes x86 indirect-call semantics. AArch64 blr requires the target in x0-x30 (not sp). Current code hardcodes rcx; must parametrize or choose a different scratch reg per arch.",
+  "Metrics collection counts 'regs' by string search (reg_present, mod.rs:2066-2069). Pool names are hardcoded ['rcx'...'r11']. After retarget, must update the SPARE list to arch-specific registers, or switch to a better mechanism (track which Instr::LoadCell registers were emitted).",
+  "DSP-coalescing offset arithmetic assumes signed i64 displacement (disp + delta). AArch64 addressing may have different offset ranges (12-bit immediates for ldr/str in some modes). Displacements > 4095 may not be encodable \u2014 render may need to decompose (load base, add offset, load/store) or emit out-of-range errors.",
+  "FP stack pointer in memory ([rbx + 0x1218]) \u2014 custom offset. AArch64 may use a different memory layout or keep FSP in a register. If registers change, all FpOp/FpStack/FpMem emit functions must be retargeted, and FSP-coalescing logic verified to still be sound.",
+  "Round-trip test (render(parse_instrs(x)) == x) will fail if parse_instrs misses an x86-only pattern (e.g., a scaled-index addressing mode). AArch64 render will generate different text. Test coverage must be comprehensive before merging AArch64 lowering.",
+  "Position independence relies on movabs + absolute memory addresses (no RIP-relative). AArch64 movz+movk chains work for absolute immediates. However, PC-relative forms (adr x0,label) are shorter; if used, they break position independence. render() must avoid them.",
+  "Wfasm assembler integration (mod.rs:2131) calls wfasm::rasm::assemble(&asm). If wfasm has not been ported to AArch64, WF66 will assemble x86-syntax text through an x86-only encoder and fail cryptically (\"unknown mnemonic\"). Must coordinate with wfasm port completion before WF66 AArch64 is usable."
+ ]
+}

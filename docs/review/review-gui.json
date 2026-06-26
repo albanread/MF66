@@ -1,0 +1,151 @@
+{
+ "subsystem": "WF66 GUI/IDE (iGui): Windows MDI-based Direct2D/DirectWrite IDE",
+ "purpose": "WF66 is a Windows-only IDE that runs Forth inside a Direct2D-rendered MDI frame with cooperative GUI/core integration. The GUI thread owns the Win32 message pump and Direct2D device context; the worker thread owns Wf64Session (the Forth VM) and drains IGuiEvent messages from a cross-thread event mailbox. Key responsibilities: MDI child lifecycle (fedit editor, fconsole REPL, stack_view), event routing (keyboard/mouse \u2192 Forth), output capture (console append, stack publish), and render-on-demand (batch-based geometry + text drawing).",
+ "arch_os_assumptions": [
+  {
+   "location": "src/igui/mod.rs:30",
+   "assumption": "#![cfg(windows)] \u2014 entire igui module is Windows-only; Direct2D/DirectWrite/Win32 APIs not portable"
+  },
+  {
+   "location": "src/igui/window.rs:17-48",
+   "assumption": "Windows Win32 API imports: HWND, MDICLIENT, WM_* message dispatch, GetMessageW message pump, Win32 message marshaling via SendMessageW/PostMessageW"
+  },
+  {
+   "location": "src/igui/cp_exports.rs:14",
+   "assumption": "#![cfg(windows)] \u2014 native function exports (iGui.NextEvent, iGui.OpenChild, etc.) use C ABI on x86-64 with i64 register convention"
+  },
+  {
+   "location": "src/igui/repl_pane.rs:64-66",
+   "assumption": "Direct2D-backed render target; HwndRenderTarget tied to HWND lifetime; D2D1_FEATURE_LEVEL_DEFAULT device creation"
+  },
+  {
+   "location": "src/igui/fconsole.rs:36-40",
+   "assumption": "Direct2D/DirectWrite for text rendering \u2014 D2D1HwndRenderTarget, IDWriteTextLayout, DWRITE_FONT_WEIGHT; all tied to Win32 HWND"
+  },
+  {
+   "location": "src/igui/stack_view.rs:23-32",
+   "assumption": "DXGI_FORMAT_B8G8R8A8_UNORM swap chain, D3D11 \u2192 Direct2D composition via HwndRenderTarget"
+  },
+  {
+   "location": "src/igui/executor.rs:14-17",
+   "assumption": "ID2D1DeviceContext (GPU-backed device context) and ID2D1Brush cache; assumes DXGI/D3D11 subsystem is initialized globally by renderer::install()"
+  },
+  {
+   "location": "src/bin/wf64_ui.rs:31",
+   "assumption": "#[cfg(windows)] on main() entry point; non-Windows builds immediately exit"
+  },
+  {
+   "location": "src/newfactor/factor_session.rs:98-104",
+   "assumption": "Windows hardcoded paths (E:\\factor\\factor.com, E:\\NewFactor\\factor.image); Factor subprocess with CREATE_NO_WINDOW flag specific to Windows console subsystem"
+  },
+  {
+   "location": "src/lib.rs:71-72",
+   "assumption": "pub mod igui is gated #[cfg(windows)]; NewFactor (lines 74-77) also Windows-only"
+  }
+ ],
+ "reusable_asis": [
+  "Wf64Session core API (pub fn eval, pub fn call_xt, pub fn stack(), pub fn push/pop) \u2014 pure Forth engine, no GUI entanglement",
+  "channels::IGuiEvent enum \u2014 platform-independent event model (keyboard, mouse, focus, resize, menu); serializable to/from i64 tuples",
+  "batch::SurfaceCmd \u2014 Direct2D command abstraction (FillRect, DrawLine, etc.) with platform-neutral geometry (Rect, Point, Rgba color); could be retargeted to macOS Metal/CoreGraphics",
+  "executor::execute(batch) \u2014 command interpreter that translates SurfaceCmd \u2192 Direct2D calls; logic is D2D-specific but structure is portable",
+  "repl_pane::append / fconsole::append \u2014 text output accumulation (thread-safe Mutex queues) with PostMessage flushing pattern; can adapt to macOS runloop",
+  "stack_view::publish \u2014 data-stack visualization model (thread-safe Mutex snapshot) independent of rendering",
+  "lib.rs:1650-1750 extern bindings (rt_print_int, rt_dot_s, rt_type, rt_read_line, rt_igui_page, rt_gpane_open, etc.) \u2014 C FFI surface that MacNCL IDE can call identically"
+ ],
+ "port_changes": [
+  {
+   "what": "IDE window frame + MDI child management",
+   "where": "src/igui/window.rs:592-766 (pub fn run, frame_wnd_proc, MDI frame/client lifecycle)",
+   "effort": "large",
+   "detail": "MF66 must replace Win32 HWND/message-pump with macOS NSWindow/NSViewController + event loop integration. MDICLIENT equivalent is a tab bar (NSSplitViewController or custom layout manager) since macOS doesn't have true MDI. WM_USER messages (WM_IGUI_OPEN_CHILD, etc. at window.rs:64-99) become cross-thread channels; SendMessageW \u2192 async dispatch queue. RegisterClassExW \u2192 NSWindowController subclass. The frame's wallpaper brush (make_logo_brush) \u2192 NSView with custom drawRect:."
+  },
+  {
+   "what": "Direct2D/DirectWrite rendering pipeline",
+   "where": "src/igui/{renderer.rs, d2d.rs, d3d.rs, dwrite.rs, executor.rs, repl_pane.rs, fconsole.rs, stack_view.rs}",
+   "effort": "huge",
+   "detail": "Replace D3D11 device + DXGI swap chains with Metal MTLDevice/MTLCommandQueue. Replace Direct2D geometry calls (FillRect, DrawLine, etc.) with MTLRenderCommandEncoder equivalents. Replace DirectWrite text layout with CoreText (NSTextStorage + NSLayoutManager on macOS, or Core Text APIs directly). This touches repl_pane.rs:36-42 (Direct2D/DirectWrite imports), fconsole.rs:36-46 (same), stack_view.rs:23-36 (DXGI format constants). The batch executor (executor.rs:68-251) itself is architecture-independent; only the underlying brush/brush-cache needs retargeting (currently D2D1SolidColorBrush \u2192 Metal render state)."
+  },
+  {
+   "what": "Event mailbox + message dispatch",
+   "where": "src/igui/{channels.rs:1-200, window.rs:732-766 message loop}",
+   "effort": "medium",
+   "detail": "channels::IGuiEvent and next_event() are platform-independent; the underlying MPSC queue survives. Replace SendMessageW blocking calls (window.rs:777-830, cp_exports.rs igui_open_child) with async dispatch_async to the GUI thread's dispatch queue. Mac equivalent of PostMessageW \u2192 DispatchQueue.main.async { \u2026 }. The WM_IGUI_* private message constants become enum variants internally. Timeout-on-next_event \u2192 DispatchSemaphore or waitForEvents: pattern on macOS runloop."
+  },
+  {
+   "what": "Window message handling + input dispatch",
+   "where": "src/igui/{window.rs frame_wnd_proc + child WndProcs, repl_pane.rs WM_CHAR/WM_KEYDOWN, fconsole.rs same, fedit.rs same}",
+   "effort": "large",
+   "detail": "Replace frame_wnd_proc switch statement (window.rs:776-820+) with NSResponder subclass overrides (keyDown:, mouseMoved:, etc.). Replace DefMDIChildProcW + GetWindowLongPtrW user storage with NSViewController userData / ivars. WM_PAINT \u2192 drawRect:. WM_SIZE \u2192 setFrameSize:. VK_* key codes \u2192 NSEvent.keyCode translation. Mouse button masks \u2192 NSEvent.type/.buttonNumber. GetKeyState modifiers \u2192 NSEvent.modifierFlags."
+  },
+  {
+   "what": "MDI pane classes (fedit, fconsole, repl_pane, stack_view, crash_view, help_pane, doc_pane)",
+   "where": "src/igui/{fedit.rs, fconsole.rs, repl_pane.rs, stack_view.rs, crash_view.rs, help_pane.rs, doc_pane.rs}",
+   "effort": "huge",
+   "detail": "Each pane registers a Win32 window class + WndProc; MF66 will subclass NSViewController instead. fedit text editing is currently fedit.rs; must move to NSTextView + NSTextDelegate. repl_pane split-pane layout (repl_pane.rs:9-10) \u2192 NSSplitViewController. fconsole scrollback + input line (fconsole.rs:117-135) \u2192 NSTableView (scrollback) + NSTextField (input). stack_view (stack_view.rs) table rendering \u2192 NSTableView. crash_view \u2192 NSTextView. help_pane + doc_pane (docpane crate) \u2192 Markdown rendering; can reuse docpane's layout (docpane/src/lib.rs:26-29) but feed CoreText for text measurement instead of DirectWrite."
+  },
+  {
+   "what": "Clipboard integration",
+   "where": "src/igui/repl_pane.rs:45-50 (GetClipboardData, SetClipboardData, CF_UNICODETEXT)",
+   "effort": "small",
+   "detail": "Replace Win32 Clipboard API (OpenClipboard, GetClipboardData, SetClipboardData) with macOS NSPasteboard. CF_UNICODETEXT \u2192 NSPasteboardTypeString."
+  },
+  {
+   "what": "Timer-driven animation tick (EvTick events)",
+   "where": "src/igui/window.rs:101-106 (WM_IGUI_SET_TIMER, SetTimer, KillTimer)",
+   "effort": "small",
+   "detail": "Replace Win32 SetTimer with NSTimer or DispatchSourceTimer on the main dispatch queue. WM_TIMER message becomes timer callback that posts EvTick to the event queue."
+  },
+  {
+   "what": "Menu + accelerators",
+   "where": "src/igui/{menu.rs, tools_menu.rs, window.rs:716-735 menu installation, frame_wnd_proc WM_COMMAND}",
+   "effort": "medium",
+   "detail": "Replace HMENU + CreateMenu/AppendMenuW with NSMenu/NSMenuItem. Keyboard accelerators (TranslateAcceleratorW, HACCEL) \u2192 NSView responder chain (keyDown: with NSEvent.keyCode filtering). WM_COMMAND handler (window.rs:817-856) \u2192 NSMenuItem target/action callbacks. Menu spec parsing (menu.rs) survives; only the Win32 menu API calls change."
+  },
+  {
+   "what": "DPI awareness + scaling",
+   "where": "src/igui/window.rs:31-33 (SetProcessDpiAwarenessContext), stack_view.rs:40 (GetDpiForWindow)",
+   "effort": "small",
+   "detail": "SetProcessDpiAwarenessContext \u2192 macOS is always DPI-aware (NSScreen.backingScaleFactor is automatic). GetDpiForWindow \u2192 NSWindow.backingScaleFactor * 96 (DPI). Mostly just remove the Windows calls; macOS handles scaling transparently."
+  },
+  {
+   "what": "GDI logo brush (window.rs:324-413, make_logo_brush, make_app_icon)",
+   "where": "src/igui/window.rs:342-412",
+   "effort": "small",
+   "detail": "Window class icon (make_app_icon, window.rs:419-549) \u2192 NSImage + NSApp.applicationIconImage. Background wallpaper brush (make_logo_brush) \u2192 NSView custom drawRect: with CoreGraphics / Core Text glyphs."
+  },
+  {
+   "what": "Process-wide renderer initialization",
+   "where": "src/igui/renderer.rs + src/igui/d3d.rs + src/igui/d2d.rs",
+   "effort": "large",
+   "detail": "Currently initializes D3D11 device + DXGI factory + Direct2D factory (renderer::install at window.rs:633). MF66 equivalent: initialize MTLDevice.makeDefaultDevice(), set up a global Metal command queue, and initialize Core Text font cache. The renderer's thread_local ctx() function (executor.rs:64-66) survives; the *contents* change from ID2D1DeviceContext to Metal command buffer state."
+  },
+  {
+   "what": "NewFactor subprocess integration (factor.com)",
+   "where": "src/newfactor/factor_session.rs, src/bin/newfactor_ui.rs",
+   "effort": "medium",
+   "detail": "factor.com is Windows-only; MF66 will call MacNCL's Forth directly (in-process) instead of spawning a Factor subprocess. Remove newfactor_session.rs subprocess Stdio piping; call into wf64::Wf64Session::eval() from the worker thread. The transpiler (newfactor/transpiler.rs) may survive if MacNCL wants to accept NewFactor syntax, but the subprocess harness is gone."
+  },
+  {
+   "what": "SEH crash handler (Phase 3b recovery)",
+   "where": "src/igui/crash_handler.rs:30-150, src/bin/wf64_ui.rs:35-105 (VEH, ExitThread redirect)",
+   "effort": "large",
+   "detail": "Windows SEH (Structured Exception Handling) with VEH (Vectored Exception Handler) is not portable; macOS has no direct equivalent. MF66 will use Mach exception handlers or signal handlers (SIGSEGV) + landing pads. The crash_view UI (crash_view.rs) survives; only the *mechanism* for catching JIT'd code faults changes. A future port may defer this to Phase 3b."
+  },
+  {
+   "what": "Cooperative pane-agent fiber scheduling",
+   "where": "src/bin/wf64_ui.rs:155-268 (run_drain_loop, agents::run_slice, IGuiEvent routing)",
+   "effort": "small",
+   "detail": "Cooperative agents model (run_slice at wf64_ui.rs:265) is pure Rust with no OS assumptions. No porting needed \u2014 only ensure the event queue (channels::next_event) works on macOS runloop instead of Win32 message pump."
+  }
+ ],
+ "risks": [
+  "Direct2D rendering is tightly coupled to D3D11 + DXGI swap chains; no abstract 'render backend' layer exists. A wholesale rewrite of renderer.rs, d3d.rs, d2d.rs is unavoidable, not refactorable.",
+  "Window message dispatch (WndProc pattern) is deeply baked into each pane class (fedit, fconsole, repl_pane, stack_view, crash_view). Porting each pane requires understanding its specific message-handler logic and translating to NSResponder/NSViewController patterns.",
+  "Feature interaction: repl_pane's D2D1HwndRenderTarget, fconsole's HwndRenderTarget, stack_view's HwndRenderTarget are all created ad-hoc per-pane and maintain their own geometry/brush cache. macOS equivalents (CAMetalLayer or MTKView) must coordinate a single Metal device + command queue; no per-HWND device allowed.",
+  "Batch execution (executor::execute) is a 'pull' model: Forth worker issues SurfaceCmd batches, GUI thread executes them. macOS Metal command encoding must happen on the render thread (or be queued via dispatch_async). The synchronization model may need adjustment.",
+  "NewFactor subprocess piping (factor_session.rs) is Windows CREATE_NO_WINDOW specific. Porting the IDE to macOS probably means dropping NewFactor support entirely and relying on in-process Forth only. Factor macro support (transpiler.rs) would need new rationale.",
+  "SEH-based crash recovery (crash_handler.rs) is the *only* safety net for JIT'd Forth faults. macOS has weaker tooling (SIGSEGV vs. SEH); implementing a robust landing-pad system is non-trivial and Phase 3b-like scope.",
+  "The xctest-derived test harness (if any) uses cfg(windows) guards; porting tests requires ensuring non-Windows builds still compile and run (at least for Rust-side unit tests; Forth tests depend on session.eval() which is platform-neutral).",
+  "Menu/accelerator architecture (tools_menu.rs, menu.rs) encodes platform-specific menu IDs (u16 MENU_CMD_BASE, etc.) and builds spec strings. The parsing survives; the menu API calls and command ID resolution change."
+ ]
+}

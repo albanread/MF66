@@ -1,0 +1,166 @@
+{
+ "subsystem": "WF66 Forth Session Runtime",
+ "purpose": "WF66 is a 64-bit Forth-in-Forth implementation that JITs a kernel written in MASM (x86-64 assembly) into executable memory, bootstraps a dictionary via Rust runtime callbacks, and runs an interactive REPL or direct-invocation test harness. It pairs a Forth interpreter (QUIT) with an optimizing compiler (`:` definitions), supports green-thread agents, register pinning (hot-variable scalar replacement), WF66 token-IR capture for optimization, and a graphical IDE (iGui). The runtime substrate consists of the Wf64Session (executable memory manager, JIT coordinator), the MASM kernel (primitives and control flow), Rust runtime functions (rt_*), and SEH/VEH crash handler integration.",
+ "arch_os_assumptions": [
+  {
+   "location": "src/lib.rs:1014-1036",
+   "assumption": "Win32 VirtualAlloc2 with MEM_ADDRESS_REQUIREMENTS for near-memory reservations; RIP-relative addressing relies on \u00b12 GB displacement fields (x86-64 constraint)"
+  },
+  {
+   "location": "src/lib.rs:1326",
+   "assumption": "ForthMain signature uses Win64 calling convention (rcx/rdx/r8/r9 args, rax return); extern 'system' fn(u64, u64, u64, u64) \u2192 u64"
+  },
+  {
+   "location": "kernel/macros.masm:41-43",
+   "assumption": "Register pinning: TOS=rax (data stack top, cached), DSP=rbp (data stack pointer, grows down), UP=rbx (user area pointer, base offset 0x80000); no r13-r15 user-owned, r15 is locals-stack pointer (LP)"
+  },
+  {
+   "location": "kernel/macros.masm:279-330",
+   "assumption": "win64_call macro (line 324): Win64 ABI requires rcx/rdx/r8/r9 caller-saved (no shadow space used by kernel primitives); r15 and UP(rbx) are preserved; @extern calls from kernel to Rust rt_* use Win64 calling convention"
+  },
+  {
+   "location": "src/lib.rs:872, kernel/macros.masm:81-84",
+   "assumption": "FTOS (floating-point top-of-stack) cached in xmm15; FP stack grows down in memory at [UP+user_FSP], user_FP0 at [UP+0x1210], xmm15 spilled to [UP+0x1228] on context switches"
+  },
+  {
+   "location": "src/lib.rs:1403, 1448",
+   "assumption": "NativeJit (from wfasm::native) is the only JIT backend; it calls RasmEncoder (native x86-64 encoder, no LLVM); kernel placed via VirtualAlloc2 into RWX memory with rel32 reachability to data region"
+  },
+  {
+   "location": "src/lib.rs:1421-1422, 1654-1681",
+   "assumption": "wfasm::seh:: installs a process-wide Vectored Exception Handler (VEH) for access violations, illegal instructions, int 3 breakpoints; registers JIT code ranges with SEH for symbolic crash dumps; RtlAddFunctionTable unwinding NOT used (no UNWIND_INFO)"
+  },
+  {
+   "location": "src/runtime.rs:65-69",
+   "assumption": "Windows _kbhit() and _getwch() for live keyboard input (not used in buffered test mode)"
+  },
+  {
+   "location": "pin.rs:75-85",
+   "assumption": "Register pinning pools: GP r9/r10/r11 for integers (caller-saved, dies across calls), xmm6-13 for floats (Win64 callee-saved, survives calls); SMC clears NOT needed (data region separate, W^X enforced)"
+  }
+ ],
+ "port_changes": [
+  {
+   "what": "Loader backend replacement",
+   "where": "src/lib.rs:1402-1403 build_boot_loader()",
+   "effort": "medium",
+   "detail": "Replace wfasm::native::NativeJit with wfasm::native_macos::MacJit (already ported in JASM/rust/src/native_macos.rs). MacJit uses mmap(MAP_JIT) instead of VirtualAlloc2, pthread_jit_write_protect_np for W^X toggle instead of page protection, AArch64 A64Encoder instead of x86 RasmEncoder. No address-constraint window needed (ARM branch range is \u00b1128 MB by default, no near-memory anchor required)."
+  },
+  {
+   "what": "Memory allocation (Forth region)",
+   "where": "src/lib.rs:1158-1192 alloc_forth_region()",
+   "effort": "medium",
+   "detail": "Replace VirtualAlloc2 with mmap(MAP_PRIVATE|MAP_ANON). Remove MEM_ADDRESS_REQUIREMENTS constraint (no near-memory window needed on ARM). Alignment: change from 0x10000 granularity to 0x4000 (ARM page size on Apple Silicon). RWX on ARM uses a single mmap call + thread-local W^X toggle (pthread_jit_write_protect_np), not page-protection changes."
+  },
+  {
+   "what": "JIT arena allocation",
+   "where": "src/lib.rs:1200-1231 alloc_jit_arena()",
+   "effort": "small",
+   "detail": "Same changes as Forth region: mmap, remove \u00b1128 MB address window (ARM branch reach handles far calls via absolute veneers), 0x4000 alignment. AAPCS64 calling convention (x0-x7 args, x0-x1 return, x19-x28 callee-saved) differs from Win64, but JIT code generation is opaque to the host (A64Encoder encodes it); only the calling convention for rt_* externs matters (see below)."
+  },
+  {
+   "what": "Locals stack allocation",
+   "where": "src/lib.rs:1249-1262 alloc_locals_region()",
+   "effort": "small",
+   "detail": "Replace VirtualAlloc with mmap(MAP_PRIVATE|MAP_ANON, PAGE_READWRITE). No MAP_JIT needed (R15 addressed RIP-relatively, far placement acceptable). Alignment: 0x4000 (16 KiB). R15 initialized to `locals_base + LOCALS_REGION_SIZE` unchanged."
+  },
+  {
+   "what": "Variable region allocation",
+   "where": "src/lib.rs:1276-1320 alloc_var_region()",
+   "effort": "small",
+   "detail": "Replace VirtualAlloc/VirtualAlloc2 with mmap. Remove \u00b1512 MB address-constraint window (hotvariable RIP-relative lea falls back to mov imm64 on AArch64 anyway; ARM addressing is fundamentally different \u2014 ADRP+ADD or plain movz/movk). PAGE_READWRITE maps to PROT_READ|PROT_WRITE (no exec). No changes to bump-pointer or size logic."
+  },
+  {
+   "what": "Runtime calling convention (rt_* externs)",
+   "where": "src/lib.rs:1463-1576 bind_externs()",
+   "effort": "large",
+   "detail": "All rt_* functions are currently marked extern 'C' (matches Win64: rcx=arg1, rdx=arg2, r8=arg3, r9=arg4, rax=return, stack shadow space). AAPCS64 is extern 'C' on ARM: x0-x7 args, x0-x1 return, stack 16-byte aligned (no shadow space). For example, rt_print_int(n, base) on Win64 is (rcx, rdx); on ARM it is (x0, x1). The extern 'C' ABI is correct by default on ARM; no source changes needed to the Rust side, BUT the MASM kernel must change: all win64_call(rt_*) sites must become AAPCS64 calling-convention sequences. See kernel code changes below."
+  },
+  {
+   "what": "Kernel calling convention to Rust rt_*",
+   "where": "kernel/*.masm all @extern calls",
+   "effort": "large",
+   "detail": "Win64 win64_call macro (kernel/macros.masm:324) loads args into rcx/rdx/r8/r9 and calls. AAPCS64 loads args into x0-x7. All JIT'd code uses the calling convention of the A64Encoder, so this is automatic. But the kernel's @extern directives reference Rust rt_* functions. The A64Encoder will emit AAPCS64 call sequences; the Rust side is already extern 'C' (correct for ARM). No MASM changes needed if A64Encoder handles this, BUT kernel assembly must be valid AArch64 syntax (current MASM is x86-64 syntax and cannot be reused)."
+  },
+  {
+   "what": "Register convention (TOS, DSP, UP, LP, FTOS, xmm pool)",
+   "where": "kernel/macros.masm:41-43, 81-84, 759-760, 872",
+   "effort": "large",
+   "detail": "AArch64 has 31 general-purpose registers (x0-x30). Currently: TOS=rax (x0 on ARM, caller-saved arg), DSP=rbp (no direct ARM equivalent; x29 is FP but not used here), UP=rbx (x27 by AAPCS64 convention, callee-saved), LP=r15 (x15, caller-saved). FP state: xmm15 (x86 simd) \u2192 d31 (ARM 64-bit FP, callee-saved). Map: TOS\u2192x0 (arg 1), DSP\u2192x29 (FP-like), UP\u2192x27 (callee-saved), LP\u2192x15 (caller-saved, acceptable for compiler-managed). FTOS\u2192d31 (callee-saved, survives calls like Win64 xmm6-15). Pin pool: r9-11 \u2192 x9-11 (caller-saved), xmm6-13 \u2192 d6-13 (callee-saved). Kernel asm must be rewritten as AArch64 syntax."
+  },
+  {
+   "what": "SEH/VEH crash handler",
+   "where": "src/lib.rs:1421-1422, 1654-1681; wfasm::seh::*",
+   "effort": "large",
+   "detail": "Windows VEH (Vectored Exception Handler, wfasm::seh) is Windows-only. macOS uses Mach exceptions (host_exception_handler, MACH_RCV_LARGE, catch_exception_raise, etc.) or standard POSIX signals (SIGSEGV, SIGILL, SIGBUS). A new Mach-based crash handler must replace VEH: register a Mach exception server, install a signal handler for SIGILL/SIGBUS (not catchable via Mach), and format Forth dumps from Mach exception context (ARM register frame, different layout than x86 CONTEXT). Code ranges and Forth dump info registration remain; the backend changes. Approximately 300 lines of seh.rs must be ported to Mach/signal handlers, or signal handlers only if Mach is deemed too complex."
+  },
+  {
+   "what": "Stack discipline and register spilling",
+   "where": "kernel/macros.masm:172-202 (rstack juggle), stack.masm throughout",
+   "effort": "medium",
+   "detail": "x86 uses rsp-xchg tricks to avoid an extra push. ARM has more registers; stack juggling logic must be rewritten in AArch64 to match the new register allocation (DSP\u2192x29, UP\u2192x27). No fundamental algorithm change, just syntax and register selection. Spill/reload of FTOS (xmm15\u2192d31) and user-area reads (UP-relative\u2192x27-relative) must be converted to ARM addressing modes."
+  },
+  {
+   "what": "Dictionary bootstrap",
+   "where": "src/lib.rs:1607-1644",
+   "effort": "small",
+   "detail": "Memory layout (OFFSET_DSP_TOP, OFFSET_RSP_TOP, OFFSET_USER_BASE, OFFSET_DICT_BASE) is architecture-agnostic byte offsets within the Forth region. No changes required; the kernel initialization sequence runs unchanged (albeit with rewritten AArch64 asm)."
+  },
+  {
+   "what": "Runtime function entry point (forth_main)",
+   "where": "src/lib.rs:1326, 1580-1627",
+   "effort": "small",
+   "detail": "ForthMain type is 'extern system fn(u64, u64, u64, u64) \u2192 u64 \u2014 correct for AAPCS64 (args in x0-x3, return in x0). Signature stays unchanged; A64Encoder emits the prologue/epilogue for this calling convention."
+  },
+  {
+   "what": "iGui/graphical UI backend",
+   "where": "src/lib.rs:71-77 (cfg(windows)), src/igui.rs",
+   "effort": "huge",
+   "detail": "iGui is a Windows MDI (Multiple Document Interface) frontend using Win32 GDI. On macOS, replace with a Cocoa/AppKit native window (NSWindow, NSView, CAMetalLayer for 3D drawing). gpane-* graphics primitives currently call Win32 GDI (FillRect, etc.); on macOS they must call Quartz 2D (CGContextFillRect, etc.). This is orthogonal to JIT porting and can be deferred; the Forth core runs headless. The iGui code is optional (feature-gated); it is not blocking for baseline MF66."
+  },
+  {
+   "what": "Vectorized register pinning emission",
+   "where": "pin.rs:218-356 (emit_load, emit_writeback, emit_access, emit_fload, etc.)",
+   "effort": "large",
+   "detail": "Pin emission currently emits x86-64 bytecode (mov reg,[rip+disp32], etc.). On ARM, emit AArch64 instructions (ldr x9, [xN, #disp], str x9, [xN, #disp]). The pin analysis logic (pin.rs:109-205) is arch-neutral; only the code emission must change. New emission functions: emit_load_aarch64, emit_writeback_aarch64, etc. The existing x86 functions can be kept behind a cfg gate."
+  },
+  {
+   "what": "GC root region access (rt_vec_alloc_floats, rt_vec_alloc_refs)",
+   "where": "src/runtime.rs:582-628",
+   "effort": "small",
+   "detail": "GC root regions (HEAPPTR, LITERAL) are just byte-offset addresses within the user area. Access via unsafe pointer casts (standard Rust); no arch changes needed."
+  },
+  {
+   "what": "WF66 token-IR capture infrastructure",
+   "where": "src/runtime.rs:860-1185, pin.rs altogether",
+   "effort": "medium",
+   "detail": "WF66 IR capture and optimization (rt_ir_begin, rt_ir_lit, rt_ir_word, rt_ir_finalize) is Rust-side logic; arch-neutral. Register pinning (rt_pin_analyze, rt_pin_emit_prologue, etc.) is the only arch-dependent part \u2014 see pin.rs emission functions above."
+  },
+  {
+   "what": "Testing harness",
+   "where": "tests/harness.rs throughout",
+   "effort": "small",
+   "detail": "Test invocations are API-level (push, pop, call, eval); they are arch-agnostic. Register pinning tests (test_pin_*) may need register number updates (r9\u2192x9, etc.) if they inspect raw bytecode, but most assertions are on behavior, not encoding."
+  }
+ ],
+ "reusable_asis": [
+  "Token-IR compiler (wf66 module, src/lib.rs:40-46, src/wf66/): optimization passes, constant folding, strength reduction are arch-neutral; only rt_pin_emit_* needs ARM codegen",
+  "Dictionary and symbol table management (kernel/dict.masm, kernel/macros.masm layout offsets): memory layout is byte-oriented; no arch coupling once register mapping is done",
+  "Forth semantics (primitives, control flow): stack discipline and register caching are ported via asm rewrite, but the high-level semantics are unchanged",
+  "REPL/quit interpreter (kernel/main.masm, runtime.rs I/O): input/output buffering and QUIT loop are arch-agnostic; only signal-driven input differs (keyboard polling on Windows \u2192 read from stdin on Unix)",
+  "Garbage collector (gc module, src/gc.rs): memory layout and object tagging are arch-neutral; only callback rt_gc_collect* to Rust side uses extern 'C' which is auto-correct on ARM",
+  "String subsystem (V2s stage A-E, kernel/string.masm, runtime.rs rt_string_*): memory ops and UTF-8 handling are portable; only register convention for rt_* calls changes",
+  "Agents/green threads (kernel/agents.masm, agents.rs): co-operative scheduling and mailbox logic are arch-neutral; only register convention changes",
+  "iGui primitives (gpane-*, fractal-iter, rt_gpane_*): Forth-side stubs and runtime dispatch are unchanged; only Win32 GDI backend must be replaced with Cocoa/Quartz (not blocking MF66 baseline)"
+ ],
+ "risks": [
+  "Kernel asm syntax conversion (MASM\u2192AArch64 GNU as) is >1000 lines of hand-written code; risk of register allocation errors, branch range miscalculations, or addressing-mode mismatches causing runtime hangs or crashes. Mitigation: test each primitive in isolation with the harness.",
+  "Register pinning codegen (emit_* functions) must handle ARM addressing modes (RIP-relative has no direct ARM analogue; use ADRP+ADD or PC-relative branches). Incorrect displacement encoding will corrupt stack or heap. Mitigation: unit tests in pin.rs, Golden snapshot tests vs LLVM-MC oracle.",
+  "Crash handler porting (VEH\u2192Mach or signals): exception frame layout differs; a mistake in reading registers could cause the dumper itself to crash. Mitigation: guard all memory reads (page_readable check), use core-dump post-mortem if dumper fails.",
+  "Locals stack R15 register: ARM caller-saved (r15 is not conventionally used by hand-written code). If a Rust-side rt_* function clobbers x15, locals stack pointers become garbage. Mitigation: audit all externs for x15 clobbering (not conventional per AAPCS64, but toolchain-dependent).",
+  "Float register mapping (xmm15\u2192d31) and FP stack memory layout ([UP+user_FSP]) are intertwined; a typo in the offset constant or register number will corrupt float computations. Mitigation: all-float test suite (Mandelbrot, FFT, etc.).",
+  "Veneer overhead: ARM can reach \u00b1128 MB via `bl` alone; absolute veneers are needed for host externs (rt_*, Win32 msvcrt stubs). Code size may grow 5-20%, affecting JIT arena capacity and performance. Mitigation: use LLVM-MC to benchmark veneer frequency.",
+  "W^X toggle (pthread_jit_write_protect_np) is per-thread; if WF66 ever becomes multi-threaded (agents on separate threads), the toggle discipline must be thread-aware. Current single-thread design is safe. Mitigation: do not parallelize test harness.",
+  "iGui deferral: headless WF66 can ship first, but a macOS GUI requires AppKit bindings (via objc crate) and Quartz 2D; shipping without GUI is acceptable for MF66 Phase 0."
+ ]
+}

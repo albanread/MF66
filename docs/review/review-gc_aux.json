@@ -1,0 +1,146 @@
+{
+ "subsystem": "WF64 / WF66 Garbage Collection, Language Runtime, and Architecture Integration",
+ "purpose": "WF64/WF66 is a 64-bit STC (stack-threaded code) Forth compiler targeting x86-64 Windows (Win64), with a GC subsystem built on newgc-core and cooperative agents via Win32 fibers. The codebase integrates memory management (GC heap layout), a micro-infix DSL (LET) for numeric computation, and runtime functions that bridge kernel assembly to Rust. MF66 (macOS ARM64 port) must reimplement the Windows/x86-specific fiber system and SysV ABI calling conventions, source the GC from MacNCL, and port the LET language codegen from Win64 to AArch64.",
+ "arch_os_assumptions": [
+  {
+   "location": "src/gc/layout.rs:44-229",
+   "assumption": "newgc-core HeapLayout trait impl (Wf64Layout) uses generic pointer classification; platform-neutral except tag scheme is x86-neutral. Heap type tags (3-bit low bits: FloatVec=010, RefVec=011, String=100, Builder=101) are platform-neutral conventions."
+  },
+  {
+   "location": "src/gc/heap.rs:41",
+   "assumption": "DEFAULT_HEAP_BYTES = 64 MB; paged_gc reserves address space lazily via VirtualAlloc (Windows API). MF66 must use mmap/VM_FLAGS_FIXED or similar."
+  },
+  {
+   "location": "src/gc/heap.rs:95",
+   "assumption": "PageHeap::<Wf64Layout>::with_reservation(bytes) calls into newgc-core which uses Windows VirtualAlloc internally. MacNCL already ported this; MF66 will source GC from MacNCL, not reimplement."
+  },
+  {
+   "location": "kernel/gc.masm:1-30, 162-193",
+   "assumption": "win64_call macro (JASM syntax) uses Win64 calling convention: RCX/RDX/R8/R9 for integer args, XMM0..3 for float args. Stack is 16-byte aligned at call site. kernel/gc.masm calls rt_gc_auto_step(UP), rt_vec_alloc_floats(UP, n, slot), rt_gc_collect(UP), etc."
+  },
+  {
+   "location": "src/agents.rs:115-148",
+   "assumption": "Win32 fiber API (ConvertThreadToFiber, CreateFiber, SwitchToFiber) is Windows-only. cfg(not(windows)) stubs return null. Fibers manage TEB (thread environment block) / SEH / guard pages / return-stack internally. MF66 must replace with libdispatch or pthread-based green threads."
+  },
+  {
+   "location": "src/agents.rs:29-40",
+   "assumption": "Per-agent state stored in shared user area at fixed offsets (USER_HANDLER=0x80, USER_FSP=0x1218, USER_SELF=0x17F0). Agents swap these cells at each fiber switch. Windows fiber handles keep native return stack + SEH correct automatically."
+  },
+  {
+   "location": "src/let_lang/codegen.rs:3-44",
+   "assumption": "LET codegen emits MC-flavour Intel syntax x86-64 assembly: Win64 calling convention (rcx=inputs, rdx=outputs), XMM6..15 for named values (callee-saved), XMM0..5 for scratch. Libm calls clobber XMM0..5 and RDX. r12 used to preserve outputs ptr across calls."
+  },
+  {
+   "location": "src/let_lang/codegen.rs:160-221",
+   "assumption": ".intel_syntax noprefix; Win64 prologue/epilogue (push r12, mov r12 rdx, sub rsp 32 for libm calls, pop r12, ret). RSP alignment \u2261 8 mod 16 on entry (for 16-byte alignment at call site). No platform abstraction layer."
+  },
+  {
+   "location": "src/let_lang/codegen.rs:496-526",
+   "assumption": "Libm calls emitted as mov rax, <abs_addr>; call rax using absolute 64-bit immediates. Addresses baked at compile time from LibmTable. No position-independent code (PIC)."
+  },
+  {
+   "location": "src/runtime.rs:65-70, 463-477",
+   "assumption": "#[cfg(windows)] calls _kbhit() / _getwch() for interactive I/O (Windows CRT). Non-Windows path uses stdin BufRead. Platform-specific but well-gated."
+  },
+  {
+   "location": "src/runtime.rs:582-628",
+   "assumption": "rt_vec_alloc_floats / rt_vec_alloc_refs call gc::alloc_floatvec / gc::alloc_refvec (Rust); on large-object failure, call gc::collect_full with root regions extracted from user area. References PAGE_SIZE_CELLS from newgc-core (platform-neutral)."
+  },
+  {
+   "location": "src/runtime.rs:634-640",
+   "assumption": "gc_root_regions(up) reads HEAPPTR and LITERAL region (base, next) pairs from user area (USER_HEAPPTR_BASE, USER_HEAPPTR_NEXT, USER_LITERAL_BASE, USER_LITERAL_NEXT offsets). Regions are 8-byte-aligned address pairs, platform-neutral."
+  },
+  {
+   "location": "src/runtime.rs:1363-1444",
+   "assumption": "GC functions (rt_gc_collect, rt_gc_collect_minor, rt_gc_auto_step, rt_gc_collect_full, rt_gc_cycle_count) are platform-neutral Rust wrappers around newgc-core PageHeap methods. No direct OS calls."
+  }
+ ],
+ "port_changes": [
+  {
+   "what": "Win32 fiber \u2192 libdispatch / pthread-based green threads or custom ARM64 coroutine scheduler",
+   "where": "src/agents.rs:115-148 (sys module); kernel/agents.masm (agent_trampoline, switch logic)",
+   "effort": "large",
+   "detail": "Fibers (ConvertThreadToFiber, CreateFiber, SwitchToFiber) manage native stacks + TEB + SEH. MF66 cannot use Win32 APIs. Options: (1) libdispatch on macOS (coarse-grained; poor Forth integration), (2) pthread + custom context switch (heavyweight), (3) ucontext / hand-rolled ARM64 setjmp (fragile across ABI changes). Must preserve per-agent state swap semantics (USER_HANDLER, USER_FSP, USER_SELF) via ARM64 registers or stack manipulation. Likely 2-4 week effort including fiber\u2190\u2192ARM64 RSP/FP reroute, exception handling bridging, and test verification."
+  },
+  {
+   "what": "Calling convention: Win64 (rcx/rdx/r8/r9 + XMM0..3) \u2192 SysV ARM64 (x0-x7 + v0-v7)",
+   "where": "src/agents.rs (sys::create_fiber param passing); kernel/gc.masm win64_call macro; kernel/agents.masm trampoline; src/runtime.rs (#[no_mangle] extern \"C\" functions, all using Win64 ABI assumptions)",
+   "effort": "large",
+   "detail": "Every rt_*() extern function expects Win64 calling convention. Kernel .masm files use win64_call(rtname) macro. MF66 needs: (1) new arm64_call macro in JASM, (2) AArch64 calling-convention wrappers for Rust externs (standard Rust on ARM64 already uses SysV, but function signatures must match), (3) user area layout changes if register-based parameter passing shifts (e.g., UP historically in a register post-context-switch), (4) fp stack conventions (fsp/xmm15 cached TOS in x86; MF66 uses v8-v15 or v0-v7 + different ABI). Estimated 1-2 weeks including wrapper layer + test harness updates."
+  },
+  {
+   "what": "LET codegen: x86-64 assembly (Intel syntax) \u2192 AArch64 assembly (AT&T or ARM preferred syntax)",
+   "where": "src/let_lang/codegen.rs:156-252 (emit_load_const, emit_expr, emit_call, intrinsic ops, prologue/epilogue); all register/instruction generation",
+   "effort": "large",
+   "detail": "LET emits MC-flavour x86 asm: Win64 prologue (push r12, mov r12 rdx), inputs from [rcx + offset], outputs to [r12 + offset], libm calls as mov rax imm64; call rax. XMM register allocation (xmm6..15 named, xmm0..5 scratch) and SSE2/SSE3 ops (movsd, addsd, mulsd, cmpsd, andpd, sqrt, etc.). For ARM64: (1) SysV calling convention (x0=inputs_ptr, x1=outputs_ptr), (2) v8..v15 for named FP values (callee-saved), v0..v7 for scratch, (3) NEON scalar FP ops (fmov s0 #const, fmul d0 d0 d1, fcmp, fabs, fneg, fsqrt, etc.), (4) libm calls via BL with offset-agnostic PC-relative addressing or via PLT, (5) AArch64 prologue (stp x29 x30 [sp -16]!, mov x29 sp; stp d8 d9 [sp -16]! for v8..v9; etc.), (6) re-verify const pool layout (RO data in .rodata or inline), (7) stack alignment (16 bytes on ARM64, with 0 mod 16 at fn entry per AAPCS). Estimated 2-3 weeks: codegen logic is straightforward but SSE\u2192NEON instruction mapping requires care + test coverage for all intrinsics (sqrt, floor, ceil, min, max, rounding, etc.)."
+  },
+  {
+   "what": "GC heap initialization: VirtualAlloc (Windows) \u2192 mmap / vm_allocate (macOS)",
+   "where": "src/gc/heap.rs:41, 95 (NewGC::with_reservation calls); newgc-core crate (not in WF66 tree, but sourced from MacNCL port)",
+   "effort": "small",
+   "detail": "MF66 will source entire GC subsystem from MacNCL, which has already ported newgc-core::PageHeap to macOS. WF66's src/gc/ wrapper layer (Wf64Layout, alloc_floatvec, collect_major, etc.) remains platform-neutral. No changes needed in WF66 proper; defer to MacNCL's GC."
+  },
+  {
+   "what": "Interactive I/O: Windows CRT (_kbhit, _getwch) \u2192 macOS TTY / libedit / Foundation",
+   "where": "src/runtime.rs:463-477 (rt_key_q Live branch); rt_read_line (similar #[cfg] gate exists)",
+   "effort": "small",
+   "detail": "Gated by #[cfg(windows)]. Non-Windows path already uses stdin BufRead (platform-neutral). May want better terminal control on macOS (libedit, raw mode, etc.) for REPL comfort, but fallback to stdin works. Low priority; can defer or use stub for now."
+  },
+  {
+   "what": "Agent parameter marshalling: fiber context as [UP, ds_top, ls_top, entry_xt] box \u2192 ARM64 register / stack layout",
+   "where": "src/agents.rs:200-230 (rt_agent_spawn_with_recv, ctx layout); kernel/agents.masm agent_trampoline reads ctx param",
+   "effort": "medium",
+   "detail": "Windows CreateFiber passes param via pointer (ctx_ptr as *const c_void). ARM64 fiber / green-thread substitute must still pass agent context somehow. Options: (1) via register (x0, x1, etc.) before context switch, (2) via stack frame, (3) via TLS / thread-local cell. kernel/agents.masm trampoline (agent_trampoline proc) reads the param; MF66 must ensure ARM64 trampoline receives [UP, ds_top, ls_top, entry_xt] in the same form. May require small adjustment to Box<[u64; 4]> passing semantics. Estimated 3-5 days."
+  },
+  {
+   "what": "User area layout review: Windows offset assumptions (0x80, 0x1218, 0x17F0, etc.) remain valid on ARM64",
+   "where": "src/agents.rs:29-40 (constants); kernel/macros.masm (mirror definitions); all per-agent user-area swaps",
+   "effort": "small",
+   "detail": "Offsets are arbitrary symbolic addresses, not hardware-dependent. Verify MacNCL defines the same user area layout (likely yes, since Forth semantics are arch-neutral). If MacNCL already has a ported kernel/ with matching macro definitions, no changes needed. If not, align layouts between WF66 and MacNCL before porting."
+  },
+  {
+   "what": "X86 instruction decoder (iced-x86) removal or ARM64 equivalent for opt-metrics feature",
+   "where": "src/opt_metrics.rs (feature-gated); src/golden.rs; Cargo.toml opt-metrics feature",
+   "effort": "medium",
+   "detail": "opt-metrics feature pulls in iced-x86 (pure-Rust x86 decoder) for golden-capture and optimizer metrics. For MF66, either: (1) reimplement with ARM64 disassembler (e.g., capstone via FFI, or hand-rolled for the subset of instructions used), (2) accept that golden capture is x86-only and gate the feature behind --target x86_64-pc-windows-msvc, (3) stub the feature for ARM64. Estimated 1 week if option (1); negligible if option (2)."
+  },
+  {
+   "what": "SEH / VEH exception handling \u2192 ARM64 / macOS exception semantics (where applicable)",
+   "where": "kernel/crash_handler / VEH registration (not directly visible in src/, but referenced in agents.rs comments and Cargo.toml Win32_System_Diagnostics_Debug); rt_forth_brk() may call into VEH",
+   "effort": "small",
+   "detail": "Windows VEH (vectored exception handler) used for crash dumps and Phase 3b recovery. macOS uses Mach exceptions (lower-level) or signal handlers (POSIX). Not critical for MVP; can defer. Forth-side breakpoint (brk / int3 in code) becomes a different trap on ARM64 (BRK #n). Low priority unless debugger integration is required."
+  },
+  {
+   "what": "WF32 \u2192 WF64 translator (wf32_port.rs) remains as-is (no ARM64 code generation from it)",
+   "where": "src/wf32_port.rs",
+   "effort": "small",
+   "detail": "Translator reads WF32 syntax, outputs JASM .masm (x86 asm). For MF66, translator can still output .masm but JASM must assemble it as ARM64. Or, create a separate ArmTranslator. Low priority; defer until ARM64 kernel baseline is solid."
+  },
+  {
+   "what": "iGui / newfactor (Windows-only GUI) \u2192 stub or conditional platform builds",
+   "where": "src/lib.rs:71-77 (cfg(windows)); src/igui/, src/newfactor/; Cargo.toml [target.'cfg(windows)'.dependencies]",
+   "effort": "small",
+   "detail": "#[cfg(windows)] guards already isolate GUI modules. MF66 builds headless by default (no iGui). If GUI is desired, will require macOS-native equivalent (Cocoa / SwiftUI), but that's beyond the scope of GC / runtime porting. Negligible effort for headless."
+  }
+ ],
+ "reusable_asis": [
+  "src/gc/layout.rs (Wf64Layout, tag scheme, header_layout impl, all tests) \u2014 pure data structure, platform-neutral. Zero changes needed.",
+  "src/gc/heap.rs (alloc_floatvec, alloc_refvec, alloc_string, alloc_builder, collect_major, collect_minor, collect_auto, collect_full) \u2014 Rust wrappers around newgc-core PageHeap. Platform-neutral as long as newgc-core is available (will source from MacNCL).",
+  "src/let_lang/parser.rs (LET grammar, tokenization, AST construction) \u2014 pure parsing, no code generation. Platform-neutral.",
+  "src/let_lang/mod.rs (compile() orchestrator, LetForm / CompiledLet struct) \u2014 API layer, platform-neutral.",
+  "src/runtime.rs (rt_print_int, rt_dot_s, rt_emit, rt_type, rt_read_line basics, rt_to_float, rt_forth_brk/trace, rt_forth_yield, rt_pin_* analysis, rt_ir_* WF66 token-IR capture, rt_gc_cycle_count, gc_root_regions) \u2014 all platform-neutral Rust. Only rt_key_q has #[cfg(windows)] I/O branch, which is already gated.",
+  "src/golden.rs (kernel symbol capture, ASLR normalization, golden oracle) \u2014 tool code, uses iced-x86 decoder (x86-only) but can be conditionally compiled or stubbed for ARM64.",
+  "tests/gc_layout_integration.rs, tests/golden_oracle.rs \u2014 test harnesses can remain as-is if they don't hardcode x86 assumptions.",
+  "kernel/ .masm files minus the calling-convention details (proc/endp structure, comment style, logic) \u2014 logic is portable; only win64_call macro invocations need rewriting to arm64_call."
+ ],
+ "risks": [
+  "Fiber \u2194 Forth RSP interop: Windows fibers automatically manage TEB / SEH; custom ARM64 context switch must manually save/restore x29 (FP), x30 (LR), and any callee-saved regs. Mishap here (stack corruption, CFI failure) is subtle and hard to debug. Test harness for fiber round-robin is essential.",
+  "Calling convention mismatch: if any extern C function signature or asm-level parameter passing is misconstrued, GC allocation / collection will silently corrupt the heap. Verify every @extern / win64_call against the ARM64 SysV ABI spec.",
+  "LET codegen SSE\u2192NEON instruction mismatch: cmpsd/andpd/andnpd/orpd (SSE bit-level ops) have no direct NEON scalar equivalents. Fallback to scalar compare \u2192 splat / blend may alter performance or semantics. Test all comparison ops (Eq, Ne, Lt, Gt, Le, Ge) end-to-end.",
+  "GC root region pointers must remain 8-byte-aligned on both platforms. User area layout assumptions (offset constants) must match MacNCL. Misalignment causes heap invariant violations.",
+  "libm function resolution: LET codegen bakes absolute addresses from LibmTable at compile time. On macOS, libm may be at a different address; ensure LibmTable is populated correctly (likely via dlsym or hardcoded libm.dylib base + offset).",
+  "Interactive I/O: Windows console mode (raw vs. cooked) differs from macOS TTY. REPL may misbehave if stdin handling is incomplete.",
+  "No automated test migration: WF64 tests assume x86-64 Windows calling convention. Tests will fail on ARM64 until (1) calling convention layer is complete, (2) all @extern symbols are correctly linked. Plan for 1-2 week debugging cycle.",
+  "Fiber stack size: WF64 hardcodes FIBER_STACK = 4 MB per agent (Win32 minimum). Verify this is suitable for ARM64 coroutines; may need tuning (libdispatch uses smaller queue size, pthread stacks are configurable)."
+ ]
+}

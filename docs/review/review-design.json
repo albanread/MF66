@@ -1,0 +1,154 @@
+{
+ "subsystem": "WF66 Optimizer + Forth ABI",
+ "purpose": "WF66 is a token-IR optimizing compiler layered on WF65, a subroutine-threaded Forth for Windows x86-64. It captures Forth definitions as token IR, applies fixpoint reduction at the Forth semantic level (constant folding, dead-code elimination, compare\u2192branch fusion), then lowers to assembly and applies instruction-level passes (DSP-adjust coalescing, window fusion via symbolic simulation for parallel-move generation, read-only cell promotion). The dual-level architecture separates algebraic Forth-semantic optimizations (invisible to machine code) from machine-specific redundancy elimination. Both levels are pure rewrite engines with no SSA/CFG/register allocator; correctness is differential against the eager WF65 oracle.",
+ "arch_os_assumptions": [
+  {
+   "location": "kernel/macros.masm:1-27",
+   "assumption": "STC (subroutine-threaded code): every word entered with `call`, return with `ret`. RSP is the native CPU call/ret stack and the Forth return stack simultaneously."
+  },
+  {
+   "location": "kernel/macros.masm:41-43",
+   "assumption": "x86-64 register assignment hardcoded: RAX=TOS, RBP=DSP, RBX=UP. Win64 ABI assumed (callee-saved RBX, RBP, R12\u2013R15)."
+  },
+  {
+   "location": "kernel/macros.masm:39",
+   "assumption": "@assert cell == 8 with comment 'requires 8-byte cells (this is x86-64)' \u2014 x86-64 address width baked into user-area offsets and memory layout."
+  },
+  {
+   "location": "get-started.md:195-207",
+   "assumption": "Win64 calling convention: RCX/RDX/RSI/RDI/R8\u2013R11 are scratch; R12 reserved as RSP-save slot for callouts (R11 forbidden); R15 reserved for LP (locals pointer)."
+  },
+  {
+   "location": "docs/memory-map.md:15-30",
+   "assumption": "Win64 ABI: RSP grows down; data/return stacks grow down. `rel32` calls/jumps for \u00b12 GB reach from JIT kernel to near regions."
+  },
+  {
+   "location": "docs/memory-map.md:105-135",
+   "assumption": "Near-placement memory layout: data-region (`user_VAR_HERE`) reserved within \u00b1512 MB of code region so `hotvariable` can emit RIP-relative `lea rax,[rip+disp32]` (7 B) instead of absolute `mov rax,imm64` (10 B). Falls back to absolute if out of range."
+  },
+  {
+   "location": "src/wf66/mod.rs:1681-1683",
+   "assumption": "Scratch register pool hardcoded: ['rsi', 'rdi', 'r8', 'r9', 'rcx', 'rdx'] for window-fusion parallel moves; r10/r11 reserved separately for read-only cell promotion. Pool layout assumes Win64 caller-saved convention."
+  },
+  {
+   "location": "docs/design/wf66_dual_level_reducer.md:200-213",
+   "assumption": "FP stack architecture: FTOS in xmm15 (callee-saved in Win64); FSP (FP stack pointer) at [UP+user_FSP]. xmm6\u201315 are nonvolatile (Win64 ABI); xmm0/xmm1 transient scratch."
+  },
+  {
+   "location": "docs/design/fp-stack-register-cache.md:69-74",
+   "assumption": "xmm15 as FTOS hardcoded; Win64 nonvolatile assumption (survives callouts); xmm14 is NOT used (2-deep cache rejected for complexity; single-FTOS cache is the design)."
+  },
+  {
+   "location": "src/lib.rs:718",
+   "assumption": "OFFSET_DSP_TOP = 0x40000 \u2014 hard-coded offset within the 128 MB main region, assumes x86-64 addressing."
+  }
+ ],
+ "port_changes": [
+  {
+   "what": "Register assignment (TOS/DSP/UP/LP homes)",
+   "where": "kernel/macros.masm lines 41\u201343; get-started.md \u00a77; src/lib.rs register definitions",
+   "effort": "large",
+   "detail": "AArch64 has no perfect equivalent to RAX=TOS caching (x0\u2013x30 are all general-purpose). The settle-everywhere ABI may work by keeping TOS in a designated register (e.g., x0), DSP in another (e.g., x19 or x20, callee-saved per ARM64 convention), and UP in a third. Register availability differs: ARM64 has 31 GP regs + SP vs x86-64's 16; ARM64 ABI reserves x18 (platform), x29\u2013x30 (frame chain). The design must reassign all 6 register roles (RAX TOS, RBP DSP, RBX UP, R12 RSP-save, R15 LP, xmm15 FTOS) to ARM64 equivalents and verify callee-save properties match. This is the mechanical but broadest change."
+  },
+  {
+   "what": "Calling convention and stack ABI (STC return addresses, Win64 \u2192 ARM64 ABI)",
+   "where": "kernel/macros.masm lines 24\u201327; docs/memory-map.md \u00a7Registers; src/runtime.rs callout marshalling",
+   "effort": "large",
+   "detail": "WF65 assumes Win64 calling convention (RCX/RDX first 2 int args, R8/R9 next 2, RSP aligned 16 B on entry to function, callee saves RBP/RBX/R12\u2013R15). ARM64 ABI (ARM EABI) differs: x0\u2013x7 are first 8 int args, x8 return-address register for values > 16 B, x29\u2013x30 (LR) are special. The return stack is the native CPU call/ret stack (STC), so the calling convention is baked into every `call`/`ret` pair. Forth\u2192Win32 API callouts would need marshalling to ARM64 ABI if porting to a non-Windows ARM64 OS; if porting to Windows on ARM64 (Windows ARM64 uses ARM EABI variant), the ABI layer changes but not the STC structure itself."
+  },
+  {
+   "what": "Scratch/temporary register pool for instruction-level passes",
+   "where": "src/wf66/mod.rs:1683 ['rsi', 'rdi', 'r8', 'r9', 'rcx', 'rdx']; promotion pool r10/r11 at line 1781",
+   "effort": "medium",
+   "detail": "The parallel-move scratch pool (6 regs for window_fuse) and promotion pool (2 regs for promote_hot_cells) are hardcoded x86-64 register names. ARM64 equivalent would need 8 non-overlapping caller-saved registers (preserving any system-reserved registers). ARM64 has x9\u2013x15 as caller-saved (7 free after excluding x18-platform/x19-frame), so a larger pool is available but must be explicitly reserved in the prologue/epilogue. The pass logic is independent of register names (it just allocates from a pool), so the change is mechanical substitution + widening the pool if desired."
+  },
+  {
+   "what": "RIP-relative addressing for hotvariable (near-memory optimization)",
+   "where": "docs/memory-map.md:106\u2013136; src/lib.rs:1271 (lea rasm comment)",
+   "effort": "medium",
+   "detail": "x86-64 uses RIP-relative addressing (rel32 displacement) to reach the data region within \u00b12 GB of code. ARM64 has no RIP equivalent; addressing is PC-relative or absolute. The design would need to either: (a) use ARM64 ADR/ADRP + offset (\u00b11 MB / \u00b14 GB reach, ADR limited to single 4 KB page), or (b) accept 64-bit absolute addresses. The near-region placement strategy (keeping data within \u00b1512 MB) would become a near-pool strategy (loading absolute or using ADR pools). The fallback to absolute addressing (10 B mov on x86) would be the primary path on ARM64."
+  },
+  {
+   "what": "FP stack register assignment and Win64 nonvolatile preservation",
+   "where": "docs/design/fp-stack-register-cache.md:68\u201375; kernel/float.masm:1\u201340 (per-primitive xmm15 reload pattern); src/wf66/mod.rs:235\u2013257 (lowering FP ops)",
+   "effort": "medium",
+   "detail": "xmm15 is hardcoded as FTOS. Win64 specifies xmm6\u201315 as nonvolatile (saved by callee); ARM64 has no xmm registers (v0\u2013v31 are SIMD; v8\u2013v15 are callee-saved, v0\u2013v7 caller-saved). The design would map FTOS to a callee-saved v-register (v8\u2013v15). The FP-operation lowering (addsd xmm15, [rcx]) would become SIMD-equivalent (fadd d15, d15, ...). Crossing the FP-stack boundary (FSP materialization in kernel primitives, float-parser interaction) would be unaffected by register choice."
+  },
+  {
+   "what": "Immediate operand encoding and instruction selection",
+   "where": "src/wf66/mod.rs:100\u2013300 (lower() function emitting Intel-syntax text); docs/design/wf66_dual_level_reducer.md:24\u201326 (lower() target)",
+   "effort": "large",
+   "detail": "Lowering outputs Intel-syntax x86-64 assembly text (e.g., 'mov rax,[rbp]', 'addsd xmm15, qword ptr [rcx]'). The JASM assembler (src/wfasm) converts this to bytes. ARM64 porting would require a parallel ARM64 lowering path or a retargeted assembler. Immediate operand constraints differ: x86 `add rax,123` vs ARM64 `add x0, x0, 123` (only shifted 12-bit immediates for many ALU ops). The token IR is architecture-neutral (Lit, Inline(Add), etc.); the separation between IR reduction and lowering is the clean point to insert ARM64 codegen, but the lowering path is about 300 lines of architecture-specific instruction selection."
+  },
+  {
+   "what": "JASM assembler and machine-code encoder (Rasm native encoder)",
+   "where": "docs/design/wf66_dual_level_reducer.md:34; src/lib.rs (references wfasm::rasm::assemble); Cargo.toml (path = '../JASM/rust')",
+   "effort": "huge",
+   "detail": "The entire pipeline depends on the JASM macro assembler and the Rasm native encoder. JASM is x86-64-specific; porting to ARM64 would require either a new ARM64 assembler+encoder or integration with an existing one (e.g., LLVM MC for ARM64, which would be a large seam change). This is outside WF66 itself but a blocking dependency \u2014 WF64 deliberately delegates assembly work, so the encoder is a separate project. For MF66, a stub/mock encoder would suffice for architecture audit; a real port would need Rasm ported or replaced."
+  },
+  {
+   "what": "Literal addressing and 64-bit immediates (mov rax, imm64)",
+   "where": "docs/memory-map.md:121\u2013125 (W^X: body address in xt+6 as imm64); kernel/compile.masm CREATE stub generation; src/lib.rs variable/constant stub emission",
+   "effort": "medium",
+   "detail": "CREATE stubs bake variable body addresses as x86-64 10-byte `mov rax, imm64`. ARM64 has no single instruction for 64-bit immediates; typical approach is a 2\u20133 instruction sequence (movz, movk, or PC-relative load). The design is preserved (body address still baked into the stub), but emission changes. The dictionary structure and xt layout are unchanged; only the stub machine code differs."
+  },
+  {
+   "what": "Memory access patterns: data-stack addressing and user-area accesses",
+   "where": "docs/memory-map.md:29 (NOS at [RBP], NNOS at [RBP+8]); src/wf66/mod.rs:120\u2013160 (LoadCell/StoreCell lowering); kernel/macros.masm:56\u201387 (user-area cell offsets)",
+   "effort": "small",
+   "detail": "Memory addressing is architecture-neutral in the semantic sense (load/store from offset). The syntax changes: x86 `mov rax,[rbp]` \u2192 ARM64 `ldr x0,[x19]` (assuming x19=DSP). User-area accesses use absolute addresses (UP base is in RBX/x20) and are PC-independent. The offset constants (user_HERE=0x18, user_VAR_HERE=0x1820, etc.) are pure constants (byte offsets), reusable on any architecture."
+  },
+  {
+   "what": "Control flow and conditional branches (CmpCtl token lowering)",
+   "where": "docs/design/wf66_dual_level_reducer.md:100\u2013105 (Cmp + if/until/while fuses to CmpCtl); src/wf66/mod.rs:280\u2013300 (CmpCtl lowering to `cmp` + `jcc`)",
+   "effort": "small",
+   "detail": "Token-level reduction (CmpCtl fusion) is architecture-neutral. Lowering emits `cmp rax,[rbp]; jl label` (Intel). ARM64 equivalent is `cmp x0,[x19]; b.lt label`. The comparison operators map directly (test flags in ARM64 NZCV register, same semantics). Branches are emitted as labels (resolved by rasm), reusable on ARM64."
+  },
+  {
+   "what": "Parallel-move window simulation and live-out register guard",
+   "where": "src/wf66/mod.rs:1550\u20131650 (window_fuse parallel-move logic); line 1644 (reg_family live-out guard for sub-register clobbering)",
+   "effort": "small",
+   "detail": "The window_fuse algorithm symbolically simulates stack moves and generates a minimal parallel-move sequence. The logic is machine-independent (slot-to-slot permutation). The live-out guard checks if a window defines a scratch register that a following barrier reads \u2014 this is architecture-specific in register naming but the concept is universal. ARM64 has no sub-registers (x0 is a full 64-bit register, no 32-bit x0d equivalent), so the guard would simplify (no sub-register clobbering concern). The pool-assignment strategy adapts but the algorithm itself is agnostic."
+  },
+  {
+   "what": "Read-only cell promotion and reserved register pool (r10/r11 \u2192 ARM64)",
+   "where": "src/wf66/mod.rs:1780\u20131810 (promote_hot_cells, pool=['r10','r11'])",
+   "effort": "small",
+   "detail": "Promotion logic (detect read \u22652\u00d7, never written, load once, reuse) is architecture-neutral. ARM64 would substitute two callee-saved registers (e.g., x20/x21 or x26/x27, with careful ABI compatibility). The rest of the pass (liveness, buffer modification) is unchanged."
+  },
+  {
+   "what": "DSP-adjust coalescing (rbp\u2192DSP register abstraction)",
+   "where": "src/wf66/mod.rs:1500\u20131560 (coalesce_dsp pass, AdjustDsp(n) instructions)",
+   "effort": "small",
+   "detail": "Coalescing defers `add/sub rbp, n` instructions and recomputes slot displacements. The algorithm (running delta, rewrite offsets, flush at barriers) is register-name-agnostic. Implementation only requires substituting DSP register name (rbp \u2192 x19 or equivalent). Buffer structure unchanged."
+  }
+ ],
+ "reusable_asis": [
+  "Token IR definition (Token enum: Lit, Inline, Stack, Cmp, CmpCtl, Call, Opaque, etc.) \u2014 architecture-neutral data structure.",
+  "Token-level reduction rules and fixpoint engine (`reduce()`, `reduce_tail()`, `reduce_pair()`) \u2014 all Forth-semantic, no register/assembly knowledge.",
+  "Constant-folding logic and rule catalog (ordered by frequency) \u2014 pure algebraic.",
+  "User-area cell offsets and memory-map structure (user_HERE, user_VAR_HERE, user_FSP, etc.) \u2014 constants, not register-dependent.",
+  "Dictionary header layout and xt-side backoffset mechanism \u2014 data structure, reusable.",
+  "Settle-everywhere ABI concept (TOS in register, rest in memory, canonical at boundaries) \u2014 architecture-neutral discipline, only register names change.",
+  "FP-stack split design (FTOS in register, FNOS+ in memory at FSP pointer) \u2014 concept reusable with different register.",
+  "Window barrier identification (Raw vs structured instructions, no-Raw regions as optimization targets) \u2014 algorithm is universal.",
+  "Symbolic simulation for net-map discovery in window_fuse \u2014 pure algorithm, register-name-independent.",
+  "Taint set concept (Opaque tokens for unknown words, fallback to eager baseline) \u2014 semantic, not architecture-specific.",
+  "Differential correctness (WF65 oracle comparison) \u2014 testing methodology, unchanged.",
+  "Register pinning (hotvariable scalar replacement in loops) \u2014 algorithm/analysis, only register pool name changes.",
+  "Locals stack (R15 LP, OpenLocals/CloseLocals) \u2014 architecture-neutral structure; only register name substitutes.",
+  "Fiber/agent scheduling and mailbox/AID abstraction (wf66_agents.md, wf66_pane_agent_gui.md) \u2014 purely Forth-level runtime, independent of ISA."
+ ],
+ "risks": [
+  "Register assignment: AArch64 has 31 GP regs vs x86-64's 16, but callee-save conventions differ (ARM64: x19\u2013x28 callee-saved vs Win64: RBX, RBP, R12\u2013R15 callee-saved). Misalignment with ARM64 ABI could silently corrupt state across callouts. Mitigation: audit every Forth\u2192Win32 callout site and verify register preservation.",
+  "Immediate operand encoding: ARM64 ALU immediates (add, sub, cmp) are 12-bit shifted; x86 is more flexible. Code emission may fail on immediates that fit x86 imm32 but not ARM64 encoding. Mitigation: token reduction or lowering must pre-check ARM64 immediate constraints and promote overflows to register immediates.",
+  "Instruction selection for FP operations: ARM64 SIMD (v0\u2013v31) has different semantics than x86 xmm/ymm. The mirror-Forth-primitives lowering strategy assumes Intel syntax; ARM64 ISA differs in operand order (some 3-operand, ordering of dst/src). Mitigation: verify FP lowering patterns (addsd \u2192 fadd d-register, etc.) against ARM64 manual.",
+  "Memory addressing: ARM64 has smaller RIP-relative range (\u00b11 MB for adr, \u00b14 GB for adrp). The x86 \u00b12 GB assumption for rel32 calls breaks. Fallback to absolute addressing is available but defeats the hotvariable near-placement optimization. Mitigation: measure instruction cache impact; may be acceptable if function density is high.",
+  "DSP-adjust coalescing assumes arithmetic on DSP is cheap (x86 add/sub rbp). ARM64 equivalent (add x19, x19, n) is also 1 instruction, so risk is low \u2014 but if DSP were held in memory instead of a register, the pass would become a bottleneck. Mitigation: pin DSP to a register; the design already does this.",
+  "Bare-metal environment: WF64 assumes Win32 API and VirtualAlloc2. ARM64 porting to a non-Windows OS (Linux arm64, macOS on Apple Silicon) would need memory allocation retargeting (mmap, POSIX ABI, SEH replacement). The optimizer is clean of these deps, but bootstrapping is not. Mitigation: this is bootstrapping/runtime work, not optimizer work, but it's a large seam.",
+  "JASM assembler is x86-64-only. WF66 depends on it for `assemble()` step. Porting the optimizer without porting the assembler results in a non-compiling pipeline. Mitigation: this is acknowledged as outside WF66 scope (deliberate delegation); MF66 would need a stub ARM64 encoder or a real Rasm port.",
+  "Taint set (do/loop, I/O, return-stack, FP-comparisons) assumes x86-64 calling conventions. On ARM64, the set might differ (e.g., return-stack interference is different if ARM64 uses LR differently). Mitigation: audit taint rules against ARM64 ABI and revise as needed; the design is flexible enough to adjust the set.",
+  "Sub-register live-out guard (line 1644) assumes Intel sub-registers (eax/ax/al clobber rax). ARM64 has no sub-registers; the guard would simplify but the live-out analysis remains sound. Risk is if the simplification is done incorrectly (missing a clobber scenario). Mitigation: ARM64 doesn't have the sub-register hazard, so the check becomes a no-op; test coverage on ARM64 is essential.",
+  "Fiber switching and RSP reroute (agents.md \u00a74, wf64_ui.rs fiber code) are Win32 fibers (ConvertThreadToFiber, SwitchToFiber). ARM64 porting to non-Windows needs equivalent (Rust async, green threads, or custom stack switching). Mitigation: this is runtime/scheduler work, not optimizer work; agents.md design is abstract enough (stacks are saved/restored, not inspected), so the mechanic can swap."
+ ]
+}
