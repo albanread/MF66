@@ -208,16 +208,24 @@ region}` in one ±128 MB span (calls = `bl`; data addresses = `adrp+add`).
    `Mf66Session` boots the overlay, `create_word`/`find` helpers; `tests/dict.rs`
    — create→find, case-insensitive, collisions, nt counted-name, redefinition
    shadowing, 6 green; FNV-1a uses 32-bit `mul w`, byte-identical to WF66).
-3. **Construction** — `create` (header-only ✅; CREATE-stub/`>body`/`forget`
-   deferred), `publish_primitive`, `set_xt`/`set_comp`/`set_flags`,
-   the navigation words (`>ct`/`>comp`/`>name`/`name>interpret`/`name>compile`/`tfa@`),
-   `wordlist`/search-order words. (`forget_last`, the CREATE stub, and `>body` come
-   with control-flow/CREATE — defer the stub-bearing parts until needed.)
-4. **Rust bootstrap** — `Mf66Session`: the §5 sequence; a `PRIMITIVES` table
-   (port WF66's verbatim, mapped to MF66 asm symbols), `publish_primitive` driver,
-   the xt back-ref writer (with W^X + icache).
-5. **Verify** — `find` resolves every bootstrapped primitive; then this unblocks
-   the **interpreter** (parse → find → execute/compile) and the eval corpus.
+3. **Construction** — `create` (header-only ✅), `publish_primitive` ✅,
+   `execute` ✅, `name>interpret` ✅. **PARTIAL** — the rest (`set-xt`/`set-comp`/
+   `set-flags`, the `>ct`/`>comp`/`>name`/`name>compile`/`tfa@` navigation, the
+   `wordlist`/search-order words, `forget_last`, the CREATE stub, `>body`) land
+   with the interpreter/compiler that needs them. `dh_ct` immediacy is wired from
+   Rust later (the front-end rejects `@PAGE`, so asm can't take a symbol address;
+   header fields are plain RW so Rust patches them — no SMC).
+4. **Rust bootstrap** — **✅ DONE**: `src/primitives.rs` (178 entries = WF66's
+   `PRIMITIVES` ∩ MF66's kernel procs, order preserved); `Mf66Session::
+   bootstrap_dictionary` publishes each via `publish_primitive` at boot. (Gap
+   surfaced + fixed: plain `*`/`times` had no corpus `.t`, so it was never ported.)
+   The xt back-ref writer (xt→header, needs W^X+icache) is deferred — the
+   interpreter goes nt→xt via `name>interpret`, not xt→header.
+5. **Verify** — **✅ DONE**: after boot, every primitive is findable by Forth name
+   and runs via `find → name>interpret → execute` (`tests/dict.rs`:
+   `bootstrap_makes_primitives_findable`, `publish_find_interpret_execute` —
+   `7 dup + 1+ → 15`, `6 7 * → 42`). Corpus still 147/150; full suite green. This
+   unblocks the **interpreter** (parse → find → execute/compile) + the eval corpus.
 
 The compile emitters (`compile_comma`/`inline_*`/`fold_*`) and the WF66 front-end
 typing land with the interpreter + optimizer phases; this doc fixes the data

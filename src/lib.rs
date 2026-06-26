@@ -14,6 +14,7 @@
 pub mod abi;
 pub mod asm_macros;
 pub mod jit;
+pub mod primitives;
 pub mod runtime;
 pub mod session;
 

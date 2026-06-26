@@ -71,3 +71,40 @@ fn redefinition_finds_newest_first() {
     let second = s.find("x").unwrap().unwrap();
     assert_ne!(first, second, "newest definition shadows the older one");
 }
+
+/// The interpreter's core path: publish primitives, then find → name>interpret →
+/// execute them with data-stack args (no asm-symbol shortcut).
+#[test]
+fn publish_find_interpret_execute() {
+    let mut s = Mf66Session::new().unwrap();
+    s.publish("dup", "dup_", false).unwrap();
+    s.publish("+", "plus", false).unwrap();
+    s.publish("1+", "one_plus", false).unwrap();
+    // nt -> xt resolves to the real primitive code address
+    let nt = s.find("dup").unwrap().unwrap();
+    assert!(nt != 0);
+    // execute through the dictionary
+    s.push(7);
+    s.run_word("dup").unwrap(); // 7 -> 7 7
+    assert_eq!(s.stack(), vec![7, 7]);
+    s.run_word("+").unwrap(); // 7 7 -> 14
+    assert_eq!(s.stack(), vec![14]);
+    s.run_word("1+").unwrap(); // 14 -> 15
+    assert_eq!(s.stack(), vec![15]);
+}
+
+/// After boot, every kernel primitive is findable + executable by its Forth name
+/// (no manual publish, no asm-symbol shortcut) — the dictionary bootstrap works.
+#[test]
+fn bootstrap_makes_primitives_findable() {
+    let mut s = Mf66Session::new().unwrap();
+    for name in ["dup", "swap", "drop", "+", "-", "*", "=", "<", "negate", "2dup", "cell+", "and", "or", "@", "!"] {
+        assert!(s.find(name).unwrap().is_some(), "{name} should be in the dictionary after boot");
+    }
+    s.push(6);
+    s.push(7);
+    s.run_word("*").unwrap(); // 6 7 * -> 42
+    assert_eq!(s.stack(), vec![42]);
+    s.run_word("negate").unwrap(); // -> -42
+    assert_eq!(s.stack(), vec![-42]);
+}

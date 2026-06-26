@@ -500,3 +500,11 @@ proc(um_times)
     next()
 endp()
 
+
+; * ( a b -- a*b )   plain multiply (no corpus .t drove it; surfaced by bootstrap)
+proc(times)
+    ldr     x9, [DSP]
+    mul     TOS, TOS, x9
+    stk(2, 1)
+    next()
+endp()

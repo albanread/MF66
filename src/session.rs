@@ -125,8 +125,10 @@ impl Mf66Session {
         s.write_user(USER_DICT_END, base + DICT_TOP as u64);
         s.write_user(USER_VAR_HERE, base + VAR_BASE as u64);
         s.write_user(USER_VAR_LIMIT, base + VAR_TOP as u64);
-        // Carve the FORTH wordlist + install the search order.
+        // Carve the FORTH wordlist + install the search order, then publish every
+        // kernel primitive so it is findable by its Forth name.
         s.call("init_dictionary_overlay")?;
+        s.bootstrap_dictionary()?;
         Ok(s)
     }
 
@@ -198,6 +200,40 @@ impl Mf66Session {
         };
         self.reset();
         Ok(result)
+    }
+
+    /// Publish a kernel primitive into the dictionary (bootstrap helper):
+    /// resolve `asm_sym` to its code address and `publish_primitive` it under
+    /// `forth_name`. `immediate` marks compile-time words (wired into dh_ct later).
+    pub fn publish(&mut self, forth_name: &str, asm_sym: &str, immediate: bool) -> Result<()> {
+        let xt = self.xt_of(asm_sym)?;
+        self.push_name(forth_name);
+        self.push(xt as i64);
+        self.push(0); // comp-xt (compile helper) — none yet
+        self.push(if immediate { 1 } else { 0 });
+        self.call("publish_primitive")
+    }
+
+    /// Publish every kernel primitive (the `PRIMITIVES` table) into the dictionary.
+    fn bootstrap_dictionary(&mut self) -> Result<()> {
+        for &(name, sym, immediate) in crate::primitives::PRIMITIVES {
+            self.publish(name, sym, immediate)
+                .with_context(|| format!("publish {name} ({sym})"))?;
+        }
+        Ok(())
+    }
+
+    /// Interpret-mode core: find `name` and execute it (`find → name>interpret →
+    /// execute`). Any data-stack args pushed beforehand are passed to the word.
+    pub fn run_word(&mut self, name: &str) -> Result<()> {
+        self.push_name(name);
+        self.call("find_name")?;
+        if self.stack().first() != Some(&-1) {
+            anyhow::bail!("word not found: {name}");
+        }
+        self.call("drop_")?; // drop the found flag (-1), leaving ( … nt )
+        self.call("name_to_interpret")?; // nt -> xt
+        self.call("execute") // run it
     }
 
     /// Clear the data stack and restore post-boot defaults.

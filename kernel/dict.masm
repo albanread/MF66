@@ -250,6 +250,46 @@ proc(create)
     brk     #0x10                         ; TODO: throw -8
 endp()
 
+; execute  ( xt -- )   run the word whose code is at xt; it returns to our caller.
+proc(execute)
+    mov     x16, x0                       ; xt
+    ldr     x0, [DSP]                     ; new TOS = NOS (drop xt)
+    stk(1, 0)
+    br      x16                           ; tail-jump: xt's ret returns to our caller
+endp()
+
+; name>interpret  ( nt -- xt )   xt = [nt + dh_xtptr - dh_nt]  (dh_nt-dh_xtptr=31)
+proc(name_to_interpret)
+    sub     x0, x0, #31                   ; nt - 31 = header + dh_xtptr
+    ldr     x0, [x0]
+    next()
+endp()
+
+; publish-primitive  ( c-addr u xt comp-xt flags -- )
+; Bootstrap publisher: (create) the header, then point dh_xtptr at the real JIT'd
+; primitive address and dh_comp at comp-xt (if non-zero). dh_ct (immediacy) is
+; patched from Rust once compile_word/execute exist — the interpreter doesn't read
+; it yet, and the front-end rejects @PAGE so asm can't take a symbol's address.
+proc(publish_primitive)
+    mov     x9, x0                        ; flags
+    ldr     x10, [DSP]                    ; comp-xt
+    ldr     x11, [DSP, #8]                ; xt
+    ldr     x0, [DSP, #16]                ; new TOS = u
+    add     DSP, DSP, #24                 ; drop flags/comp-xt/xt -> ( c-addr u )
+    stp     x10, x11, [sp, #-32]!         ; save comp-xt, xt
+    stp     x9, x30, [sp, #16]            ; save flags, LR
+    bl      create                        ; ( c-addr u -- )  header at HERE
+    ldp     x9, x30, [sp, #16]
+    ldp     x10, x11, [sp], #32
+    ldr     x12, [UP, #user_LATEST]
+    str     x11, [x12, #dh_xtptr]         ; real xt
+    str     x11, [UP, #user_LATESTXT]
+    cbz     x10, .nocomp
+    str     x10, [x12, #dh_comp]
+.nocomp:
+    next()                                ; flags (x9) -> dh_ct deferred (interpreter)
+endp()
+
 ; MF66 kernel — dictionary helpers (ported from WF66 kernel/dict.masm).
 ; Internal form: TOS in x0, NOS at [DSP] (x19). See docs/porting-guide.md.
 
