@@ -213,4 +213,9 @@ pub const PRIMITIVES: &[(&str, &str, bool)] = &[
     ("allot", "allot_word", false),
     (",", "comma_word", false),
     ("c,", "c_comma_word", false),
+    // OOP dispatch (MF66 oop.masm)
+    ("self", "self_word", false),
+    ("(send)", "send_word", false),
+    ("(send-xt)", "send_xt_word", false),
+    ("(dnu)", "dnu_word", false),
 ];

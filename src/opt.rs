@@ -59,6 +59,9 @@ pub enum Tok {
     Mem(Mem),
     LocalFetch(u32),  // push local[i] (LP-relative)
     LocalStore(u32),  // local[i] = TOS; drop
+    IvarFetch(u32),   // push [SELF + off]  (OOP instance variable)
+    IvarStore(u32),   // [SELF + off] = TOS; drop
+    SelfPush,         // push the current receiver (user_SELF)
     Call(u64),
 }
 
@@ -123,6 +126,8 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
 const TOS: u32 = 0; // x0 — always holds the top of stack within a window
 const DSP: u32 = 19;
 const LP: u32 = 21; // locals-frame pointer
+const UP: u32 = 20; // user-area base
+const USER_SELF: u32 = 0x1830; // OOP receiver slot in the user area
 const POOL: [u32; 7] = [9, 10, 11, 12, 13, 14, 15]; // register window below TOS
 
 /// Register-windowing lowerer (O2). The invariant: TOS is in x0; the next cells
@@ -342,6 +347,26 @@ impl<'a> Low<'a> {
         self.out.push(mov_reg(TOS, r));
     }
 
+    fn self_push(&mut self) {
+        self.push_down();
+        self.out.push(ldr_off(TOS, UP, USER_SELF)); // TOS = [UP + user_SELF]
+    }
+
+    fn ivar_fetch(&mut self, off: u32) {
+        self.push_down();
+        let r = self.alloc(); // transient: the SELF base
+        self.out.push(ldr_off(r, UP, USER_SELF));
+        self.out.push(ldr_off(TOS, r, off)); // TOS = [SELF + off]
+    }
+
+    fn ivar_store(&mut self, off: u32) {
+        let r = self.scratch(); // SELF base (transient)
+        self.out.push(ldr_off(r, UP, USER_SELF));
+        self.out.push(str_off(TOS, r, off)); // [SELF + off] = TOS
+        let v = self.pop_nos(); // drop TOS, raise NOS
+        self.out.push(mov_reg(TOS, v));
+    }
+
     fn mem(&mut self, m: Mem) {
         match m {
             Mem::Fetch => self.out.push(ldr0(TOS, TOS)),
@@ -417,6 +442,9 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>) {
             Tok::Mem(m) => low.mem(m),
             Tok::LocalFetch(i) => low.local_fetch(i),
             Tok::LocalStore(i) => low.local_store(i),
+            Tok::IvarFetch(off) => low.ivar_fetch(off),
+            Tok::IvarStore(off) => low.ivar_store(off),
+            Tok::SelfPush => low.self_push(),
             Tok::Call(xt) => {
                 low.settle();
                 emit_call(xt, low.out);

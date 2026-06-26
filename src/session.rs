@@ -40,6 +40,7 @@ const USER_DSP_SAVE: usize = 0x60;
 const USER_SP0: usize = 0x68;
 const USER_RSP_CURRENT: usize = 0x70;
 const USER_HANDLER: usize = 0x80;
+const USER_SELF: usize = 0x1830;
 const USER_LP0: usize = 0x15B0;
 const USER_FP0: usize = 0x1210;
 const USER_FSP: usize = 0x1218;
@@ -82,7 +83,44 @@ pub struct Mf66Session {
     vocab: HashMap<u64, Vec<Tok>>,
     /// Word count of the most recently compiled colon body (for optimizer tests).
     last_body_words: usize,
+
+    // ── OOP state ──────────────────────────────────────────────────────────
+    /// Classes by name (metadata; the source of truth alongside the data-space
+    /// class struct each one allocates).
+    classes: HashMap<String, ClassInfo>,
+    /// Selector names → stable id (index); never cleared (WF66 semantics).
+    selectors: Vec<String>,
+    /// Named instances → (object base addr, class name).
+    objects: HashMap<String, (u64, String)>,
+    /// Class being built between `class`/`subclass` and `end-class`.
+    pending_class: Option<ClassInfo>,
+    /// While compiling a `:m` method body: the owning class name (ivar scope).
+    method_class: Option<String>,
+    /// One-shot flag: the next `->` is a `super` send (early-bind to the parent).
+    super_pending: bool,
+    /// Static class of the most recently emitted receiver (for early binding).
+    last_receiver_class: Option<String>,
+    /// Cached xts: (dnu) default method, (send), (send-xt).
+    dnu_xt: u64,
+    send_xt: u64,
+    send_xt_xt: u64,
 }
+
+/// OOP class metadata. The data-space class struct mirrors this: [+0]=super
+/// struct addr, [+8]=reserved, [+16]=vtable[VTABLE_CAP] (selector id → method xt,
+/// unused slots = (dnu)).
+#[derive(Clone)]
+struct ClassInfo {
+    name: String,
+    super_name: Option<String>,
+    struct_addr: u64,
+    isize_bytes: u64,              // instance size incl. the leading class-ptr cell
+    ivars: Vec<(String, u64)>,    // ivar name → byte offset within an instance
+    methods: HashMap<String, u64>, // selector name → compiled method xt
+}
+
+/// Fixed vtable capacity per class (matches the hand-built oop_send layout).
+const VTABLE_CAP: u64 = 256;
 
 /// In-progress colon definition: the word name, the accumulated body words, and
 /// the compile-time control-flow stack of pending branch patches / loop targets.
@@ -159,6 +197,16 @@ impl Mf66Session {
             bye: false,
             vocab: HashMap::new(),
             last_body_words: 0,
+            classes: HashMap::new(),
+            selectors: Vec::new(),
+            objects: HashMap::new(),
+            pending_class: None,
+            method_class: None,
+            super_pending: false,
+            last_receiver_class: None,
+            dnu_xt: 0,
+            send_xt: 0,
+            send_xt_xt: 0,
         };
 
         s.write_user(USER_RSP_CURRENT, rstack_top);
@@ -184,7 +232,55 @@ impl Mf66Session {
         s.call("init_dictionary_overlay")?;
         s.bootstrap_dictionary()?;
         s.build_vocab()?;
+        s.oop_boot()?;
         Ok(s)
+    }
+
+    /// One-time OOP setup: the user_SELF slot, the `cell` constant, the root
+    /// class `object`, and cached xts for dispatch + (dnu).
+    fn oop_boot(&mut self) -> Result<()> {
+        self.write_user(USER_SELF, 0);
+        self.publish_constant("cell", CELL as i64)?; // `cell ivar: n`
+        self.dnu_xt = self.xt_of("dnu_word")?;
+        self.send_xt = self.xt_of("send_word")?;
+        self.send_xt_xt = self.xt_of("send_xt_word")?;
+        // Root class `object`: metadata-only (never instantiated directly).
+        self.classes.insert(
+            "object".to_string(),
+            ClassInfo {
+                name: "object".to_string(),
+                super_name: None,
+                struct_addr: 0,
+                isize_bytes: CELL as u64, // just the class-ptr cell
+                ivars: Vec::new(),
+                methods: HashMap::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Reverse-lookup a class name by its data-space struct address.
+    fn class_name_by_struct(&self, addr: u64) -> Option<String> {
+        self.classes
+            .iter()
+            .find(|(_, c)| c.struct_addr == addr && addr != 0)
+            .map(|(n, _)| n.clone())
+    }
+
+    /// If compiling a method body and `name` is an ivar of its class, its offset.
+    fn ivar_offset(&self, name: &str) -> Option<u32> {
+        self.method_class.as_ref()?;
+        let c = self.pending_class.as_ref()?;
+        c.ivars.iter().find(|(n, _)| n == name).map(|(_, o)| *o as u32)
+    }
+
+    /// Find-or-assign a stable selector id for `name`.
+    fn selector_id(&mut self, name: &str) -> u64 {
+        if let Some(i) = self.selectors.iter().position(|s| s == name) {
+            return i as u64;
+        }
+        self.selectors.push(name.to_string());
+        (self.selectors.len() - 1) as u64
     }
 
     // ── Stack API (mirrors Wf64Session) ─────────────────────────────────
@@ -346,6 +442,108 @@ impl Mf66Session {
                 }
                 continue;
             }
+            // Receiver tracking for early binding: any token other than `->`
+            // begins a fresh receiver context.
+            if lk != "->" {
+                self.last_receiver_class = None;
+            }
+            // ── OOP parsing words (valid in both interpret and compile state) ──
+            match lk.as_str() {
+                "->" => {
+                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`->` needs a selector"))?;
+                    self.oop_send(s)?;
+                    continue;
+                }
+                ":m" => {
+                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`:m` needs a name"))?;
+                    self.oop_begin_method(s)?;
+                    continue;
+                }
+                ";m" => {
+                    self.oop_end_method()?;
+                    continue;
+                }
+                "ivar:" => {
+                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`ivar:` needs a name"))?;
+                    self.oop_ivar(s)?;
+                    continue;
+                }
+                "end-class" => {
+                    self.oop_end_class()?;
+                    continue;
+                }
+                "class" => {
+                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`class` needs a name"))?;
+                    self.oop_start_class(s, "object")?;
+                    continue;
+                }
+                "subclass" => {
+                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`subclass` needs a name"))?;
+                    let parent = self.pop_data().unwrap_or(0) as u64;
+                    let pn = self
+                        .class_name_by_struct(parent)
+                        .ok_or_else(|| anyhow::anyhow!("`subclass`: parent is not a class"))?;
+                    self.oop_start_class(s, &pn)?;
+                    continue;
+                }
+                "new" => {
+                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`new` needs a name"))?;
+                    let cs = self.pop_data().unwrap_or(0) as u64;
+                    let cn = self
+                        .class_name_by_struct(cs)
+                        .ok_or_else(|| anyhow::anyhow!("`new`: not a class"))?;
+                    self.oop_new(&cn, s)?;
+                    continue;
+                }
+                "create" => {
+                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`create` needs a name"))?;
+                    let addr = self.read_user(USER_VAR_HERE);
+                    self.publish_constant(s, addr as i64)?; // NAME pushes the data field addr
+                    continue;
+                }
+                "[defined]" => {
+                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`[defined]` needs a name"))?;
+                    self.oop_defined_q(s)?;
+                    continue;
+                }
+                "object?" => {
+                    self.oop_object_q();
+                    continue;
+                }
+                "class?" => {
+                    self.oop_class_q();
+                    continue;
+                }
+                "is-a?" => {
+                    self.oop_is_a_q();
+                    continue;
+                }
+                ".class" => {
+                    self.oop_dot_class();
+                    continue;
+                }
+                _ => {}
+            }
+            // ── Class / object names used as operands ──
+            if let Some(c) = self.classes.get(tok) {
+                let addr = c.struct_addr as i64;
+                if self.pending.is_some() {
+                    self.pending.as_mut().unwrap().toks.push(Tok::Lit(addr));
+                } else {
+                    self.push(addr);
+                }
+                continue;
+            }
+            if let Some(&(addr, ref cls)) = self.objects.get(tok) {
+                let cls = cls.clone();
+                if self.pending.is_some() {
+                    self.pending.as_mut().unwrap().toks.push(Tok::Lit(addr as i64));
+                } else {
+                    self.push(addr as i64);
+                }
+                self.last_receiver_class = Some(cls);
+                continue;
+            }
             if self.pending.is_some() {
                 if lk == ";" {
                     self.finish_colon()?;
@@ -480,17 +678,33 @@ impl Mf66Session {
 
     /// `to <local>` — compile a store into the named local.
     fn compile_to(&mut self, target: &str) -> Result<()> {
+        // `to <ivar>` inside a method, else `to <local>`.
+        if let Some(off) = self.ivar_offset(target) {
+            self.pending.as_mut().unwrap().toks.push(Tok::IvarStore(off));
+            return Ok(());
+        }
         let def = self.pending.as_ref().unwrap();
         match def.locals.iter().position(|n| n.eq_ignore_ascii_case(target)) {
             Some(i) => {
                 self.pending.as_mut().unwrap().toks.push(Tok::LocalStore(i as u32));
                 Ok(())
             }
-            None => anyhow::bail!("`to {target}` — not a local (VALUEs not supported yet)"),
+            None => anyhow::bail!("`to {target}` — not a local/ivar"),
         }
     }
 
     fn compile_token(&mut self, tok: &str) -> Result<()> {
+        // A bare ivar name (inside a method body) compiles to a SELF-relative fetch.
+        if let Some(off) = self.ivar_offset(tok) {
+            self.pending.as_mut().unwrap().toks.push(Tok::IvarFetch(off));
+            return Ok(());
+        }
+        // `super` inside a method: push self and mark the next `->` as a super send.
+        if tok.eq_ignore_ascii_case("super") {
+            self.pending.as_mut().unwrap().toks.push(Tok::SelfPush);
+            self.super_pending = true;
+            return Ok(());
+        }
         // A bare local name compiles to a fetch from its frame slot.
         if let Some(i) = self
             .pending
@@ -716,25 +930,245 @@ impl Mf66Session {
 
     /// Finish the pending colon definition: emit unnest+ret, commit the body to
     /// the code arena, create the header, and point it at the body (tfa = colon).
-    fn finish_colon(&mut self) -> Result<()> {
+    /// Finish the pending body (flush, free locals, unnest+ret) and commit it to
+    /// the code arena, returning its xt. Does NOT publish a header.
+    fn commit_body(&mut self) -> Result<u64> {
         self.flush_toks(); // lower the final straight-line run
-        let mut def = self.pending.take().expect("finish_colon with no pending def");
+        let mut def = self.pending.take().expect("commit_body with no pending def");
         if !def.cf.is_empty() {
             anyhow::bail!("unbalanced control flow in `{}`", def.name);
         }
         if !def.locals.is_empty() {
-            // free the locals frame before returning
             def.body.push(crate::aenc::add_imm(21, 21, (def.locals.len() * 8) as u32));
         }
         crate::aenc::emit_unnest_ret(&mut def.body);
         self.last_body_words = def.body.len();
-        let xt = self.code.commit(&def.body)?;
+        self.code.commit(&def.body)
+    }
+
+    fn finish_colon(&mut self) -> Result<()> {
+        let name = self.pending.as_ref().expect("finish_colon: no def").name.clone();
+        let xt = self.commit_body()?;
         // Header (in the RW dict heap) via (create), then patch xt + type tag.
-        self.push_name(&def.name);
+        self.push_name(&name);
         self.call("create")?;
         let header = self.read_user(USER_LATEST);
         self.write_u64(header + DH_XTPTR, xt);
         self.write_u8(header + DH_TFA, TFA_TCOL);
+        Ok(())
+    }
+
+    // ── OOP defining words ──────────────────────────────────────────────────
+
+    /// `class N` / `P subclass N`: begin building a class (copy-down from parent).
+    fn oop_start_class(&mut self, name: &str, parent: &str) -> Result<()> {
+        let p = self
+            .classes
+            .get(parent)
+            .ok_or_else(|| anyhow::anyhow!("unknown parent class `{parent}`"))?;
+        self.pending_class = Some(ClassInfo {
+            name: name.to_string(),
+            super_name: Some(parent.to_string()),
+            struct_addr: 0,
+            isize_bytes: p.isize_bytes,
+            ivars: p.ivars.clone(),
+            methods: p.methods.clone(), // inherit (copy-down)
+        });
+        Ok(())
+    }
+
+    /// `<size> ivar: NAME` — add an instance variable to the pending class.
+    fn oop_ivar(&mut self, name: &str) -> Result<()> {
+        let size = self.pop_data().unwrap_or(CELL as i64) as u64;
+        let c = self
+            .pending_class
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("`ivar:` outside a class"))?;
+        let off = c.isize_bytes;
+        c.ivars.push((name.to_string(), off));
+        c.isize_bytes += size;
+        Ok(())
+    }
+
+    /// `end-class` — allocate the data-space class struct and register the class.
+    fn oop_end_class(&mut self) -> Result<()> {
+        let mut c = self
+            .pending_class
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("`end-class` without `class`"))?;
+        // class struct: [+0]=super, [+8]=reserved, [+16]=vtable[VTABLE_CAP]
+        let struct_addr = self.read_user(USER_VAR_HERE);
+        let total = 16 + VTABLE_CAP * CELL as u64;
+        self.write_user(USER_VAR_HERE, struct_addr + total);
+        let super_addr = c
+            .super_name
+            .as_ref()
+            .and_then(|p| self.classes.get(p))
+            .map(|p| p.struct_addr)
+            .unwrap_or(0);
+        self.write_u64(struct_addr, super_addr);
+        self.write_u64(struct_addr + 8, 0);
+        // fill the vtable: every slot = (dnu), then install this class's methods
+        for k in 0..VTABLE_CAP {
+            self.write_u64(struct_addr + 16 + k * CELL as u64, self.dnu_xt);
+        }
+        for (sel, xt) in c.methods.clone() {
+            let id = self.selector_id(&sel);
+            self.write_u64(struct_addr + 16 + id * CELL as u64, xt);
+        }
+        c.struct_addr = struct_addr;
+        self.classes.insert(c.name.clone(), c);
+        Ok(())
+    }
+
+    /// `C new NAME` — allocate + zero an instance, store its class, register it.
+    fn oop_new(&mut self, class_name: &str, obj_name: &str) -> Result<()> {
+        let c = self
+            .classes
+            .get(class_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown class `{class_name}`"))?;
+        let isize = c.isize_bytes;
+        let struct_addr = c.struct_addr;
+        let addr = self.read_user(USER_VAR_HERE);
+        self.write_user(USER_VAR_HERE, addr + isize);
+        for off in (0..isize).step_by(CELL) {
+            self.write_u64(addr + off, 0);
+        }
+        self.write_u64(addr, struct_addr); // [obj+0] = class
+        self.objects.insert(obj_name.to_string(), (addr, class_name.to_string()));
+        self.publish_constant(obj_name, addr as i64)?; // NAME pushes its base addr
+        Ok(())
+    }
+
+    /// `:m SELECTOR` — begin compiling a method body in the pending class's scope.
+    fn oop_begin_method(&mut self, selector: &str) -> Result<()> {
+        let class = self
+            .pending_class
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("`:m` outside a class"))?
+            .name
+            .clone();
+        self.selector_id(selector); // assign a stable id
+        let mut body = Vec::new();
+        crate::aenc::emit_nest(&mut body);
+        self.pending = Some(ColonDef {
+            name: selector.to_string(), // method bodies reuse `name` to hold the selector
+            body,
+            cf: Vec::new(),
+            toks: Vec::new(),
+            locals: Vec::new(),
+        });
+        self.method_class = Some(class);
+        Ok(())
+    }
+
+    /// `;m` — finish the method body, install its xt in the class's method map.
+    fn oop_end_method(&mut self) -> Result<()> {
+        let selector = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("`;m` without `:m`"))?
+            .name
+            .clone();
+        let xt = self.commit_body()?;
+        self.method_class = None;
+        self.pending_class
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("`;m` outside a class"))?
+            .methods
+            .insert(selector, xt);
+        Ok(())
+    }
+
+    /// `recv -> SELECTOR` — compile or execute a method send. The receiver is
+    /// already emitted/pushed; `super`/named-object receivers early-bind.
+    fn oop_send(&mut self, selector: &str) -> Result<()> {
+        let compiling = self.pending.is_some();
+        // Resolve an early-bound method xt when the receiver's class is static.
+        let early_xt = if self.super_pending {
+            // The current method belongs to the class being built (pending_class),
+            // which is not yet in `classes`; take its parent from there.
+            let parent = self.pending_class.as_ref().and_then(|c| c.super_name.clone());
+            parent
+                .and_then(|p| self.classes.get(&p).cloned())
+                .and_then(|p| p.methods.get(selector).copied())
+        } else if let Some(cls) = self.last_receiver_class.clone() {
+            self.classes.get(&cls).and_then(|c| c.methods.get(selector).copied())
+        } else {
+            None
+        };
+        self.super_pending = false;
+        self.last_receiver_class = None;
+        if compiling {
+            match early_xt {
+                Some(xt) => {
+                    let send = self.send_xt_xt;
+                    let d = self.pending.as_mut().unwrap();
+                    d.toks.push(Tok::Lit(xt as i64));
+                    d.toks.push(Tok::Call(send));
+                }
+                None => {
+                    let id = self.selector_id(selector) as i64;
+                    let send = self.send_xt;
+                    let d = self.pending.as_mut().unwrap();
+                    d.toks.push(Tok::Lit(id));
+                    d.toks.push(Tok::Call(send));
+                }
+            }
+        } else {
+            match early_xt {
+                Some(xt) => {
+                    self.push(xt as i64);
+                    self.call("send_xt_word")?;
+                }
+                None => {
+                    let id = self.selector_id(selector);
+                    self.push(id as i64);
+                    self.call("send_word")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ── OOP introspection ───────────────────────────────────────────────────
+    fn oop_object_q(&mut self) {
+        let obj = self.pop_data().unwrap_or(0) as u64;
+        let cls = self.read_u64(obj);
+        let is = self.classes.values().any(|c| c.struct_addr != 0 && c.struct_addr == cls);
+        self.push(if is { -1 } else { 0 });
+    }
+    fn oop_class_q(&mut self) {
+        let x = self.pop_data().unwrap_or(0) as u64;
+        let is = x != 0 && self.classes.values().any(|c| c.struct_addr == x);
+        self.push(if is { -1 } else { 0 });
+    }
+    fn oop_is_a_q(&mut self) {
+        let cls = self.pop_data().unwrap_or(0) as u64; // class struct addr
+        let obj = self.pop_data().unwrap_or(0) as u64;
+        let mut c = self.read_u64(obj); // obj's class
+        let mut found = false;
+        while c != 0 {
+            if c == cls {
+                found = true;
+                break;
+            }
+            c = self.read_u64(c); // super at [c+0]
+        }
+        self.push(if found { -1 } else { 0 });
+    }
+    fn oop_dot_class(&mut self) {
+        let obj = self.pop_data().unwrap_or(0) as u64;
+        let cls = self.read_u64(obj);
+        if let Some(name) = self.classes.iter().find(|(_, c)| c.struct_addr == cls).map(|(n, _)| n.clone()) {
+            crate::runtime::capture_str(&name); // no trailing space; REPL adds ` ok`
+        }
+    }
+    fn oop_defined_q(&mut self, name: &str) -> Result<()> {
+        let found = self.find(name)?.is_some()
+            || self.classes.contains_key(name)
+            || self.objects.contains_key(name);
+        self.push(if found { -1 } else { 0 });
         Ok(())
     }
 
@@ -791,6 +1225,14 @@ impl Mf66Session {
         self.write_user(USER_DSP_SAVE, self.dstack_top);
         self.write_user(USER_RSP_CURRENT, self.rstack_top);
         self.write_user(UVAR_BASE, 10);
+        // OOP: keep the root class + stable selector ids; drop user classes/objects.
+        self.classes.retain(|k, _| k == "object");
+        self.objects.clear();
+        self.pending_class = None;
+        self.method_class = None;
+        self.super_pending = false;
+        self.last_receiver_class = None;
+        self.write_user(USER_SELF, 0);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────
@@ -803,6 +1245,10 @@ impl Mf66Session {
     /// Write a cell at an absolute address in the (RW) dict heap.
     fn write_u64(&mut self, addr: u64, v: u64) {
         unsafe { (addr as *mut u64).write_unaligned(v) };
+    }
+    /// Read a cell at an absolute address.
+    fn read_u64(&self, addr: u64) -> u64 {
+        unsafe { (addr as *const u64).read_unaligned() }
     }
     /// Write a byte at an absolute address in the (RW) dict heap.
     fn write_u8(&mut self, addr: u64, v: u8) {

@@ -1,0 +1,67 @@
+; MF66 kernel — OOP dispatch primitives (AArch64 port of WF66's kernel/oop.masm).
+;
+; Object layout:  [obj+0] = class struct addr,  [obj+8] = ivar0, [obj+16] = ivar1, …
+; Class layout:   [class+0]=super, [class+8]=reserved, [class+16] = vtable[],
+;                 selector id k -> method xt at [class+16 + k*8].
+;
+; `self` is the current receiver, held in user_SELF. `(send)`/`(send-xt)` set it
+; around the method call and restore it afterwards (the bracket lives in the SEND
+; frame, parked on RP, so nested sends and EXIT are safe). RP=x28, x30=LR.
+
+; self ( -- obj )   push the current receiver (0 outside a method)
+proc(self_word)
+    str     x0, [DSP, #-cell]           ; spill old TOS into the NOS slot
+    ldr     x0, [UP, #user_SELF]
+    stk(0, 1)
+    next()
+endp()
+
+; (send) ( i*x obj sel -- j*x )   late-bound dispatch via the class vtable
+;
+; The self bracket and (send)'s own return address are BOTH parked on RP (never
+; sp), so a THROW inside the method — which resets RP := HANDLER wholesale — does
+; not leak the C stack and corrupt forth_main's epilogue.
+proc(send_word)
+    lsl     x14, x0, #3                 ; x14 = sel*8   (x0 = sel = TOS)
+    ldr     x11, [DSP]                  ; x11 = obj (NOS)
+    ldr     x12, [x11]                  ; x12 = class = [obj]
+    add     x13, x12, #16               ; vtable base
+    add     x13, x13, x14
+    ldr     x9, [x13]                   ; x9 = method xt = [vtable + sel*8]
+    ldr     x0, [DSP, #cell]            ; new TOS = cell below obj (drop obj+sel)
+    add     DSP, DSP, #16
+    ldr     x10, [UP, #user_SELF]       ; old self
+    str     x11, [UP, #user_SELF]       ; self := obj
+    str     x30, [RP, #-cell]!          ; save (send)'s return address on RP
+    str     x10, [RP, #-cell]!          ; park old self under it
+    blr     x9                          ; run the method
+    ldr     x10, [RP], #cell            ; restore old self
+    str     x10, [UP, #user_SELF]
+    ldr     x30, [RP], #cell            ; restore (send)'s return address
+    ret
+endp()
+
+; (send-xt) ( i*x obj xt -- j*x )   early-bound dispatch (xt already resolved)
+proc(send_xt_word)
+    mov     x9, x0                      ; x9 = method xt (TOS)
+    ldr     x11, [DSP]                  ; x11 = obj (NOS)
+    ldr     x0, [DSP, #cell]            ; new TOS = cell below obj (drop obj+xt)
+    add     DSP, DSP, #16
+    ldr     x10, [UP, #user_SELF]       ; old self
+    str     x11, [UP, #user_SELF]       ; self := obj
+    str     x30, [RP, #-cell]!          ; save return address on RP
+    str     x10, [RP, #-cell]!          ; park old self
+    blr     x9
+    ldr     x10, [RP], #cell            ; restore old self
+    str     x10, [UP, #user_SELF]
+    ldr     x30, [RP], #cell            ; restore return address
+    ret
+endp()
+
+; (dnu) ( -- )   does-not-understand: THROW -2058
+proc(dnu_word)
+    str     x0, [DSP, #-cell]!          ; push (preserve any TOS)
+    mov     x0, #-2058
+    bl      throw_word
+    next()                              ; unreachable when a handler is active
+endp()
