@@ -348,6 +348,21 @@ pub extern "C" fn rt_allocate(u: u64, addr_out: *mut u64) -> u64 {
     }
 }
 
+/// ud/mod ( lo hi u -- rem qlo qhi ): divide the unsigned double (lo,hi) by u,
+/// giving a single remainder and a *double* quotient. (Double-cell `#` needs the
+/// quotient to stay double; AArch64 has no 128/64 divide, so do it in u128.)
+pub extern "C" fn rt_ud_mod(lo: u64, hi: u64, u: u64, qlo: *mut u64, qhi: *mut u64) -> u64 {
+    let ud = ((hi as u128) << 64) | (lo as u128);
+    let d = u as u128;
+    if d == 0 {
+        unsafe { *qlo = 0; *qhi = 0 };
+        return 0;
+    }
+    let q = ud / d;
+    unsafe { *qlo = q as u64; *qhi = (q >> 64) as u64 };
+    (ud % d) as u64
+}
+
 /// free ( a-addr -- ior )
 pub extern "C" fn rt_free(addr: u64) -> u64 {
     if addr != 0 {
@@ -405,5 +420,6 @@ pub fn externs() -> Vec<(&'static str, *const ())> {
         ("rt_allocate", rt_allocate as *const ()),
         ("rt_free", rt_free as *const ()),
         ("rt_resize", rt_resize as *const ()),
+        ("rt_ud_mod", rt_ud_mod as *const ()),
     ]
 }

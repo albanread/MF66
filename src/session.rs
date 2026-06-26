@@ -268,8 +268,10 @@ impl Mf66Session {
 
     /// Standard library words defined in Forth at boot (the lib/core.f analogue).
     fn bootstrap_lib(&mut self) -> Result<()> {
-        // #s: convert all remaining digits (at least one) for pictured output.
-        self.eval(": #s begin # dup 0= until ;")?;
+        // Pictured numeric output (double-cell, ANS): # converts one digit of the
+        // unsigned double ud; #s converts all remaining (at least one).
+        self.eval(": # base@ ud/mod rot dup 9 > if 7 + then 48 + hold ;")?;
+        self.eval(": #s begin # 2dup or 0= until ;")?;
         // FP address arithmetic (a float is one cell on this target).
         self.eval(": float+ cell+ ;")?;
         self.eval(": floats cells ;")?;

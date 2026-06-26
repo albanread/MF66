@@ -268,7 +268,7 @@ pub const PRIMITIVES: &[(&str, &str, bool)] = &[
     // Pictured numeric output (MF66 numout.masm)
     ("<#", "pic_start", false),
     ("hold", "hold_word", false),
-    ("#", "pic_digit", false),
+    ("ud/mod", "ud_slash_mod", false),
     ("#>", "pic_end", false),
     ("sign", "sign_word", false),
 ];

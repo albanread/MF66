@@ -19,31 +19,32 @@ proc(hold_word)
     next()
 endp()
 
-; # ( u -- u' )   convert one digit (u mod base) and prepend it
-proc(pic_digit)
-    ldr     x10, [UP, #user_BASE]
-    udiv    x9, x0, x10                 ; x9 = u / base
-    msub    x11, x9, x10, x0            ; x11 = u mod base
-    add     x12, x11, #0x30             ; '0' + rem
-    add     x13, x11, #0x57             ; 'a' - 10 + rem
-    cmp     x11, #10
-    csel    x12, x12, x13, lo           ; rem < 10 ? digit : letter
-    ldr     x14, [UP, #user_HOLD]
-    sub     x14, x14, #1
-    strb    w12, [x14]
-    str     x14, [UP, #user_HOLD]
-    mov     x0, x9                      ; u' = u / base
-    next()
+; ud/mod ( lo hi u -- rem qlo qhi )   unsigned double / single → rem + double quot
+proc(ud_slash_mod)
+    mov     x2, x0                      ; u
+    ldr     x1, [DSP]                   ; hi
+    ldr     x0, [DSP, #cell]            ; lo
+    add     x3, UP, #user_PAD           ; &qlo
+    add     x4, UP, #user_PAD
+    add     x4, x4, #cell               ; &qhi = PAD + 8
+    aapcs_call(rt_ud_mod)               ; x0 = rem
+    ldr     x9, [UP, #user_PAD]         ; qlo
+    add     x10, UP, #user_PAD
+    ldr     x10, [x10, #cell]           ; qhi
+    str     x0, [DSP, #cell]            ; NNOS ← rem
+    str     x9, [DSP]                   ; NOS  ← qlo
+    mov     x0, x10                     ; TOS  ← qhi
+    next()                              ; balanced (3 in, 3 out)
 endp()
 
-; #> ( u -- c-addr len )   end conversion, yield the string
+; #> ( ud -- c-addr len )   end conversion, drop the double, yield the string
 proc(pic_end)
     ldr     x9, [UP, #user_HOLD]        ; c-addr
     ldr     x10, [UP, #user_HOLD_END]
     sub     x10, x10, x9                ; len
-    str     x9, [DSP, #-cell]!          ; push c-addr (becomes NOS); drops u
+    str     x9, [DSP]                   ; NOS ← c-addr (drops the ud's high cell)
     mov     x0, x10                     ; TOS = len
-    next()
+    next()                              ; balanced (2 in, 2 out)
 endp()
 
 ; sign ( n -- )   if n<0, prepend '-'
