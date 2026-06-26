@@ -65,6 +65,71 @@ pub fn emit_lit(n: i64, out: &mut Vec<u32>) {
     load_imm64(TOS, n as u64, out); // movz/movk x0, n
 }
 
+// ── Control-flow encoders (branch offsets are in WORDS, relative to self) ──
+
+/// `mov Xd, Xm`  (= orr Xd, XZR, Xm).
+pub fn mov_reg(rd: u32, rm: u32) -> u32 {
+    0xAA00_03E0 | ((rm & 0x1F) << 16) | (rd & 0x1F)
+}
+/// `ldr Xt, [Xn]`  (unsigned offset 0).
+pub fn ldr0(rt: u32, rn: u32) -> u32 {
+    0xF940_0000 | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+/// `add Xd, Xn, #imm12`.
+pub fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
+    0x9100_0000 | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `cbz Xt, off`  — branch if Xt == 0; `off` is a signed instruction count.
+pub fn cbz(rt: u32, off: i32) -> u32 {
+    0xB400_0000 | (((off as u32) & 0x7FFFF) << 5) | (rt & 0x1F)
+}
+/// `b off`  — unconditional branch; `off` is a signed instruction count.
+pub fn b(off: i32) -> u32 {
+    0x1400_0000 | ((off as u32) & 0x03FF_FFFF)
+}
+
+const SCRATCH: u32 = 9; // x9
+
+/// Compile a Forth `IF`/`UNTIL`/`WHILE` flag test: consume TOS (raise NOS),
+/// remembering the flag, then a `cbz` placeholder (offset 0) on the flag.
+/// Returns the index (in `out`) of the `cbz` word, to be patched later.
+pub fn emit_flag_test_cbz(out: &mut Vec<u32>) -> usize {
+    out.push(mov_reg(SCRATCH, TOS)); // x9 = flag (TOS)
+    out.push(ldr0(TOS, DSP)); // TOS = NOS
+    out.push(add_imm(DSP, DSP, CELL as u32)); // drop the flag
+    let idx = out.len();
+    out.push(cbz(SCRATCH, 0)); // placeholder; patch target later
+    idx
+}
+/// Patch a previously-emitted `cbz` (at `at`) to branch to `target` (word index).
+pub fn patch_cbz(out: &mut [u32], at: usize, target: usize) {
+    out[at] = cbz(SCRATCH, target as i32 - at as i32);
+}
+/// Patch a previously-emitted `b` (at `at`) to branch to `target` (word index).
+pub fn patch_b(out: &mut [u32], at: usize, target: usize) {
+    out[at] = b(target as i32 - at as i32);
+}
+
+#[cfg(test)]
+mod cf_tests {
+    use super::*;
+    fn asm(text: &str) -> Vec<u32> {
+        let m = wfasm::a64::assemble(text).unwrap_or_else(|e| panic!("assemble {text:?}: {e}"));
+        m.code.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+    #[test]
+    fn cf_encoders_match_assembler() {
+        assert_eq!(vec![mov_reg(9, 0)], asm("mov x9, x0"));
+        assert_eq!(vec![ldr0(0, 19)], asm("ldr x0, [x19]"));
+        assert_eq!(vec![add_imm(19, 19, 8)], asm("add x19, x19, #8"));
+        // cbz/b with a +2-word forward offset (label two instructions ahead)
+        assert_eq!(asm("cbz x9, .L\nnop\n.L:")[0], cbz(9, 2));
+        assert_eq!(asm("b .L\nnop\n.L:")[0], b(2));
+        // backward (negative) offset
+        assert_eq!(asm(".L:\nnop\nb .L")[1], b(-1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

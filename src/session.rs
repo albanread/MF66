@@ -71,10 +71,19 @@ pub struct Mf66Session {
     pending: Option<ColonDef>,
 }
 
-/// In-progress colon definition: the word name + the accumulated body words.
+/// In-progress colon definition: the word name, the accumulated body words, and
+/// the compile-time control-flow stack of pending branch patches / loop targets.
 struct ColonDef {
     name: String,
     body: Vec<u32>,
+    cf: Vec<Cf>,
+}
+
+/// A pending control-flow mark (compile time).
+enum Cf {
+    FwdCbz(usize), // a forward `cbz` to patch (if / while)
+    FwdB(usize),   // a forward `b` to patch (else)
+    Begin(usize),  // a backward target word index (begin)
 }
 
 impl Mf66Session {
@@ -254,7 +263,7 @@ impl Mf66Session {
                     .ok_or_else(|| anyhow::anyhow!("`:` needs a name"))?;
                 let mut body = Vec::new();
                 crate::aenc::emit_nest(&mut body);
-                self.pending = Some(ColonDef { name: name.to_string(), body });
+                self.pending = Some(ColonDef { name: name.to_string(), body, cf: Vec::new() });
             } else {
                 self.interpret_token(tok)?;
             }
@@ -301,9 +310,12 @@ impl Mf66Session {
         }
     }
 
-    /// Compile one token into the pending colon body: a call if it's a word,
-    /// else a literal if it's a number.
+    /// Compile one token into the pending colon body: a control-flow directive,
+    /// else a call if it's a word, else a literal if it's a number.
     fn compile_token(&mut self, tok: &str) -> Result<()> {
+        if matches!(tok, "if" | "else" | "then" | "begin" | "until" | "while" | "repeat") {
+            return self.compile_control(tok);
+        }
         let base = self.read_user(UVAR_BASE) as u32;
         match self.xt_of_forth_name(tok)? {
             Some(xt) => {
@@ -320,10 +332,74 @@ impl Mf66Session {
         Ok(())
     }
 
+    /// Compile-time control-flow directives (immediate). All operate on the
+    /// pending definition's body + control-flow stack; branch offsets are
+    /// word-relative. `if`/`while` consume the TOS flag (false → branch).
+    fn compile_control(&mut self, tok: &str) -> Result<()> {
+        use crate::aenc::{b, emit_flag_test_cbz, patch_b, patch_cbz};
+        let def = self.pending.as_mut().expect("control word outside a definition");
+        match tok {
+            "if" => {
+                let i = emit_flag_test_cbz(&mut def.body);
+                def.cf.push(Cf::FwdCbz(i));
+            }
+            "else" => {
+                let bidx = def.body.len();
+                def.body.push(b(0)); // jump over the else-clause (patched at `then`)
+                let here = def.body.len();
+                match def.cf.pop() {
+                    Some(Cf::FwdCbz(i)) => patch_cbz(&mut def.body, i, here),
+                    _ => anyhow::bail!("`else` without `if`"),
+                }
+                def.cf.push(Cf::FwdB(bidx));
+            }
+            "then" => {
+                let here = def.body.len();
+                match def.cf.pop() {
+                    Some(Cf::FwdCbz(i)) => patch_cbz(&mut def.body, i, here),
+                    Some(Cf::FwdB(i)) => patch_b(&mut def.body, i, here),
+                    _ => anyhow::bail!("`then` without `if`/`else`"),
+                }
+            }
+            "begin" => def.cf.push(Cf::Begin(def.body.len())),
+            "until" => {
+                let i = emit_flag_test_cbz(&mut def.body); // false → loop back
+                match def.cf.pop() {
+                    Some(Cf::Begin(t)) => patch_cbz(&mut def.body, i, t),
+                    _ => anyhow::bail!("`until` without `begin`"),
+                }
+            }
+            "while" => {
+                let i = emit_flag_test_cbz(&mut def.body); // false → exit loop
+                def.cf.push(Cf::FwdCbz(i));
+            }
+            "repeat" => {
+                let wcbz = match def.cf.pop() {
+                    Some(Cf::FwdCbz(i)) => i,
+                    _ => anyhow::bail!("`repeat` without `while`"),
+                };
+                let target = match def.cf.pop() {
+                    Some(Cf::Begin(t)) => t,
+                    _ => anyhow::bail!("`repeat` without `begin`"),
+                };
+                let bidx = def.body.len();
+                def.body.push(b(0));
+                patch_b(&mut def.body, bidx, target); // branch back to begin
+                let here = def.body.len();
+                patch_cbz(&mut def.body, wcbz, here); // while's exit → after repeat
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
     /// Finish the pending colon definition: emit unnest+ret, commit the body to
     /// the code arena, create the header, and point it at the body (tfa = colon).
     fn finish_colon(&mut self) -> Result<()> {
         let mut def = self.pending.take().expect("finish_colon with no pending def");
+        if !def.cf.is_empty() {
+            anyhow::bail!("unbalanced control flow in `{}`", def.name);
+        }
         crate::aenc::emit_unnest_ret(&mut def.body);
         let xt = self.code.commit(&def.body)?;
         // Header (in the RW dict heap) via (create), then patch xt + type tag.
