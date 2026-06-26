@@ -14,6 +14,10 @@ pub fn movk(rd: u32, imm16: u16, shift: u32) -> u32 {
 pub fn blr(rn: u32) -> u32 {
     0xD63F_0000 | ((rn & 0x1F) << 5)
 }
+/// `br Xn`  (branch to register — tail call; does not touch x30).
+pub fn br_reg(rn: u32) -> u32 {
+    0xD61F_0000 | ((rn & 0x1F) << 5)
+}
 /// `ret` (returns to x30).
 pub fn ret() -> u32 {
     0xD65F_03C0
@@ -58,6 +62,12 @@ pub fn emit_unnest_ret(out: &mut Vec<u32>) {
 pub fn emit_call(xt: u64, out: &mut Vec<u32>) {
     load_imm64(CALL_TMP, xt, out);
     out.push(blr(CALL_TMP));
+}
+/// Compile a tail call to `xt` (veneer; leaves x30 so `xt`'s `ret` returns to the
+/// current word's caller). `movz/movk x16, xt; br x16`.
+pub fn emit_tail_call(xt: u64, out: &mut Vec<u32>) {
+    load_imm64(CALL_TMP, xt, out);
+    out.push(br_reg(CALL_TMP));
 }
 /// Compile a literal push: spill the cached TOS, load `n` as the new TOS.
 pub fn emit_lit(n: i64, out: &mut Vec<u32>) {

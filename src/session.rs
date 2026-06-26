@@ -97,6 +97,9 @@ pub struct Mf66Session {
     objects: HashMap<String, (u64, String)>,
     /// `value` names → the data cell holding the value (for `to`).
     values: HashMap<String, u64>,
+    /// CREATE/DOES> defining words → (build tokens incl. `create`, does-code xt
+    /// or 0). Replayed in Rust at use time. See finish_defining/instantiate.
+    defining_words: HashMap<String, (Vec<String>, u64)>,
     /// Class being built between `class`/`subclass` and `end-class`.
     pending_class: Option<ClassInfo>,
     /// While compiling a `:m` method body: the owning class name (ivar scope).
@@ -144,6 +147,10 @@ struct ColonDef {
     noname: bool,
     /// The code address this body will commit to (for `recurse`).
     self_xt: u64,
+    /// `: name create … [does> …] ;` is a defining word — its body is captured
+    /// raw (here) and replayed at use time rather than compiled.
+    defining: bool,
+    raw: Vec<String>,
 }
 
 /// A pending control-flow mark (compile time).
@@ -216,6 +223,7 @@ impl Mf66Session {
             super_pending: false,
             bracket_interpret: false,
             values: HashMap::new(),
+            defining_words: HashMap::new(),
             last_receiver_class: None,
             dnu_xt: 0,
             send_xt: 0,
@@ -502,6 +510,34 @@ impl Mf66Session {
                 continue;
             }
             let lk = tok.to_ascii_lowercase(); // Forth is case-insensitive
+            // CREATE/DOES> defining words: a `: name create … ;` captures its body
+            // raw (replayed at use time) rather than compiling it.
+            if let Some(def) = self.pending.as_ref() {
+                if def.defining {
+                    if lk == ";" {
+                        self.finish_defining()?;
+                    } else {
+                        self.pending.as_mut().unwrap().raw.push(tok.to_string());
+                    }
+                    continue;
+                }
+                if def.raw.is_empty() && lk == "create" {
+                    let d = self.pending.as_mut().unwrap();
+                    d.defining = true;
+                    d.raw.push("create".to_string());
+                    continue;
+                }
+            }
+            // A registered defining word: define the next name from its template.
+            if self.pending.is_none() {
+                if let Some((build, does_xt)) = self.defining_words.get(&lk).cloned() {
+                    let target = tokens
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("`{tok}` needs a name"))?;
+                    self.instantiate_defining(target, &build, does_xt)?;
+                    continue;
+                }
+            }
             // [if] / [else] / [then] — conditional compilation (token skipping).
             if lk == "[if]" {
                 let flag = self.pop_data().unwrap_or(0);
@@ -814,6 +850,8 @@ impl Mf66Session {
                     locals: Vec::new(),
                     noname: lk == ":noname",
                     self_xt,
+                    defining: false,
+                    raw: Vec::new(),
                 });
             } else if lk == "2constant" {
                 let name = tokens
@@ -1225,6 +1263,84 @@ impl Mf66Session {
         Ok(())
     }
 
+    /// Finish a CREATE/DOES> defining word: split its captured tokens at `does>`,
+    /// compile the behavior to a routine, and register it for use-time replay.
+    fn finish_defining(&mut self) -> Result<()> {
+        let def = self.pending.take().expect("finish_defining: no def");
+        let name = def.name;
+        let raw = def.raw;
+        let does_at = raw.iter().position(|t| t.eq_ignore_ascii_case("does>"));
+        let (build, does_xt) = match does_at {
+            Some(i) => {
+                let build = raw[..i].to_vec();
+                let behavior = raw[i + 1..].to_vec();
+                let xt = self.compile_routine(&behavior)?;
+                (build, xt)
+            }
+            None => (raw, 0u64),
+        };
+        self.defining_words.insert(name, (build, does_xt));
+        Ok(())
+    }
+
+    /// Compile a token list into a standalone routine; return its xt. Used for a
+    /// `does>` behavior, which runs with the instance's body address on the stack.
+    fn compile_routine(&mut self, tokens: &[String]) -> Result<u64> {
+        let mut body = Vec::new();
+        crate::aenc::emit_nest(&mut body);
+        let self_xt = self.code.next_addr();
+        self.pending = Some(ColonDef {
+            name: String::new(),
+            body,
+            cf: Vec::new(),
+            toks: Vec::new(),
+            locals: Vec::new(),
+            noname: false,
+            self_xt,
+            defining: false,
+            raw: Vec::new(),
+        });
+        for t in tokens {
+            self.compile_token(t)?;
+        }
+        self.commit_body()
+    }
+
+    /// Instantiate a CREATE/DOES> defining word: define `target` with a body that
+    /// pushes its data-field address and (if any) runs the does-code, then replay
+    /// the build tokens in Rust to fill the data field. (Interpret-time only.)
+    fn instantiate_defining(
+        &mut self,
+        target: &str,
+        build: &[String],
+        does_xt: u64,
+    ) -> Result<()> {
+        let body_addr = self.read_user(USER_VAR_HERE);
+        let mut wbody = Vec::new();
+        crate::aenc::emit_lit(body_addr as i64, &mut wbody); // push data-field addr
+        if does_xt != 0 {
+            // tail-call the does-code (its ret returns to our caller); no nest, so
+            // a blr+ret here would loop on the clobbered x30.
+            crate::aenc::emit_tail_call(does_xt, &mut wbody);
+        } else {
+            wbody.push(crate::aenc::ret());
+        }
+        let xt = self.code.commit(&wbody)?;
+        self.push_name(target);
+        self.call("create")?;
+        let header = self.read_user(USER_LATEST);
+        self.write_u64(header + DH_XTPTR, xt);
+        self.write_u8(header + DH_TFA, TFA_TCOL);
+        // Replay the build (skip the leading `create`) to fill the data field.
+        let start = usize::from(
+            build.first().map(|t| t.eq_ignore_ascii_case("create")).unwrap_or(false),
+        );
+        for t in build[start..].to_vec() {
+            self.interpret_token(&t)?;
+        }
+        Ok(())
+    }
+
     /// Publish `name` as a leaf word that pushes a double-cell constant `lo hi`.
     fn publish_dconstant(&mut self, name: &str, lo: i64, hi: i64) -> Result<u64> {
         let mut body = Vec::new();
@@ -1342,6 +1458,8 @@ impl Mf66Session {
             locals: Vec::new(),
             noname: false,
             self_xt,
+            defining: false,
+            raw: Vec::new(),
         });
         self.method_class = Some(class);
         Ok(())
@@ -1525,6 +1643,7 @@ impl Mf66Session {
         self.classes.retain(|k, _| k == "object");
         self.objects.clear();
         self.values.clear();
+        self.defining_words.clear();
         self.pending_class = None;
         self.method_class = None;
         self.super_pending = false;
