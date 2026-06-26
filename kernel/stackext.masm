@@ -1,0 +1,79 @@
+; MF66 kernel — extended stack words (rot / -rot / ?dup / depth / pick / roll).
+; Standard ANS words WF66 kept in lib/core.f; MF66 provides them as primitives.
+
+; rot ( a b c -- b c a )
+proc(rot_word)
+    ldr     x9, [DSP, #cell]            ; x9 = a
+    ldr     x10, [DSP]                  ; x10 = b
+    str     x10, [DSP, #cell]           ; [DSP+8] = b
+    str     x0, [DSP]                   ; [DSP]   = c
+    mov     x0, x9                      ; TOS = a
+    next()
+endp()
+
+; -rot ( a b c -- c a b )
+proc(minus_rot_word)
+    ldr     x9, [DSP]                   ; x9 = b
+    ldr     x10, [DSP, #cell]           ; x10 = a
+    str     x10, [DSP]                  ; [DSP]   = a
+    str     x0, [DSP, #cell]            ; [DSP+8] = c
+    mov     x0, x9                      ; TOS = b
+    next()
+endp()
+
+; tuck ( a b -- b a b )   copy TOS under NOS
+proc(tuck_word)
+    ldr     x9, [DSP]                   ; x9 = a
+    str     x0, [DSP]                   ; [DSP] = b
+    str     x9, [DSP, #-cell]!          ; push a beneath: [DSP-8]=a, DSP-=8
+    next()
+endp()
+
+; ?dup ( x -- x x | 0 )   duplicate only if non-zero
+proc(qdup_word)
+    cbz     x0, .zero
+    str     x0, [DSP, #-cell]!          ; dup
+.zero:
+    next()
+endp()
+
+; depth ( -- n )   number of items on the data stack
+proc(depth_word)
+    ldr     x9, [UP, #user_SP0]         ; SP0 = empty DSP (= dstack_top)
+    sub     x9, x9, DSP                 ; bytes between SP0 and the inside DSP
+    asr     x9, x9, #3                  ; /8 → (depth - 1), signed
+    add     x9, x9, #1                  ; → depth (counts the cached TOS)
+    str     x0, [DSP, #-cell]           ; spill old TOS into the NOS slot
+    mov     x0, x9
+    stk(0, 1)                           ; complete the push
+    next()
+endp()
+
+; pick ( xu .. x0 u -- xu .. x0 xu )   copy the u-th item (0 pick = dup)
+proc(pick_word)
+    lsl     x9, x0, #3                  ; u*8
+    ldr     x0, [DSP, x9]               ; TOS = [DSP + u*8]
+    next()
+endp()
+
+; roll ( xu .. x0 u -- xu-1 .. x0 xu )   rotate u+1 items (2 roll = rot)
+proc(roll_word)
+    cbz     x0, .drop_u
+    lsl     x9, x0, #3                  ; u*8
+    ldr     x11, [DSP, x9]              ; x11 = x_u = m[u]
+    mov     x12, x0                     ; i = u
+.loop:
+    sub     x13, x12, #1               ; i-1
+    lsl     x14, x13, #3
+    ldr     x15, [DSP, x14]            ; m[i-1]
+    lsl     x14, x12, #3
+    str     x15, [DSP, x14]            ; m[i] = m[i-1]
+    subs    x12, x12, #1
+    b.ne    .loop
+    mov     x0, x11                    ; TOS = x_u
+    add     DSP, DSP, #cell            ; close the vacated slot
+    next()
+.drop_u:
+    ldr     x0, [DSP], #cell           ; 0 roll → drop u, raise NOS
+    next()
+endp()

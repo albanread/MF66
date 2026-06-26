@@ -218,4 +218,12 @@ pub const PRIMITIVES: &[(&str, &str, bool)] = &[
     ("(send)", "send_word", false),
     ("(send-xt)", "send_xt_word", false),
     ("(dnu)", "dnu_word", false),
+    // Extended stack words (MF66 stackext.masm)
+    ("rot", "rot_word", false),
+    ("-rot", "minus_rot_word", false),
+    ("tuck", "tuck_word", false),
+    ("?dup", "qdup_word", false),
+    ("depth", "depth_word", false),
+    ("pick", "pick_word", false),
+    ("roll", "roll_word", false),
 ];

@@ -24,6 +24,9 @@ pub enum Stk {
     Swap,
     Over,
     Nip,
+    Rot,      // ( a b c -- b c a )
+    MinusRot, // ( a b c -- c a b )
+    Tuck,     // ( a b -- b a b )
 }
 #[derive(Clone, Copy, PartialEq)]
 pub enum Cmp {
@@ -117,6 +120,15 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
                 }
                 _ => out.push(t),
             },
+            // stack-motion cancellation: inverse permutations annihilate
+            Tok::Stk(s) => match (out.last().copied(), s) {
+                (Some(Tok::Stk(Stk::Swap)), Stk::Swap)
+                | (Some(Tok::Stk(Stk::Rot)), Stk::MinusRot)
+                | (Some(Tok::Stk(Stk::MinusRot)), Stk::Rot) => {
+                    out.pop();
+                }
+                _ => out.push(t),
+            },
             _ => out.push(t),
         }
     }
@@ -176,6 +188,17 @@ impl<'a> Low<'a> {
             self.below.insert(0, r);
         }
         self.below[0]
+    }
+
+    /// Ensure the window holds at least `n` cells below TOS, pulling the deepest
+    /// from memory as needed (each appended at the bottom of the window).
+    fn ensure_below(&mut self, n: usize) {
+        while self.below.len() < n {
+            let r = self.alloc();
+            self.out.push(ldr_off(r, DSP, (self.consumed * 8) as u32));
+            self.consumed += 1;
+            self.below.push(r);
+        }
     }
 
     /// Push the current TOS down into the window (caller then sets the new TOS).
@@ -295,6 +318,36 @@ impl<'a> Low<'a> {
                 } else {
                     self.below.remove(0);
                 }
+            }
+            Stk::Rot => {
+                // ( a b c -- b c a ): TOS=c below=[b,a]  →  TOS=a below=[c,b]
+                self.settle_if_tight(3);
+                self.ensure_below(2);
+                let a = self.below[1];
+                let rc = self.scratch();
+                self.out.push(mov_reg(rc, TOS)); // rc = c
+                self.out.push(mov_reg(TOS, a)); // TOS = a
+                self.below[1] = self.below[0]; // below[1] = b
+                self.below[0] = rc; // below[0] = c
+            }
+            Stk::MinusRot => {
+                // ( a b c -- c a b ): TOS=c below=[b,a]  →  TOS=b below=[a,c]
+                self.settle_if_tight(3);
+                self.ensure_below(2);
+                let b = self.below[0];
+                let rc = self.scratch();
+                self.out.push(mov_reg(rc, TOS)); // rc = c
+                self.out.push(mov_reg(TOS, b)); // TOS = b
+                self.below[0] = self.below[1]; // below[0] = a
+                self.below[1] = rc; // below[1] = c
+            }
+            Stk::Tuck => {
+                // ( a b -- b a b ): TOS=b below=[a]  →  TOS=b below=[a, b']
+                self.settle_if_tight(2);
+                self.ensure_below(1);
+                let rc = self.scratch();
+                self.out.push(mov_reg(rc, TOS)); // rc = copy of b
+                self.below.insert(1, rc);
             }
         }
     }
