@@ -261,6 +261,32 @@ impl Mf66Session {
         // Misc Core-ext composed from existing primitives.
         self.eval(": ?: rot if drop else nip then ;")?; // ( f a b -- a|b )
         self.eval(": ?negate 0< if negate then ;")?; // ( n1 n2 -- n1|-n1 )
+        self.eval(": under+ rot + swap ;")?; // ( a b c -- a+c b )
+        self.eval(": d>s drop ;")?; // ( d -- n )
+        // FP comparisons + helpers (compose from kernel f< / f- / f0= / f** / …)
+        self.eval(": f= f- f0= ;")?;
+        self.eval(": f> fswap f< ;")?;
+        self.eval(": f<= fswap f< 0= ;")?;
+        self.eval(": f>= f< 0= ;")?;
+        self.eval(": f2* 2e f* ;")?;
+        self.eval(": f2/ 2e f/ ;")?;
+        self.eval(": fmax fover fover f< if fswap then fdrop ;")?;
+        self.eval(": fmin fover fover f< 0= if fswap then fdrop ;")?;
+        self.eval(": falog 10e fswap f** ;")?;
+        // Double-cell comparisons (compose from kernel d< / d> / d0= / d0<)
+        self.eval(": d<= d> 0= ;")?;
+        self.eval(": d>= d< 0= ;")?;
+        self.eval(": d0<> d0= 0= ;")?;
+        self.eval(": d0>= d0< 0= ;")?;
+        self.eval(": d0<= 2dup d0= -rot d0< or ;")?;
+        self.eval(": d0> d0<= 0= ;")?;
+        self.eval(": dmax 2over 2over d< if 2swap then 2drop ;")?;
+        self.eval(": dmin 2over 2over d< 0= if 2swap then 2drop ;")?;
+        // String helpers (compose from /string / compare / search)
+        self.eval(": -trailing begin dup if 2dup + 1- c@ 32 = else 0 then while 1- repeat ;")?;
+        self.eval(": -leading begin dup if over c@ 32 = else 0 then while 1 /string repeat ;")?;
+        self.eval(": starts-with? rot over < if 2drop drop 0 else tuck compare 0= then ;")?;
+        self.eval(": contains? search nip nip ;")?;
         Ok(())
     }
 
