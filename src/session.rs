@@ -299,6 +299,16 @@ impl Mf66Session {
         self.eval(": starts-with? rot over < if 2drop drop 0 else tuck compare 0= then ;")?;
         self.eval(": contains? search nip nip ;")?;
         self.eval(": blank 32 fill ;")?; // ( c-addr u -- ) fill with spaces
+        // Defining words, now built the real Forth way on CREATE/DOES>.
+        self.eval(": constant create , does> @ ;")?;
+        self.eval(": variable create 0 , ;")?; // pushes the cell address
+        self.eval(": 2variable create 0 , 0 , ;")?;
+        // Structures (CREATE/DOES> all the way down).
+        self.eval(": field: aligned create dup , cell + does> @ + ;")?;
+        self.eval(": cfield: create dup , 1 + does> @ + ;")?;
+        self.eval(": 2field: aligned create dup , 16 + does> @ + ;")?;
+        self.eval(": begin-structure create here 0 , 0 does> @ ;")?;
+        self.eval(": end-structure swap ! ;")?;
         Ok(())
     }
 
@@ -510,9 +520,12 @@ impl Mf66Session {
                 continue;
             }
             let lk = tok.to_ascii_lowercase(); // Forth is case-insensitive
-            // CREATE/DOES> defining words: a `: name create … ;` captures its body
-            // raw (replayed at use time) rather than compiling it.
-            if let Some(def) = self.pending.as_ref() {
+            // CREATE/DOES> defining words: a named `: name … create … [does> …] ;`
+            // captures its body raw (replayed at use time) rather than compiling it.
+            // Named-only (not :noname / :m), and `create` may appear anywhere.
+            if self.pending.is_some() {
+                let def = self.pending.as_ref().unwrap();
+                let named = !def.noname && self.method_class.is_none();
                 if def.defining {
                     if lk == ";" {
                         self.finish_defining()?;
@@ -521,11 +534,15 @@ impl Mf66Session {
                     }
                     continue;
                 }
-                if def.raw.is_empty() && lk == "create" {
-                    let d = self.pending.as_mut().unwrap();
-                    d.defining = true;
-                    d.raw.push("create".to_string());
-                    continue;
+                if named {
+                    if lk == "create" {
+                        let d = self.pending.as_mut().unwrap();
+                        d.defining = true;
+                        d.raw.push("create".to_string());
+                        continue;
+                    }
+                    // record raw for potential later detection, then compile normally
+                    self.pending.as_mut().unwrap().raw.push(tok.to_string());
                 }
             }
             // A registered defining word: define the next name from its template.
@@ -796,20 +813,6 @@ impl Mf66Session {
             } else if lk == "bye" {
                 self.bye = true;
                 break;
-            } else if lk == "constant" {
-                let name = tokens
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("`constant` needs a name"))?;
-                let v = self
-                    .pop_data()
-                    .ok_or_else(|| anyhow::anyhow!("`constant` needs a value"))?;
-                self.publish_constant(name, v)?;
-            } else if lk == "variable" {
-                let name = tokens
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("`variable` needs a name"))?;
-                let addr = self.allot_cell();
-                self.publish_constant(name, addr as i64)?;
             } else if lk == "value" {
                 let name = tokens
                     .next()
@@ -1315,28 +1318,29 @@ impl Mf66Session {
         build: &[String],
         does_xt: u64,
     ) -> Result<()> {
-        let body_addr = self.read_user(USER_VAR_HERE);
-        let mut wbody = Vec::new();
-        crate::aenc::emit_lit(body_addr as i64, &mut wbody); // push data-field addr
-        if does_xt != 0 {
-            // tail-call the does-code (its ret returns to our caller); no nest, so
-            // a blr+ret here would loop on the clobbered x30.
-            crate::aenc::emit_tail_call(does_xt, &mut wbody);
-        } else {
-            wbody.push(crate::aenc::ret());
-        }
-        let xt = self.code.commit(&wbody)?;
-        self.push_name(target);
-        self.call("create")?;
-        let header = self.read_user(USER_LATEST);
-        self.write_u64(header + DH_XTPTR, xt);
-        self.write_u8(header + DH_TFA, TFA_TCOL);
-        // Replay the build (skip the leading `create`) to fill the data field.
-        let start = usize::from(
-            build.first().map(|t| t.eq_ignore_ascii_case("create")).unwrap_or(false),
-        );
-        for t in build[start..].to_vec() {
-            self.interpret_token(&t)?;
+        // Replay the build tokens; when we reach `create`, define `target` with a
+        // body that pushes its data-field address and tail-calls the does-code.
+        for t in build.to_vec() {
+            if t.eq_ignore_ascii_case("create") {
+                let body_addr = self.read_user(USER_VAR_HERE);
+                let mut wbody = Vec::new();
+                crate::aenc::emit_lit(body_addr as i64, &mut wbody);
+                if does_xt != 0 {
+                    // tail-call: the does-code's ret returns to our caller (no nest
+                    // here, so a blr+ret would loop on the clobbered x30).
+                    crate::aenc::emit_tail_call(does_xt, &mut wbody);
+                } else {
+                    wbody.push(crate::aenc::ret());
+                }
+                let xt = self.code.commit(&wbody)?;
+                self.push_name(target);
+                self.call("create")?;
+                let header = self.read_user(USER_LATEST);
+                self.write_u64(header + DH_XTPTR, xt);
+                self.write_u8(header + DH_TFA, TFA_TCOL);
+            } else {
+                self.interpret_token(&t)?;
+            }
         }
         Ok(())
     }
@@ -1642,8 +1646,9 @@ impl Mf66Session {
         // OOP: keep the root class + stable selector ids; drop user classes/objects.
         self.classes.retain(|k, _| k == "object");
         self.objects.clear();
-        self.values.clear();
-        self.defining_words.clear();
+        // Keep `values` and `defining_words`: the bootstrap defining words
+        // (constant/variable/field:/…) must survive reset like the root class.
+        // (User-defined ones leak harmlessly — they are unreferenced after reset.)
         self.pending_class = None;
         self.method_class = None;
         self.super_pending = false;
