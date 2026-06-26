@@ -206,6 +206,16 @@ impl Mf66Session {
         ((self.dstack_top - self.current_dsp) / CELL as u64) as usize
     }
 
+    /// Pop and return the top data-stack cell (None if empty).
+    fn pop_data(&mut self) -> Option<i64> {
+        if self.depth() == 0 {
+            return None;
+        }
+        let v = unsafe { (self.current_dsp as *const u64).read() as i64 };
+        self.current_dsp += CELL as u64;
+        Some(v)
+    }
+
     /// Resolve a primitive's asm symbol to its execution token (code address).
     /// Used by the corpus harness for NYIMP detection.
     pub fn xt_of(&mut self, asm_sym: &str) -> Result<u64> {
@@ -246,6 +256,30 @@ impl Mf66Session {
     pub fn create_word(&mut self, name: &str) -> Result<()> {
         self.push_name(name);
         self.call("create")
+    }
+
+    /// Publish `name` as a leaf word that pushes the constant `value` at runtime
+    /// (body = spill TOS, load value, ret). The foundation for `constant`,
+    /// `variable`, and the OOP `class NAME` / `new OBJ` defining words.
+    pub fn publish_constant(&mut self, name: &str, value: i64) -> Result<u64> {
+        let mut body = Vec::new();
+        crate::aenc::emit_lit(value, &mut body); // push old TOS, TOS = value
+        body.push(crate::aenc::ret());
+        let xt = self.code.commit(&body)?;
+        self.push_name(name);
+        self.call("create")?;
+        let header = self.read_user(USER_LATEST);
+        self.write_u64(header + DH_XTPTR, xt);
+        self.write_u8(header + DH_TFA, TFA_TCOL);
+        Ok(xt)
+    }
+
+    /// Allot a zeroed cell in data space and return its address.
+    fn allot_cell(&mut self) -> u64 {
+        let addr = self.read_user(USER_VAR_HERE);
+        self.write_u64(addr, 0);
+        self.write_user(USER_VAR_HERE, addr + CELL as u64);
+        addr
     }
 
     /// Look up `name` via the kernel `find-name`. Returns the name-token address
@@ -345,6 +379,20 @@ impl Mf66Session {
             } else if lk == "bye" {
                 self.bye = true;
                 break;
+            } else if lk == "constant" {
+                let name = tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("`constant` needs a name"))?;
+                let v = self
+                    .pop_data()
+                    .ok_or_else(|| anyhow::anyhow!("`constant` needs a value"))?;
+                self.publish_constant(name, v)?;
+            } else if lk == "variable" {
+                let name = tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("`variable` needs a name"))?;
+                let addr = self.allot_cell();
+                self.publish_constant(name, addr as i64)?;
             } else if lk == ":" {
                 let name = tokens
                     .next()
