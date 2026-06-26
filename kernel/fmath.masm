@@ -1,0 +1,100 @@
+; MF66 kernel — transcendental floating-point words (AArch64 port of WF66's
+; kernel/fmath.masm). Each calls a host libm wrapper via aapcs_call: the FP
+; argument(s) go in d0 (and d1), the result comes back in d0. FTOS=d8 is callee-
+; saved so it survives the call; the data TOS (x0) is caller-saved, so it is
+; spilled/restored around the call. (Written out per-word: JASM macros don't
+; substitute a parameter into a nested macro call like aapcs_call.)
+
+; ── one-argument: ( F: r -- f(r) ) ──────────────────────────────────────────
+proc(fsin_word)
+    str     x0, [DSP, #-cell]!
+    fmov    d0, FTOS
+    aapcs_call(rt_fsin)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()
+proc(fcos_word)
+    str     x0, [DSP, #-cell]!
+    fmov    d0, FTOS
+    aapcs_call(rt_fcos)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()
+proc(ftan_word)
+    str     x0, [DSP, #-cell]!
+    fmov    d0, FTOS
+    aapcs_call(rt_ftan)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()
+proc(fexp_word)
+    str     x0, [DSP, #-cell]!
+    fmov    d0, FTOS
+    aapcs_call(rt_fexp)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()
+proc(fln_word)
+    str     x0, [DSP, #-cell]!
+    fmov    d0, FTOS
+    aapcs_call(rt_fln)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()
+proc(flog_word)
+    str     x0, [DSP, #-cell]!
+    fmov    d0, FTOS
+    aapcs_call(rt_flog)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()
+proc(fatan_word)
+    str     x0, [DSP, #-cell]!
+    fmov    d0, FTOS
+    aapcs_call(rt_fatan)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()
+proc(fasin_word)
+    str     x0, [DSP, #-cell]!
+    fmov    d0, FTOS
+    aapcs_call(rt_fasin)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()
+proc(facos_word)
+    str     x0, [DSP, #-cell]!
+    fmov    d0, FTOS
+    aapcs_call(rt_facos)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()
+
+; ── two-argument: ( F: a b -- g(a,b) )  a→d0, b→d1; pop one FP cell ──────────
+proc(f_pow_word)
+    str     x0, [DSP, #-cell]!
+    ldr     d0, [FSP], #cell            ; d0 = a (FNOS), pop FP
+    fmov    d1, FTOS                     ; d1 = b
+    aapcs_call(rt_fpow)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()
+proc(fatan2_word)
+    str     x0, [DSP, #-cell]!
+    ldr     d0, [FSP], #cell
+    fmov    d1, FTOS
+    aapcs_call(rt_fatan2)
+    fmov    FTOS, d0
+    ldr     x0, [DSP], #cell
+    next()
+endp()

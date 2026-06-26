@@ -106,6 +106,89 @@ proc(fdepth)
     next()
 endp()
 
+; f0= ( F: r -- ) ( -- flag )   r == 0.0   (compare vs a zeroed reg: avoids the
+; `#0.0` literal, whose `.0` the front-end mangles as a local-label suffix)
+proc(f_zero_equal)
+    fmov    d9, xzr                     ; d9 = 0.0
+    fcmp    FTOS, d9
+    ldr     FTOS, [FSP], #cell          ; fdrop (flags preserved)
+    csetm   x9, eq
+    str     x0, [DSP, #-cell]           ; push flag
+    mov     x0, x9
+    stk(0, 1)
+    next()
+endp()
+
+; f0< ( F: r -- ) ( -- flag )   r < 0.0
+proc(f_zero_less)
+    fmov    d9, xzr                     ; d9 = 0.0
+    fcmp    FTOS, d9
+    ldr     FTOS, [FSP], #cell          ; fdrop
+    csetm   x9, mi
+    str     x0, [DSP, #-cell]
+    mov     x0, x9
+    stk(0, 1)
+    next()
+endp()
+
+; f< ( F: a b -- ) ( -- flag )   a < b
+proc(f_less)
+    ldr     d9, [FSP]                   ; d9 = FNOS (a)
+    fcmp    d9, FTOS                     ; a vs b
+    ldr     FTOS, [FSP, #cell]           ; new FTOS (below a)
+    add     FSP, FSP, #16                ; pop a and b
+    csetm   x9, mi
+    str     x0, [DSP, #-cell]
+    mov     x0, x9
+    stk(0, 1)
+    next()
+endp()
+
+; d>f ( d -- ) ( F: -- r )   low cell of d → float
+proc(d_to_f)
+    ldr     x9, [DSP]                   ; low cell of d (the integer)
+    scvtf   d0, x9
+    str     FTOS, [FSP, #-cell]!        ; push old FTOS
+    fmov    FTOS, d0
+    ldr     x0, [DSP, #cell]            ; raise (drop both data cells)
+    stk(2, 0)
+    next()
+endp()
+
+; f>d ( F: r -- ) ( -- d )   FTOS → double-cell integer (truncate)
+proc(f_to_d)
+    fcvtzs  x9, FTOS                     ; lo = (i64)r
+    asr     x10, x9, #63                 ; hi = sign extension
+    ldr     FTOS, [FSP], #cell           ; fdrop
+    str     x0, [DSP, #-cell]            ; old TOS → [DSP-8]
+    str     x9, [DSP, #-16]              ; lo → [DSP-16]
+    mov     x0, x10                      ; TOS = hi
+    stk(0, 2)
+    next()
+endp()
+
+; fsqrt / fabs / floor / fround / ftrunc — hardware, no stack effect (F: r -- r')
+proc(fsqrt_word)
+    fsqrt   FTOS, FTOS
+    next()
+endp()
+proc(fabs_word)
+    fabs    FTOS, FTOS
+    next()
+endp()
+proc(floor_word)
+    frintm  FTOS, FTOS                   ; round toward -inf
+    next()
+endp()
+proc(fround_word)
+    frintn  FTOS, FTOS                   ; round to nearest, ties to even
+    next()
+endp()
+proc(ftrunc_word)
+    frintz  FTOS, FTOS                   ; round toward zero
+    next()
+endp()
+
 ; f. ( F: r -- )   print the float top, followed by a space
 proc(f_dot)
     str     x0, [DSP, #-cell]!      ; preserve the data TOS across the host call

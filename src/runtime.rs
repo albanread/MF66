@@ -91,6 +91,21 @@ pub extern "C" fn rt_print_float(x: f64) {
     capture_str(&format!("{x} "));
 }
 
+// Transcendental math for the FP word set (libm via Rust's f64 methods, which
+// lower to the platform math library). One-argument:
+pub extern "C" fn rt_fsin(x: f64) -> f64 { x.sin() }
+pub extern "C" fn rt_fcos(x: f64) -> f64 { x.cos() }
+pub extern "C" fn rt_ftan(x: f64) -> f64 { x.tan() }
+pub extern "C" fn rt_fexp(x: f64) -> f64 { x.exp() }
+pub extern "C" fn rt_fln(x: f64) -> f64 { x.ln() }
+pub extern "C" fn rt_flog(x: f64) -> f64 { x.log10() }
+pub extern "C" fn rt_fatan(x: f64) -> f64 { x.atan() }
+pub extern "C" fn rt_fasin(x: f64) -> f64 { x.asin() }
+pub extern "C" fn rt_facos(x: f64) -> f64 { x.acos() }
+// Two-argument (a in d0, b in d1):
+pub extern "C" fn rt_fpow(a: f64, b: f64) -> f64 { a.powf(b) }
+pub extern "C" fn rt_fatan2(a: f64, b: f64) -> f64 { a.atan2(b) }
+
 /// The built-in runtime externs every session binds before assembling the
 /// kernel. Names must match the `bl`/`aapcs_call` targets in the kernel.
 pub fn externs() -> Vec<(&'static str, *const ())> {
@@ -100,5 +115,16 @@ pub fn externs() -> Vec<(&'static str, *const ())> {
         ("rt_type", rt_type as *const ()),
         ("rt_print_int", rt_print_int as *const ()),
         ("rt_print_float", rt_print_float as *const ()),
+        ("rt_fsin", rt_fsin as *const ()),
+        ("rt_fcos", rt_fcos as *const ()),
+        ("rt_ftan", rt_ftan as *const ()),
+        ("rt_fexp", rt_fexp as *const ()),
+        ("rt_fln", rt_fln as *const ()),
+        ("rt_flog", rt_flog as *const ()),
+        ("rt_fatan", rt_fatan as *const ()),
+        ("rt_fasin", rt_fasin as *const ()),
+        ("rt_facos", rt_facos as *const ()),
+        ("rt_fpow", rt_fpow as *const ()),
+        ("rt_fatan2", rt_fatan2 as *const ()),
     ]
 }

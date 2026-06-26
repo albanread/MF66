@@ -251,6 +251,11 @@ impl Mf66Session {
     fn bootstrap_lib(&mut self) -> Result<()> {
         // #s: convert all remaining digits (at least one) for pictured output.
         self.eval(": #s begin # dup 0= until ;")?;
+        // FP address arithmetic (a float is one cell on this target).
+        self.eval(": float+ cell+ ;")?;
+        self.eval(": floats cells ;")?;
+        self.eval(": faligned aligned ;")?;
+        self.eval(": falign ;")?; // data space is already cell-aligned
         Ok(())
     }
 
