@@ -188,3 +188,122 @@ proc(zero_not_equal)
     next()
 endp()
 
+
+; ── batch 3 (hard arith / double-cell / +! / stragglers) ──
+proc(d_equal)
+    ldr     x9,  [DSP]             ; x9  = d2.low  (NOS)
+    ldr     x10, [DSP, #cell]      ; x10 = d1.high (NNOS)
+    ldr     x11, [DSP, #16]        ; x11 = d1.low  (NNNOS, offset 2*cell = 16)
+    eor     x9,  x9,  x11          ; x9  = d2.low ^ d1.low   (0 iff low halves equal)
+    eor     x10, x10, x0           ; x10 = d1.high ^ d2.high (0 iff high halves equal)
+    orr     x9,  x9,  x10          ; x9  = 0 iff both halves equal
+    cmp     x9,  #0
+    csetm   x0,  eq                ; flag = -1 if d1 == d2, else 0
+    stk(4, 1)                      ; ( d1 d2 -- flag ): pop 4 cells, push 1
+    next()
+endp()
+
+; d>  ( d1 d2 -- flag )    signed double-cell greater-or-equal.
+;     WF66's raw branch pattern (jl over the sub) returns true when d1 is
+;     NOT less than d2, so equal operands also yield -1 (see WF66 comment +
+;     the .t case 10. 0. 10. 0. expect -1). Doubles are (low high) with high
+;     on top, so on entry:
+;         TOS (x0)        = d2.high
+;         [DSP]           = d2.low
+;         [DSP, #cell]    = d1.high
+;         [DSP, #16]      = d1.low   (2*cell; encoder needs a literal)
+;     Compute the 128-bit difference d1 - d2 with subs/sbcs (the AArch64
+;     analogue of WF66's cmp + sbb), which leaves N,Z,C,V set for a full
+;     signed compare; `csetm ge` then fabricates the Forth flag (-1/0).
+proc(d_greater)
+    ldr     x9,  [DSP]              ; x9  = d2.low
+    ldr     x10, [DSP, #cell]       ; x10 = d1.high
+    ldr     x11, [DSP, #16]        ; x11 = d1.low  (offset 2*cell = 16)
+    subs    x12, x11, x9           ; d1.low - d2.low (sets borrow/carry)
+    sbcs    x12, x10, x0           ; d1.high - d2.high - borrow → flags = d1 vs d2
+    csetm   x0, ge                 ; -1 if d1 >= d2 (signed), else 0
+    stk(4, 1)                       ; pop three cells; flag stays cached in TOS
+    next()
+endp()
+
+; d<  ( d1 d2 -- flag )    signed double less-than: flag = -1 iff d1 < d2.
+;     Doubles are pushed lo-then-hi, so hi is nearest TOS. Stack layout:
+;       TOS (x0)      = d2.hi
+;       [DSP]         = d2.lo
+;       [DSP, #cell]  = d1.hi
+;       [DSP, #16]    = d1.lo   (#16 = 2*cell)
+;     WF66 did `cmp d1.lo,d2.lo` then `sbb d1.hi,d2.hi` (the high word of the
+;     128-bit subtract d1-d2) and branched on signed GE. On AArch64 this is a
+;     128-bit subtract: subs on the low words sets the borrow, sbcs on the high
+;     words produces the full-width NZCV; condition `lt` (N!=V) is signed less.
+proc(d_less)
+    ldr     x9,  [DSP, #16]        ; x9  = d1.lo
+    ldr     x10, [DSP]             ; x10 = d2.lo
+    subs    x9,  x9, x10           ; d1.lo - d2.lo  (sets carry = NOT borrow)
+    ldr     x11, [DSP, #cell]      ; x11 = d1.hi
+    sbcs    x9,  x11, x0           ; d1.hi - d2.hi - borrow → flags for d1-d2
+    csetm   x0,  lt                ; TOS = -1 if d1 < d2 (signed), else 0
+    stk(4, 1)                      ; ( d1 d2 -- flag ): pop 3 cells
+    next()
+endp()
+
+proc(d_not_equal)
+    ldr     x9,  [DSP]            ; x9  = d2.lo
+    ldr     x10, [DSP, #16]       ; x10 = d1.lo  (offset 2*cell; encoder needs a literal)
+    eor     x9,  x9,  x10         ; x9  = 0 iff low halves equal
+    ldr     x10, [DSP, #cell]     ; x10 = d1.hi
+    eor     x10, TOS, x10         ; x10 = 0 iff high halves equal (TOS = d2.hi)
+    orr     x9,  x9,  x10         ; x9  = 0 iff both halves equal
+    cmp     x9,  #0
+    csetm   TOS, ne               ; TOS = -1 if either half differs, else 0
+    stk(4, 1)                     ; pop 3 cells: 4 in, 1 flag out (add x19,x19,#3*cell)
+    next()
+endp()
+
+; d0=  ( d -- flag )    true iff both halves of the double are zero.
+proc(d_zero_equal)
+    ldr     x9, [DSP]              ; x9 = low half (NOS); TOS holds the high half
+    orr     TOS, TOS, x9          ; combine halves — zero iff BOTH halves are zero
+    cmp     TOS, #0
+    csetm   TOS, eq               ; Forth flag: -1 if (high|low)==0, else 0
+    stk(2, 1)
+    next()
+endp()
+
+; d0<  ( d -- flag )    true iff signed double is negative.
+proc(d_zero_less)
+    asr     TOS, TOS, #63          ; sign-extend bit 63 of the high cell across all 64 bits → -1/0
+    stk(2, 1)                      ; ( d -- flag ): drop the low cell, leave the flag in TOS
+    next()
+endp()
+
+proc(du_greater)
+    ldr     x9,  [DSP]            ; x9  = d2_lo
+    ldr     x10, [DSP, #cell]     ; x10 = d1_hi
+    ldr     x11, [DSP, #16]       ; x11 = d1_lo  (#16 = 2*cell)
+    subs    xzr, x11, x9          ; d1_lo - d2_lo: set carry (C=1 means no borrow)
+    sbcs    xzr, x10, x0          ; d1_hi - d2_hi - borrow; final C = (d1 u>= d2)
+    csetm   x0,  hs              ; flag = -1 iff carry set (d1 u>= d2), else 0
+    stk(4, 1)                     ; pop 4 cells, push flag -> add x19,x19,#24
+    next()
+endp()
+
+; du<  ( d1 d2 -- flag )   unsigned double less-than.
+;     Stack (cells, top-down): TOS=x0=d2_hi, NOS=[DSP]=d2_lo,
+;     NNOS=[DSP,#cell]=d1_hi, NNNOS=[DSP,#16]=d1_lo.  WF66 did a 128-bit
+;     subtract d1 - d2 via cmp(d1_lo,d2_lo)+sbb(d1_hi,d2_hi) and branched on the
+;     final borrow (CF): jb -> -1, jae -> 0.  On AArch64 we mirror the borrow
+;     chain with subs/sbcs.  AArch64 carry is INVERTED vs x86 for subtraction
+;     (C=1 means NO borrow), so x86 "borrow set" (jb) is condition cc (carry
+;     clear) here -> csetm x0, cc.
+proc(du_less)
+    ldr     x9,  [DSP]              ; x9  = d2_lo (NOS)
+    ldr     x10, [DSP, #cell]       ; x10 = d1_hi (NNOS)
+    ldr     x11, [DSP, #16]         ; x11 = d1_lo (NNNOS; 2*cell, encoder needs a literal)
+    subs    xzr, x11, x9           ; d1_lo - d2_lo : C=1 if no borrow
+    sbcs    xzr, x10, TOS         ; d1_hi - d2_hi - !C : C=1 if no borrow
+    csetm   TOS, cc               ; cc (carry clear) = borrow = d1 u< d2 -> -1, else 0
+    stk(4, 1)
+    next()
+endp()
+

@@ -61,6 +61,20 @@ endp()
 | `mov byte [..], al` | `strb w0, [..]` | |
 | `rep movsb` | post-indexed `ldrb`/`strb` loop | one shared idiom; see strings later |
 
+### Conditional branches → `cset`/`csetm`/`csel` + `cbz`/`cbnz`  (CRITICAL — no `b.<cond>`)
+
+**Never emit `b.<cond>` (e.g. `b.ge`, `b.eq`) inside a `proc`.** The front-end's
+local-label mangler eats the `.cond` suffix as if it were a local label, so
+`b.ge .done` is corrupted to `b<proc>$$ge …` and the a64 encoder rejects it. The
+kernel uses NO `b.<cond>` anywhere. Instead:
+
+- **Branchless select** (preferred): `cmp` then `csel`/`csinc`/`cneg`, or
+  `csetm` for a flag — covers min/max/abs/compares with no branch at all.
+- **Real branch on a condition**: materialize the predicate then branch on zero:
+  `cmp …; cset x14, <cond>; cbz x14, .done` (or `cbnz`). `.done` is an ordinary
+  scope-local label and is fine; only the `.cond` *suffix on `b`* is the trap.
+- Unconditional `b .label` is fine. Loops use `cbz`/`cbnz`/`tbz`/`tbnz` + `b`.
+
 ### Flag / comparison idioms → `cmp` + `cset`/`csetm`  (critical)
 
 WF66 produces Forth flags (`0` / `-1`) with `sub`/`sbb` or `setcc` tricks. On

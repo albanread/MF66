@@ -96,3 +96,407 @@ proc(two_times)
     next()
 endp()
 
+
+; ── batch 3 (hard arith / double-cell / +! / stragglers) ──
+; c+!  ( c addr -- )    add low byte of c into the byte at addr.
+proc(c_plus_store)
+    ldr     x9, [DSP]               ; x9 = NOS = c
+    ldrb    w10, [TOS]              ; w10 = current byte at addr (TOS = addr)
+    add     w10, w10, w9           ; add low byte of c (32-bit add)
+    strb    w10, [TOS]             ; store low byte back to [addr]
+    ldr     TOS, [DSP, #cell]      ; refill TOS from NNOS (the cell below)
+    stk(2, 0)                       ; pop both c and addr
+    next()
+endp()
+
+; d-  ( d1 d2 -- d3 )    signed double subtract.
+;     Doubles are two cells with the high cell on top. With TOS cached in x0:
+;       x0           = d2.hi   (TOS)
+;       [DSP]        = d2.lo
+;       [DSP,#cell]  = d1.hi
+;       [DSP,#16]    = d1.lo   (2*cell; encoder needs a literal offset)
+;     WF66 did sub/sbb (sub [rbp+2*cell],rdx ; sbb rcx,rax). AArch64 has no
+;     memory-operand ALU, so load the three needed cells into scratch and use
+;     subs/sbc: subs computes d1.lo-d2.lo and sets the borrow (C), sbc folds
+;     that borrow into the high subtract d1.hi-d2.hi. d3.lo is written back to
+;     the [DSP,#16] slot, which becomes the new NOS after stk(4,2) pops 2 cells;
+;     d3.hi lands in TOS.
+proc(d_minus)
+    ldr     x9,  [DSP]             ; x9  = d2.lo
+    ldr     x10, [DSP, #cell]      ; x10 = d1.hi
+    ldr     x11, [DSP, #16]       ; x11 = d1.lo   (2*cell)
+    subs    x11, x11, x9          ; d3.lo = d1.lo - d2.lo, set borrow (C)
+    sbc     TOS, x10, TOS         ; d3.hi = d1.hi - d2.hi - borrow
+    str     x11, [DSP, #16]       ; d3.lo -> slot that becomes new NOS
+    stk(4, 2)                     ; pop 2 cells: add x19, x19, #16
+    next()
+endp()
+
+; d+  ( d1 d2 -- d3 )    signed double add.
+; Stack (TOS=x0, DSP points at NOS):
+;   x0          = d2.hi      [DSP,#cell]  = d1.hi
+;   [DSP]       = d2.lo      [DSP,#16]    = d1.lo   (2*cell = 16)
+proc(d_plus)
+    ldr     x9,  [DSP]             ; x9  = d2.lo (NOS)
+    ldr     x10, [DSP, #cell]      ; x10 = d1.hi (NNOS)
+    ldr     x11, [DSP, #16]        ; x11 = d1.lo (offset 2*cell = 16; encoder needs a literal)
+    adds    x11, x11, x9           ; d3.lo = d1.lo + d2.lo, sets carry
+    str     x11, [DSP, #16]        ; store d3.lo (becomes new NOS after stk)
+    adc     TOS, TOS, x10          ; d3.hi = d2.hi + d1.hi + carry -> TOS
+    stk(4, 2)
+    next()
+endp()
+
+; d+!  ( d addr -- )    add double d into the cell pair at addr.
+;     TOS = addr; NOS ([DSP]) = low cell of d; NNOS ([DSP,#cell]) = high cell.
+;     The double at addr keeps its low cell at [addr], high cell at [addr+cell]
+;     (same layout 2!/2@ use), so the add propagates carry low->high. x86 used
+;     add/adc against memory operands; AArch64 has no memory-operand ALU, so
+;     each target cell is load -> add -> store, and the carry is carried in NZCV
+;     by doing the low cell with `adds` (set flags) then the high cell with `adc`.
+proc(d_plus_store)
+    ldr     x9,  [DSP]             ; x9  = d low  cell (NOS)
+    ldr     x10, [DSP, #cell]      ; x10 = d high cell (NNOS)
+    ldr     x11, [TOS]            ; x11 = *(addr)        (current low cell)
+    adds    x11, x11, x9          ; low cell += d_lo, sets carry
+    str     x11, [TOS]            ; *(addr) = result
+    ldr     x11, [TOS, #cell]     ; x11 = *(addr+cell)   (current high cell)
+    adc     x11, x11, x10         ; high cell += d_hi + carry
+    str     x11, [TOS, #cell]     ; *(addr+cell) = result
+    ldr     TOS, [DSP, #16]       ; #16 = 2*cell: raise NNNOS (cell below the 3) into TOS
+    stk(3, 0)                     ; pop d (2 cells) + addr (1 cell)
+    next()
+endp()
+
+; d2/  ( d1 -- d2 )    arithmetic shift-right of a signed double by one.
+;   The double is {high = TOS(x0), low = NOS([DSP])}. WF66 does
+;   `sar rax,1` (LSB of high -> carry, sign replicated) then
+;   `rcr [rbp],1` (carry rotates into low's MSB, low's LSB dropped).
+;   AArch64 has no rotate-through-carry, so capture the bit that
+;   falls out of the high cell and inject it as the low cell's MSB.
+proc(d_two_slash)
+    ldr     x9,  [DSP]              ; x9 = low cell (NOS)
+    and     x10, x0, #1            ; x10 = bit shifted out of high cell (its LSB)
+    asr     x0,  x0,  #1           ; high = high >>arith 1 (sign preserved, stays TOS)
+    lsr     x9,  x9,  #1           ; low  = low  >>logical 1 (old LSB discarded)
+    orr     x9,  x9,  x10, lsl #63 ; insert carry bit as low's new MSB
+    str     x9,  [DSP]             ; write back the low cell
+    stk(2, 2)
+    next()
+endp()
+
+; d2*  ( d1 -- d2 )    shift double left by one.
+; Double layout: TOS=x0=high cell, NOS=[DSP]=low cell (lo pushed first).
+; WF66 did `shl [rbp],1` (lo<<1, bit63 -> CF) then `rcl rax,1`
+; (hi = (hi<<1)|CF). AArch64 has no carry-through rotate of a chosen pair,
+; so reconstruct the 128-bit << 1 explicitly with extr + lsl.
+proc(d_two_times)
+    ldr     x9, [DSP]              ; x9 = lo (NOS, original)
+    extr    TOS, TOS, x9, #63     ; hi' = (hi<<1) | (lo>>63)  (uses ORIG hi,lo)
+    lsl     x9, x9, #1            ; lo' = lo<<1
+    str     x9, [DSP]            ; NOS = lo'
+    stk(2, 2)                    ; balanced ( d1 -- d2 ); emits nothing
+    next()
+endp()
+
+; dabs  ( d1 -- d2 )    absolute value of a signed double.
+;     The double's high cell is cached in TOS (x0); the low cell is NOS at
+;     [DSP]. The sign of the whole double is the sign bit of the high cell.
+;     If that bit is clear (non-negative) leave d1 untouched; otherwise
+;     perform a full 128-bit two's-complement negation:
+;       negs xlow,xlow   -> low = -low, sets carry (AArch64 C = NOT borrow)
+;       ngc  xhigh,xhigh -> high = -high - borrow  (ngc = sbc x,xzr,x)
+;     This is the AArch64 form of the x86 `neg [rbp] / neg rax / sbb rax,0`
+;     borrow-propagating negate.
+;     Sign test: `tbz`/`tbnz` are NOT encodable by the JASM AArch64 backend
+;     (no test-bit-branch arm in the encoder) and `b.<cond>` is corrupted by
+;     the @scope label mangler (see stack.masm). So materialize the
+;     non-negative condition with `cset ..,pl` and skip with `cbnz` — the
+;     same safe idiom used by s_reverse. `cmp` only sets flags, so TOS is
+;     preserved for the negate path.
+proc(dabs)
+    cmp     TOS, #0                ; set N to the sign bit of the high cell
+    cset    x9, pl                 ; x9 = 1 if sign bit clear (d1 >= 0), else 0
+    cbnz    x9, .done              ; non-negative -> leave d1 untouched
+    ldr     x9, [DSP]              ; x9 = low cell (NOS)
+    negs    x9, x9                 ; low = -low, set carry (= NOT borrow)
+    ngc     TOS, TOS               ; high = -high - borrow (two's-complement)
+    str     x9, [DSP]              ; write negated low cell back to NOS
+.done:
+    stk(2, 2)                      ; ( d1 -- d2 ): 2 in, 2 out — balanced, emits nothing
+    next()
+endp()
+
+proc(dnegate)
+    ldr     x9, [DSP]               ; x9 = low cell (NOS)
+    negs    x9, x9                  ; low2 = 0 - low1; clears C (borrow) iff low1 != 0
+    ngc     TOS, TOS                ; high2 = 0 - high1 - !C  (subtract-with-borrow)
+    str     x9, [DSP]               ; write back the negated low cell
+    stk(2, 2)
+    next()
+endp()
+
+; @+!  ( n addr -- old )   fetch cell at addr, add n, return old cell.
+proc(fetch_plus_store)
+    mov     x10, TOS               ; x10 = addr (was TOS)
+    ldr     x9,  [DSP]             ; x9  = n (NOS)
+    ldr     TOS, [x10]             ; TOS = old = [addr]   (return value)
+    add     x11, TOS, x9           ; x11 = old + n
+    str     x11, [x10]             ; [addr] = old + n
+    stk(2, 1)                      ; pop one cell (n addr -> old)
+    next()
+endp()
+
+; fm/mod  ( d n -- rem quot )    floored signed 128÷64.
+;     Symmetric divide then a floor correction when the signs of the
+;     dividend and divisor differ and the remainder is nonzero:
+;         if sign(high) XOR sign(n) is negative AND rem != 0:
+;             rem += n;  quot -= 1
+;     AArch64 has only 64/64 sdiv, so the 64-bit-representable dividend
+;     is taken from the low half [DSP,#cell]; the high half [DSP] is used
+;     solely for the sign test (the faithful analogue of WF66's rdx).
+;     TOS(x0)=n; NOS[DSP]=high; NNOS[DSP,#cell]=low.
+;     NOTE: `b.<cond>` is unusable inside proc's @scope (the local-label
+;     mangler corrupts the `.cond` suffix); materialize conditions with
+;     cset and branch with cbz, as the kernel does elsewhere.
+proc(fm_slash_mod)
+    ldr     x10, [DSP]              ; x10 = high (dividend top, for sign-test)
+    ldr     x9,  [DSP, #cell]       ; x9  = low  (dividend, the 64-bit value)
+    sdiv    x11, x9, TOS            ; x11 = quot = low / n  (symmetric, truncates)
+    msub    x12, x11, TOS, x9       ; x12 = rem  = low - quot*n  (sign of dividend)
+
+    eor     x13, x10, TOS          ; sign bit = sign(high) XOR sign(n)
+    cmp     x13, #0
+    cset    x14, mi                ; x14 = 1 iff signs differ (sign-xor < 0)
+    cmp     x12, #0
+    cset    x15, ne                ; x15 = 1 iff rem != 0
+    and     x14, x14, x15          ; correction needed iff signs differ AND rem!=0
+    cbz     x14, .done             ; no correction -> symmetric is already floored
+    add     x12, x12, TOS          ; rem  += n   (give rem the divisor's sign)
+    sub     x11, x11, #1           ; quot -= 1   (round toward -inf)
+
+.done:
+    str     x12, [DSP, #cell]      ; store rem in the low slot (becomes NOS after pop)
+    mov     TOS, x11               ; TOS = quot
+    stk(3, 2)                       ; pop one cell: new NOS = rem, TOS = quot
+    next()
+endp()
+
+; m*  ( n1 n2 -- d )    signed 64x64 -> 128-bit double.
+;     n2 = TOS (x0), n1 = NOS ([DSP]). Result double d is stored low-then-high:
+;     low cell -> NOS ([DSP]), high cell -> TOS (x0), matching WF66's
+;     `imul [rbp]` (rdx:rax = rax*[rbp]) then NOS=rax(low), TOS=rdx(high).
+proc(m_times)
+    ldr     x9,  [DSP]             ; x9 = NOS (n1)
+    mul     x10, TOS, x9           ; x10 = low 64 bits  = n2 * n1
+    smulh   TOS, TOS, x9           ; TOS = signed high 64 bits of n2 * n1
+    str     x10, [DSP]             ; NOS = low cell
+    stk(2, 2)
+    next()
+endp()
+
+; mod  ( n1 n2 -- rem )   signed remainder (symmetric — sign of dividend)
+;     Asm sym `mod_` — `mod` is a JASM/MASM reserved-keyword family.
+proc(mod_)
+    ldr     x9, [DSP]              ; x9 = NOS = n1 (dividend)
+    sdiv    x10, x9, TOS          ; x10 = n1 / n2 (truncating quotient)
+    msub    TOS, x10, TOS, x9     ; TOS = n1 - (n1/n2)*n2 = rem (sign of n1)
+    stk(2, 1)
+    next()
+endp()
+
+; 1-c!  ( addr -- )    decrement the byte at addr.
+proc(one_minus_c_store)
+    ldrb    w9, [TOS]              ; w9 = byte at addr (addr is TOS=x0); zero-extended
+    sub     w9, w9, #1            ; decrement; low 8 bits wrap (0x00 -> 0xFF)
+    strb    w9, [TOS]             ; write the low byte back to addr
+    ldr     TOS, [DSP]            ; refill TOS from NOS (was: mov rax, [rbp])
+    stk(1, 0)                     ; ( addr -- ): pop addr, add x19, x19, #cell
+    next()
+endp()
+
+; 1-!  ( addr -- )
+;     Decrement the cell at addr in place.
+proc(one_minus_store)
+    ldr     x9, [TOS]              ; x9 = *addr (no memory-operand ALU on AArch64)
+    sub     x9, x9, #1            ; decrement the cell value
+    str     x9, [TOS]             ; write it back to *addr
+    ldr     TOS, [DSP]            ; raise NOS into TOS (addr consumed)
+    stk(1, 0)                     ; pop one cell: add x19,x19,#cell
+    next()
+endp()
+
+; 1+c!  ( addr -- )    increment the byte at addr.
+proc(one_plus_c_store)
+    ldrb    w9, [TOS]              ; w9 = byte at addr (TOS holds addr); zero-extended
+    add     w9, w9, #1            ; increment; low 8 bits wrap (0xff -> 0x00) on strb
+    strb    w9, [TOS]             ; store low byte back to addr
+    ldr     TOS, [DSP]            ; raise NOS into TOS (was: mov rax, [rbp])
+    stk(1, 0)                     ; ( addr -- ): net pop one cell -> add x19, x19, #cell
+    next()
+endp()
+
+; 1+!  ( addr -- )
+;     Increment the 64-bit cell at addr in place, then drop addr.
+proc(one_plus_store)
+    ldr     x9, [TOS]               ; x9 = *addr  (the cell to bump)
+    add     x9, x9, #1              ; x9 = *addr + 1
+    str     x9, [TOS]               ; *addr = *addr + 1  (in place)
+    ldr     TOS, [DSP]              ; refill TOS from NOS (was: mov rax,[rbp])
+    stk(1, 0)                       ; pop one cell net: add x19,x19,#cell
+    next()
+endp()
+
+; +!  ( n1 a1 -- )    add n1 (NOS) into the cell at a1 (TOS)
+proc(plus_store)
+    ldr     x9, [DSP]               ; x9 = n1 (NOS)
+    ldr     x10, [TOS]              ; x10 = current cell value at addr (a1 = TOS)
+    add     x10, x10, x9            ; x10 = *a1 + n1
+    str     x10, [TOS]             ; *a1 = *a1 + n1
+    ldr     TOS, [DSP, #cell]       ; raise NNOS to TOS (reload from below the 2 popped cells)
+    stk(2, 0)                       ; pop n1 and a1 (emits add x19, x19, #16)
+    next()
+endp()
+
+; s>d  ( n -- d )    sign-extend single to double.
+proc(s_to_d)
+    str     TOS, [DSP, #-cell]      ; low cell = original n at the new NOS slot
+    asr     TOS, TOS, #63           ; TOS = high cell = sign extension (0 or -1) ; ~ cqo's rdx
+    stk(1, 2)                       ; net push one cell -> sub x19, x19, #cell
+    next()
+endp()
+
+; /  ( n1 n2 -- quot )    signed divide, quotient only (symmetric, round-toward-zero).
+;     WF66 does `mov rcx,rax` (divisor=TOS=n2), `mov rax,[rbp]` (dividend=NOS=n1),
+;     `cqo; idiv rcx` → rax = n1/n2. AArch64 `sdiv` rounds toward zero, matching
+;     x86 idiv's symmetric semantics, so a single sdiv suffices.
+proc(slash)
+    ldr     x9, [DSP]              ; x9 = NOS (n1, dividend)
+    sdiv    TOS, x9, TOS          ; TOS = n1 / n2  (NOS / TOS), trunc toward 0
+    stk(2, 1)
+    next()
+endp()
+
+; /mod  ( n1 n2 -- rem quot )    signed divide, returns rem AND quot
+;     SYMMETRIC division (round toward zero) — AArch64 sdiv truncates
+;     toward zero, matching x86 idiv. Result layout: TOS = quot,
+;     NOS = rem. Balanced 2->2 (cells written in place).
+proc(slash_mod)
+    ldr     x9,  [DSP]              ; x9 = NOS = dividend n1
+    sdiv    x10, x9, TOS           ; x10 = quot = n1 / n2 (toward zero)
+    msub    x11, x10, TOS, x9      ; x11 = rem = n1 - quot*n2
+    str     x11, [DSP]             ; NOS <- rem
+    mov     TOS, x10               ; TOS <- quot
+    stk(2, 2)                       ; balanced (2 cells in, 2 cells out)
+    next()
+endp()
+
+; sm/rem  ( d n -- rem quot )   symmetric signed double/single divide.
+;     d is a double-cell dividend: low cell at [DSP,#cell], high (sign-
+;     extension) cell at [DSP]; n (divisor) is TOS (x0). x86 used a
+;     128/64 `idiv rcx` (rax=quot, rdx=rem). On AArch64 the dividend the
+;     callers supply fits in 64 bits (high cell is just the sign of low),
+;     so a 64-bit sdiv/msub reproduces the symmetric (truncate-toward-
+;     zero) result the .t cases pin: 100/7 -> rem 2 quot 14; -10/3 ->
+;     rem -1 quot -3 (rem takes the sign of the dividend).
+proc(sm_slash_rem)
+    ldr     x9,  [DSP, #cell]      ; x9  = low(d)  (dividend, the live 64 bits)
+    sdiv    x10, x9, TOS           ; x10 = quot = dividend / n  (trunc toward 0)
+    msub    x11, x10, TOS, x9      ; x11 = rem  = dividend - quot*n  (sign of dividend)
+    str     x11, [DSP, #cell]      ; store rem under the (to-be) quotient
+    mov     TOS, x10               ; TOS = quot
+    stk(3, 2)                      ; pop one cell -> new [DSP]=rem, TOS=quot
+    next()
+endp()
+
+; */  ( n1 n2 n3 -- (n1*n2)/n3 )    multiply-then-divide, single result.
+;     WF66 holds n1*n2 in the full rdx:rax (128 bits) so only the final
+;     quotient must fit in a cell. AArch64 has no 128/64 divide, so we form
+;     the product with `mul` (low 64 — exact whenever n1*n2 fits a signed
+;     cell, which the contract's cases require) and `sdiv` (signed, truncates
+;     toward zero, matching x86 idiv's symmetric rounding).
+proc(times_slash)
+    mov     x9,  TOS                ; x9  = n3 (divisor), free TOS
+    ldr     x10, [DSP]              ; x10 = n2  (NOS)
+    ldr     x11, [DSP, #cell]       ; x11 = n1  (NNOS)
+    mul     x10, x10, x11           ; x10 = n1*n2 (low 64 = full product when it fits)
+    sdiv    TOS, x10, x9            ; TOS = (n1*n2) / n3  (signed, trunc toward 0)
+    stk(3, 1)
+    next()
+endp()
+
+; */mod  ( n1 n2 n3 -- rem (n1*n2)/n3 )   signed scale-then-divide, keep remainder
+proc(times_slash_mod)
+    ldr     x9,  [DSP]              ; x9 = n2  (NOS)
+    ldr     x10, [DSP, #cell]       ; x10 = n1 (NNOS)
+    mul     x9,  x9,  x10           ; x9 = n1*n2 (low 64 of product)
+    sdiv    x10, x9,  TOS           ; x10 = quotient = (n1*n2)/n3
+    msub    x11, x10, TOS, x9       ; x11 = remainder = (n1*n2) - quot*n3
+    str     x11, [DSP, #cell]       ; remainder into the NNOS slot (under quot)
+    mov     TOS, x10               ; TOS = quotient
+    stk(3, 2)                       ; net pop 1 cell -> TOS=quot, NOS=rem
+    next()
+endp()
+
+; u2/  ( n1 -- n2 )
+;     Unsigned shift right by one (logical). Treats input as unsigned.
+proc(u2slash)
+    lsr     x0, x0, #1          ; logical (unsigned) >>1 — x86 `shr rax, 1`
+    stk(1, 1)
+    next()
+endp()
+
+; um/mod  ( ud u -- ur uq )    unsigned 128÷64 → ( rem, quot ).
+;     WF66 used a single x86 `div rcx` on the rdx:rax pair (rdx=high, rax=low):
+;     quotient → rax (becomes TOS), remainder → rdx (stored to the low slot).
+;     AArch64 `udiv` is 64/64 only, so synthesize the full unsigned 128/64
+;     divide with a restoring shift-subtract loop (the faithful equivalent of
+;     `div r64`; like x86 it ignores quotient overflow rather than trapping).
+;     Stack layout: TOS(x0)=u (divisor), [DSP]=high, [DSP,#cell]=low.
+;     The remainder is conceptually 65-bit during `rem<<1`: the bit shifted out
+;     of bit63 is a carry that makes the (carry:rem) value >= divisor even when
+;     the truncated 64-bit rem is not — so a divisor near 2^64 still subtracts.
+;     That carry is captured into x15 and OR'd into the rem>=divisor test (via
+;     `cinc ..., hs`); dropping it corrupts large-divisor results.
+;     Branch via cinc+cbz (the front-end mangles `b.<cond>`; see stack.masm).
+proc(um_slash_mod)
+    mov     x9,  TOS                ; x9  = divisor (u)
+    ldr     x10, [DSP]              ; x10 = high (dividend top half)
+    ldr     x11, [DSP, #cell]       ; x11 = low  (dividend bottom half)
+    mov     x12, #0                 ; x12 = remainder accumulator
+    mov     x13, #0                 ; x13 = quotient accumulator
+    mov     x14, #128               ; x14 = bit counter (full 128-bit dividend)
+.loop:
+    lsr     x15, x12, #63           ; x15 = carry shifted out of (rem<<1)
+    extr    x12, x12, x10, #63      ; rem  = (rem<<1) | dividend MSB (high bit63)
+    extr    x10, x10, x11, #63      ; high = (high<<1) | (low>>63)
+    lsl     x11, x11, #1            ; low  = low << 1
+    lsl     x13, x13, #1            ; quot = quot << 1 (default new bit = 0)
+    cmp     x12, x9                 ; rem >= divisor?  (unsigned)
+    cinc    x15, x15, hs            ; x15 != 0 iff carry==1 OR rem>=divisor
+    cbz     x15, .skip             ; (carry:rem) < divisor → leave quot bit 0
+    sub     x12, x12, x9            ; rem -= divisor
+    orr     x13, x13, #1            ; set quotient bit 0
+.skip:
+    sub     x14, x14, #1            ; one bit done
+    cbnz    x14, .loop              ; repeat for all 128 bits
+    str     x12, [DSP, #cell]       ; remainder → low slot (becomes NOS after pop)
+    mov     TOS, x13                ; quotient → TOS
+    stk(3, 2)                       ; pop one cell: ( ur uq )
+    next()
+endp()
+
+; um*  ( u1 u2 -- ud )    unsigned 64x64 -> 128-bit double; result ( low high ).
+;     WF66: `mul qword ptr [rbp]` => rdx:rax = rax(TOS) * [rbp](NOS).
+;     low half (rax) overwrites NOS slot; high half (rdx) becomes TOS.
+;     AArch64 has no rdx:rax: `mul` gives the low 64 bits, `umulh` the high 64.
+proc(um_times)
+    ldr     x9,  [DSP]             ; x9 = NOS (u1) — load before overwriting
+    umulh   x10, TOS, x9          ; x10 = high 64 bits of TOS*NOS (unsigned)
+    mul     x9,  TOS, x9          ; x9  = low 64 bits of TOS*NOS
+    str     x9,  [DSP]            ; NOS slot = low half
+    mov     TOS, x10             ; TOS = high half (on top)
+    stk(2, 2)
+    next()
+endp()
+

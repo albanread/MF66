@@ -138,3 +138,22 @@ proc(two_rot)
     next()
 endp()
 
+
+; ── batch 3 (hard arith / double-cell / +! / stragglers) ──
+; nip  ( n1 n2 -- n2 )
+;     Discard NOS; TOS unchanged.
+proc(nip_)
+    stk(2, 1)                      ; pop one cell: add x19,x19,#cell (drops n1)
+    next()
+endp()
+
+; over  ( n1 n2 -- n1 n2 n1 )
+;     Copy the second stack item (NOS) to TOS.
+;     Before: TOS=n2, [DSP]=n1. After: TOS=n1, [DSP]=n2, [DSP+cell]=n1.
+proc(over_)
+    str     TOS, [DSP, #-cell]      ; park old TOS (n2) in the new slot below NOS
+    ldr     TOS, [DSP]              ; TOS = old NOS (n1) — the duplicated copy
+    stk(2, 3)                       ; net +1 cell: sub DSP, #cell
+    next()
+endp()
+

@@ -61,3 +61,21 @@ proc(xor_)
     next()
 endp()
 
+
+; ── batch 3 (hard arith / double-cell / +! / stragglers) ──
+proc(off)
+    str     xzr, [TOS]              ; *addr = 0  (TOS = x0 = addr)
+    ldr     TOS, [DSP]              ; raise NOS to TOS (refill cached top)
+    stk(1, 0)                       ; pop the address: DSP += cell
+    next()
+endp()
+
+; on  ( addr -- )    store -1 (all bits) at addr
+proc(on)
+    mov     x9, #-1                 ; x9 = -1 (all bits set); assembles as movn x9,#0
+    str     x9, [TOS]               ; *addr = -1  (was: or qword ptr [rax], -1)
+    ldr     TOS, [DSP]              ; refill TOS from NOS (was: mov rax, [rbp])
+    stk(1, 0)                       ; pop the addr cell: add x19, x19, #cell
+    next()
+endp()
+
