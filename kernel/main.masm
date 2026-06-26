@@ -28,6 +28,7 @@
 @include "strings.masm"
 @include "number.masm"
 @include "dict.masm"
+@include "io.masm"
 
 ; forth_main — the only data-stack-representation translation layer.
 ;

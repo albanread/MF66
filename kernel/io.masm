@@ -1,0 +1,48 @@
+; MF66 kernel — output primitives. Each calls a host rt_* via aapcs_call (which
+; saves x30; sp is the C stack). Output is captured by the session. See
+; src/runtime.rs and docs/porting-guide.md.
+
+; emit ( c -- )   output one character
+proc(emit)
+    aapcs_call(rt_emit)              ; rt_emit(x0 = c)
+    ldr     x0, [DSP]               ; raise NOS into TOS (drop c)
+    stk(1, 0)
+    next()
+endp()
+
+; type ( c-addr u -- )   output u bytes from c-addr
+proc(type_word)
+    mov     x1, x0                  ; arg1 = u (len)
+    ldr     x0, [DSP]               ; arg0 = c-addr
+    aapcs_call(rt_type)             ; rt_type(addr, len)
+    ldr     x0, [DSP, #cell]        ; raise NNOS into TOS (drop both)
+    stk(2, 0)
+    next()
+endp()
+
+; . ( n -- )   print n in the current base, followed by a space
+proc(dot)
+    ldr     x1, [UP, #user_BASE]    ; arg1 = base
+    aapcs_call(rt_print_int)        ; rt_print_int(n, base)
+    ldr     x0, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; cr ( -- )   output a newline
+proc(cr_word)
+    str     x0, [DSP, #-cell]!      ; save TOS (cr has no stack effect)
+    mov     x0, #10
+    aapcs_call(rt_emit)
+    ldr     x0, [DSP], #cell        ; restore TOS
+    next()
+endp()
+
+; space ( -- )   output a space
+proc(space_word)
+    str     x0, [DSP, #-cell]!
+    mov     x0, #32
+    aapcs_call(rt_emit)
+    ldr     x0, [DSP], #cell
+    next()
+endp()

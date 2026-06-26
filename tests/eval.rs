@@ -60,3 +60,15 @@ fn eval_memory_via_pad() {
     s.eval("@").unwrap(); // ( addr -- 1234 )
     assert_eq!(s.stack(), vec![1234]);
 }
+
+#[test]
+fn eval_output() {
+    let mut s = Mf66Session::new().unwrap();
+    assert_eq!(s.eval_out("42 .").unwrap(), "42 ");
+    s.reset();
+    assert_eq!(s.eval_out("1 2 + .").unwrap(), "3 ");
+    s.reset();
+    assert_eq!(s.eval_out("65 emit").unwrap(), "A"); // 'A' = 65
+    s.reset();
+    assert_eq!(s.eval_out("7 . 8 . cr 9 .").unwrap(), "7 8 \n9 ");
+}

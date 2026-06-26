@@ -243,6 +243,13 @@ impl Mf66Session {
         Ok(())
     }
 
+    /// Interpret `text` and return everything it printed (via `.`/`emit`/`type`/…).
+    pub fn eval_out(&mut self, text: &str) -> Result<String> {
+        crate::runtime::capture_clear();
+        self.eval(text)?;
+        Ok(crate::runtime::capture_take())
+    }
+
     /// Publish every kernel primitive (the `PRIMITIVES` table) into the dictionary.
     fn bootstrap_dictionary(&mut self) -> Result<()> {
         for &(name, sym, immediate) in crate::primitives::PRIMITIVES {
