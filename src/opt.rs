@@ -104,6 +104,75 @@ impl Bin {
     }
 }
 
+impl Cmp {
+    /// Constant-fold a binary comparison: `a <cmp> b` → Forth flag (-1 / 0).
+    fn eval(self, a: i64, b: i64) -> i64 {
+        let t = match self {
+            Cmp::Eq => a == b,
+            Cmp::Ne => a != b,
+            Cmp::Lt => a < b,
+            Cmp::Gt => a > b,
+            Cmp::Le => a <= b,
+            Cmp::Ge => a >= b,
+            Cmp::ULt => (a as u64) < (b as u64),
+            Cmp::UGt => (a as u64) > (b as u64),
+            _ => return 0, // zero-compares use eval_zero
+        };
+        if t { -1 } else { 0 }
+    }
+    /// Constant-fold a zero-compare: `n <0cmp>` → Forth flag.
+    fn eval_zero(self, n: i64) -> i64 {
+        let t = match self {
+            Cmp::ZEq => n == 0,
+            Cmp::ZNe => n != 0,
+            Cmp::ZLt => n < 0,
+            Cmp::ZGt => n > 0,
+            _ => return 0,
+        };
+        if t { -1 } else { 0 }
+    }
+    /// The csetm condition for a binary compare (`a <cmp> b`).
+    fn cond(self) -> u32 {
+        match self {
+            Cmp::Eq => EQ,
+            Cmp::Ne => NE,
+            Cmp::Lt => LT,
+            Cmp::Gt => GT,
+            Cmp::Le => LE,
+            Cmp::Ge => GE,
+            Cmp::ULt => LO,
+            Cmp::UGt => HI,
+            _ => EQ,
+        }
+    }
+    /// The comparison whose result is the logical negation of this one (signed
+    /// only; unsigned/zero compares have no inverse in the enum). `< 0=` → `>=`.
+    fn negate(self) -> Option<Cmp> {
+        Some(match self {
+            Cmp::Eq => Cmp::Ne,
+            Cmp::Ne => Cmp::Eq,
+            Cmp::Lt => Cmp::Ge,
+            Cmp::Gt => Cmp::Le,
+            Cmp::Le => Cmp::Gt,
+            Cmp::Ge => Cmp::Lt,
+            _ => return None,
+        })
+    }
+
+    /// The condition with operands swapped (`b <cmp> a`) — for a constant NOS.
+    fn swapped_cond(self) -> u32 {
+        match self {
+            Cmp::Lt => GT,
+            Cmp::Gt => LT,
+            Cmp::Le => GE,
+            Cmp::Ge => LE,
+            Cmp::ULt => HI,
+            Cmp::UGt => LO,
+            other => other.cond(), // Eq/Ne are symmetric
+        }
+    }
+}
+
 /// Reduce a token run: const-fold `Lit Lit Bin`, immediate-fold `Lit Bin`,
 /// dup-fuse `Dup Bin`, and DCE `Lit Drop` / `Dup Drop`. A single forward pass
 /// with lookback on the output is a fixpoint for these linear stack rewrites.
@@ -148,6 +217,15 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
                 | (Some(Tok::Stk(Stk::Rot)), Stk::MinusRot)
                 | (Some(Tok::Stk(Stk::MinusRot)), Stk::Rot) => {
                     out.pop();
+                }
+                _ => out.push(t),
+            },
+            // logical negation of a comparison: `<cmp> 0=` → the inverse compare.
+            Tok::Cmp(Cmp::ZEq) => match out.last().copied() {
+                Some(Tok::Cmp(c)) if c.negate().is_some() => {
+                    let n = c.negate().unwrap();
+                    out.pop();
+                    out.push(Tok::Cmp(n));
                 }
                 _ => out.push(t),
             },
@@ -454,6 +532,10 @@ impl<'a> Low<'a> {
             Cmp::ZEq | Cmp::ZNe | Cmp::ZLt | Cmp::ZGt => {
                 self.ensure(1);
                 let a = self.vs.pop().unwrap();
+                if let Loc::Const(n) = a {
+                    self.vs.push(Loc::Const(c.eval_zero(n))); // fold `n 0=` etc.
+                    return;
+                }
                 let r = self.to_reg(a);
                 let cond = match c {
                     Cmp::ZEq => EQ,
@@ -469,21 +551,40 @@ impl<'a> Low<'a> {
                 self.ensure(2);
                 let b = self.vs.pop().unwrap();
                 let a = self.vs.pop().unwrap();
+                // const-fold a fully-constant comparison
+                if let (Loc::Const(x), Loc::Const(y)) = (a, b) {
+                    self.vs.push(Loc::Const(c.eval(x, y)));
+                    return;
+                }
+                // immediate compare against a constant TOS: `a <cmp> k` → cmp ra,#k
+                if let Loc::Const(k) = b {
+                    if (0..=4095).contains(&k) {
+                        let ra = self.to_reg(a);
+                        self.out.push(cmp_imm(ra, k as u32));
+                        self.out.push(csetm(ra, c.cond()));
+                        self.vs.push(Loc::Reg(ra));
+                        return;
+                    }
+                }
+                // immediate compare against a constant NOS: `k <cmp> b` → cmp rb,#k
+                // with the condition swapped (b on the left).
+                if let Loc::Const(k) = a {
+                    if (0..=4095).contains(&k) {
+                        let rb = self.to_reg(b);
+                        self.out.push(cmp_imm(rb, k as u32));
+                        self.out.push(csetm(rb, c.swapped_cond()));
+                        self.vs.push(Loc::Reg(rb));
+                        return;
+                    }
+                }
                 let ra = self.to_reg(a);
                 let rb = self.to_reg(b);
-                let (rn, rm, cond) = match c {
-                    Cmp::Eq => (ra, rb, EQ),
-                    Cmp::Ne => (ra, rb, NE),
-                    Cmp::Lt => (ra, rb, LT), // a < b
-                    Cmp::Gt => (ra, rb, GT),
-                    Cmp::Le => (ra, rb, LE),
-                    Cmp::Ge => (ra, rb, GE),
-                    Cmp::ULt => (ra, rb, LO),
-                    Cmp::UGt => (ra, rb, HI),
-                    _ => unreachable!(),
+                let (rn, rm) = match c {
+                    Cmp::Eq | Cmp::Ne => (ra, rb), // symmetric
+                    _ => (ra, rb),                 // a <cmp> b
                 };
                 self.out.push(cmp_reg(rn, rm));
-                self.out.push(csetm(ra, cond));
+                self.out.push(csetm(ra, c.cond()));
                 self.freer(rb);
                 self.vs.push(Loc::Reg(ra));
             }
