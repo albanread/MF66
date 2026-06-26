@@ -16,6 +16,11 @@ pub fn capture_clear() {
     CAPTURE.with(|b| b.borrow_mut().clear());
 }
 
+/// Append a host string to the capture buffer (e.g. the REPL's ` ok`).
+pub fn capture_str(s: &str) {
+    CAPTURE.with(|b| b.borrow_mut().extend_from_slice(s.as_bytes()));
+}
+
 /// Take the captured output as a string (after an `eval`).
 pub fn capture_take() -> String {
     CAPTURE.with(|b| {

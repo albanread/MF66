@@ -69,6 +69,8 @@ pub struct Mf66Session {
     code: crate::codearena::CodeArena,
     /// Colon-compiler state (None = interpreting).
     pending: Option<ColonDef>,
+    /// Set when `bye` is seen, to stop the REPL.
+    bye: bool,
 }
 
 /// In-progress colon definition: the word name, the accumulated body words, and
@@ -136,6 +138,7 @@ impl Mf66Session {
             current_dsp: dstack_top,
             code,
             pending: None,
+            bye: false,
         };
 
         s.write_user(USER_RSP_CURRENT, rstack_top);
@@ -251,13 +254,29 @@ impl Mf66Session {
     pub fn eval(&mut self, text: &str) -> Result<()> {
         let mut tokens = text.split_whitespace();
         while let Some(tok) = tokens.next() {
+            // Comments: `\` to end of line, `( … )` inline.
+            if tok == "\\" {
+                break;
+            }
+            if tok == "(" {
+                for t in tokens.by_ref() {
+                    if t.ends_with(')') {
+                        break;
+                    }
+                }
+                continue;
+            }
+            let lk = tok.to_ascii_lowercase(); // Forth is case-insensitive
             if self.pending.is_some() {
-                if tok == ";" {
+                if lk == ";" {
                     self.finish_colon()?;
                 } else {
                     self.compile_token(tok)?;
                 }
-            } else if tok == ":" {
+            } else if lk == "bye" {
+                self.bye = true;
+                break;
+            } else if lk == ":" {
                 let name = tokens
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("`:` needs a name"))?;
@@ -313,8 +332,9 @@ impl Mf66Session {
     /// Compile one token into the pending colon body: a control-flow directive,
     /// else a call if it's a word, else a literal if it's a number.
     fn compile_token(&mut self, tok: &str) -> Result<()> {
-        if matches!(tok, "if" | "else" | "then" | "begin" | "until" | "while" | "repeat") {
-            return self.compile_control(tok);
+        let lk = tok.to_ascii_lowercase();
+        if matches!(lk.as_str(), "if" | "else" | "then" | "begin" | "until" | "while" | "repeat") {
+            return self.compile_control(&lk);
         }
         let base = self.read_user(UVAR_BASE) as u32;
         match self.xt_of_forth_name(tok)? {
@@ -420,6 +440,22 @@ impl Mf66Session {
         Ok(crate::runtime::capture_take())
     }
 
+    /// Run `input` as a REPL transcript: execute each line, emit ` ok\n` after a
+    /// successful line, stop at `bye`. Returns all captured output — matching
+    /// WF66's `quit` framing for the eval corpus.
+    pub fn repl(&mut self, input: &str) -> Result<String> {
+        crate::runtime::capture_clear();
+        self.bye = false;
+        for line in input.lines() {
+            self.eval(line)?;
+            if self.bye {
+                break;
+            }
+            crate::runtime::capture_str(" ok\n");
+        }
+        Ok(crate::runtime::capture_take())
+    }
+
     /// Publish every kernel primitive (the `PRIMITIVES` table) into the dictionary.
     fn bootstrap_dictionary(&mut self) -> Result<()> {
         for &(name, sym, immediate) in crate::primitives::PRIMITIVES {
@@ -478,16 +514,29 @@ fn kernel_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernel/main.masm")
 }
 
-/// Parse a Forth integer literal in `base` (2..=36), allowing a leading `-`.
+/// Parse a Forth integer literal in `base` (2..=36), allowing a leading `-` and
+/// explicit radix prefixes `0x`/`$` (hex), `0b`/`%` (binary), `0o` (octal).
 fn parse_forth_int(tok: &str, base: u32) -> Option<i64> {
-    let base = base.clamp(2, 36);
-    let (neg, digits) = match tok.strip_prefix('-') {
-        Some(rest) => (true, rest),
+    let (neg, rest) = match tok.strip_prefix('-') {
+        Some(r) => (true, r),
         None => (false, tok),
+    };
+    let (radix, digits) = if let Some(d) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        (16, d)
+    } else if let Some(d) = rest.strip_prefix('$') {
+        (16, d)
+    } else if let Some(d) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+        (2, d)
+    } else if let Some(d) = rest.strip_prefix('%') {
+        (2, d)
+    } else if let Some(d) = rest.strip_prefix("0o") {
+        (8, d)
+    } else {
+        (base.clamp(2, 36), rest)
     };
     if digits.is_empty() {
         return None;
     }
-    let mag = i64::from_str_radix(digits, base).ok()?;
+    let mag = i64::from_str_radix(digits, radix).ok()?;
     Some(if neg { mag.wrapping_neg() } else { mag })
 }
