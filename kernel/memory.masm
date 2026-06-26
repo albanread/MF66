@@ -1,0 +1,146 @@
+; MF66 kernel — memory primitives (ported from WF66 kernel/memory.masm).
+; Internal form: TOS in x0, NOS at [DSP] (x19). See docs/porting-guide.md.
+
+; b@  ( addr -- b )    fetch byte (unsigned, zero-extended)
+proc(b_fetch)
+    ldrb    w0, [x0]               ; load byte at addr in TOS; w0 write zero-extends into x0
+    stk(1, 1)
+    next()
+endp()
+
+; b!  ( b addr -- )    store low byte at addr
+proc(b_store)
+    ldr     x9, [DSP]              ; x9 = NOS (b, the byte value)
+    strb    w9, [TOS]             ; store low byte of b at addr (TOS)
+    ldr     TOS, [DSP, #cell]      ; refill cached TOS from NNOS
+    stk(2, 0)
+    next()
+endp()
+
+; c@  ( addr -- byte )
+;     Fetch byte from address, zero-extended.
+proc(c_fetch)
+    ldrb    w0, [TOS]                ; TOS = zero-extended byte at *addr
+    stk(1, 1)                        ; balanced (1 in, 1 out) — emits nothing
+    next()
+endp()
+
+; c!  ( byte addr -- )
+;     Store low byte of NOS at address.
+proc(c_store)
+    ldr     x9, [DSP]                ; x9 = value (byte) from NOS
+    strb    w9, [TOS]                ; *addr = low byte (addr is TOS)
+    ldr     TOS, [DSP, #cell]        ; raise NNOS to TOS
+    stk(2, 0)
+    next()
+endp()
+
+; @  ( addr -- value )
+;     Fetch cell from address. TOS holds the address; replace it with the
+;     8-byte cell loaded from there.
+proc(fetch)
+    ldr     TOS, [TOS]              ; TOS = *addr (full 64-bit cell)
+    stk(1, 1)                       ; 1 in, 1 out — balanced, emits nothing
+    next()
+endp()
+
+; L@  ( addr -- n )    fetch 32-bit longword, zero-extended into the cell
+;     x86 `mov eax, dword ptr [rax]` did a 32-bit load whose write of the
+;     32-bit EAX implicitly zeroes the upper 32 bits of RAX. The AArch64
+;     analog is `ldr w0, [x0]`: a 32-bit load that, by writing the W view,
+;     zero-extends bits 63:32 of x0. TOS holds the address in x0 (= rax).
+proc(l_fetch)
+    ldr     w0, [x0]                ; load low 32 bits at addr; W-write zero-extends to x0
+    stk(1, 1)                       ; addr -- n : balanced, emits nothing
+    next()
+endp()
+
+; L!  ( n addr -- )    store low 32 bits at addr (upper 32 left intact)
+proc(l_store)
+    ldr     x9, [DSP]               ; x9 = NOS (n)
+    str     w9, [TOS]               ; store low 32 bits of n at addr; upper 32 untouched
+    ldr     TOS, [DSP, #cell]       ; refill TOS from NNOS (cell below n)
+    stk(2, 0)                       ; pop both n and addr
+    next()
+endp()
+
+; q@  ( addr -- n )    fetch qword. On WF66 a qword IS one cell, so q@ ≡ @.
+;                      TOS (x0) holds addr on entry; load the 64-bit cell at
+;                      that address back into TOS. ldr (x-reg) = full 8-byte
+;                      cell, matching WF66's `mov rax, [rax]`.
+proc(q_fetch)
+    ldr     TOS, [TOS]             ; n = *addr  (was: mov rax, [rax])
+    stk(1, 1)                      ; ( addr -- n ): balanced, emits nothing
+    next()
+endp()
+
+; q!  ( n addr -- )    store qword. On WF64 q! ≡ ! (cell-sized).
+proc(q_store)
+    ldr     x9, [DSP]              ; x9 = n  (NOS)
+    str     x9, [TOS]             ; store n at addr  (addr = TOS = x0)
+    ldr     TOS, [DSP, #cell]      ; refill TOS from NNOS (new TOS after 2 pops)
+    stk(2, 0)                      ; pop both cells: DSP += 2*cell
+    next()
+endp()
+
+; sb@  ( addr -- b )   fetch byte (signed, sign-extended)
+proc(sb_fetch)
+    ldrsb   TOS, [TOS]             ; load byte at addr, sign-extend into x0
+    stk(1, 1)
+    next()
+endp()
+
+; !  ( value addr -- )
+;     Store cell at address. TOS = addr, NOS = value.
+proc(store)
+    ldr     x9, [DSP]                ; x9 = value (NOS)
+    str     x9, [TOS]                ; *addr = value
+    ldr     TOS, [DSP, #cell]        ; raise NNOS to TOS
+    stk(2, 0)                        ; emit `add x19, x19, #16`
+    next()
+endp()
+
+; sw@  ( addr -- w )   fetch 16-bit word (signed)
+proc(sw_fetch)
+    ldrsh   TOS, [TOS]             ; load halfword at [addr], sign-extend to 64 bits
+    stk(1, 1)
+    next()
+endp()
+
+; 2@  ( a-addr -- x1 x2 )    fetch a cell pair. x2 at [addr], x1 at [addr+cell].
+proc(two_fetch)
+    mov     x9, TOS             ; x9 = a-addr (save before we clobber TOS)
+    ldr     TOS, [x9]           ; TOS = x2 = [addr]
+    ldr     x10, [x9, #cell]    ; x10 = x1 = [addr+cell]
+    str     x10, [DSP, #-cell]  ; write x1 into the soon-to-be NOS slot
+    stk(1, 2)                   ; net push one cell → sub x19, x19, #cell
+    next()
+endp()
+
+; 2!  ( x1 x2 a-addr -- )    store a cell pair.
+proc(two_store)
+    ldr     x9,  [DSP]              ; x9 = NOS  (x2)
+    ldr     x10, [DSP, #cell]       ; x10 = NNOS (x1)
+    str     x9,  [TOS]             ; addr      <- x2
+    str     x10, [TOS, #cell]      ; addr+cell <- x1
+    ldr     TOS, [DSP, #16]       ; #16 = 2*cell: reload TOS from the cell below the popped 3
+    stk(3, 0)
+    next()
+endp()
+
+; w@  ( addr -- w )    fetch 16-bit word (unsigned)
+proc(w_fetch)
+    ldrh    w0, [x0]               ; load 16-bit halfword from addr in TOS, zero-extend
+    stk(1, 1)
+    next()
+endp()
+
+; w!  ( w addr -- )    store low 16 bits at addr
+proc(w_store)
+    ldr     x9, [DSP]               ; x9 = NOS (w)
+    strh    w9, [TOS]               ; store low 16 bits of w at addr (TOS)
+    ldr     TOS, [DSP, #cell]       ; raise the cell below NOS into TOS
+    stk(2, 0)                       ; pop both cells: add x19, x19, #2*cell
+    next()
+endp()
+
