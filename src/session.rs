@@ -89,6 +89,8 @@ struct ColonDef {
     /// Accumulated straight-line token run (flushed → reduced → lowered into
     /// `body` at each control-flow boundary and at `;`).
     toks: Vec<Tok>,
+    /// Local names by slot index (LP-relative frame); empty if none declared.
+    locals: Vec<String>,
 }
 
 /// A pending control-flow mark (compile time).
@@ -291,6 +293,30 @@ impl Mf66Session {
             if self.pending.is_some() {
                 if lk == ";" {
                     self.finish_colon()?;
+                } else if lk == "{:" {
+                    // {: in0 in1 … | uninit … :}  — declare a locals frame
+                    let mut names = Vec::new();
+                    let mut inputs = 0usize;
+                    let mut after_pipe = false;
+                    for t in tokens.by_ref() {
+                        if t == ":}" {
+                            break;
+                        }
+                        if t == "|" {
+                            after_pipe = true;
+                            continue;
+                        }
+                        if !after_pipe {
+                            inputs += 1;
+                        }
+                        names.push(t.to_string());
+                    }
+                    self.open_locals(names, inputs);
+                } else if lk == "to" {
+                    let target = tokens
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("`to` needs a name"))?;
+                    self.compile_to(target)?;
                 } else {
                     self.compile_token(tok)?;
                 }
@@ -308,6 +334,7 @@ impl Mf66Session {
                     body,
                     cf: Vec::new(),
                     toks: Vec::new(),
+                    locals: Vec::new(),
                 });
             } else {
                 self.interpret_token(tok)?;
@@ -357,7 +384,46 @@ impl Mf66Session {
 
     /// Compile one token into the pending colon body: a control-flow directive,
     /// else a call if it's a word, else a literal if it's a number.
+    /// `{: … :}` — allocate a locals frame on LP (x21) and pop the input locals
+    /// (declaration order; rightmost input = TOS) into it. Uninitialized locals
+    /// (after `|`) just reserve a slot.
+    fn open_locals(&mut self, names: Vec<String>, inputs: usize) {
+        use crate::aenc::{ldr_post, str_off, sub_imm};
+        self.flush_toks();
+        let count = names.len();
+        let def = self.pending.as_mut().unwrap();
+        if count > 0 {
+            def.body.push(sub_imm(21, 21, (count * 8) as u32)); // allocate frame
+            for i in (0..inputs).rev() {
+                def.body.push(str_off(0, 21, (i * 8) as u32)); // local[i] = TOS
+                def.body.push(ldr_post(0, 19, 8)); // raise NOS into TOS
+            }
+        }
+        def.locals = names;
+    }
+
+    /// `to <local>` — compile a store into the named local.
+    fn compile_to(&mut self, target: &str) -> Result<()> {
+        let def = self.pending.as_ref().unwrap();
+        match def.locals.iter().position(|n| n.eq_ignore_ascii_case(target)) {
+            Some(i) => {
+                self.pending.as_mut().unwrap().toks.push(Tok::LocalStore(i as u32));
+                Ok(())
+            }
+            None => anyhow::bail!("`to {target}` — not a local (VALUEs not supported yet)"),
+        }
+    }
+
     fn compile_token(&mut self, tok: &str) -> Result<()> {
+        // A bare local name compiles to a fetch from its frame slot.
+        if let Some(i) = self
+            .pending
+            .as_ref()
+            .and_then(|d| d.locals.iter().position(|n| n.eq_ignore_ascii_case(tok)))
+        {
+            self.pending.as_mut().unwrap().toks.push(Tok::LocalFetch(i as u32));
+            return Ok(());
+        }
         let lk = tok.to_ascii_lowercase();
         // cmp-branch fusion: a comparison immediately before if/until/while folds
         // into one cmp + b.<cond> (no -1/0 flag materialized).
@@ -573,6 +639,10 @@ impl Mf66Session {
         let mut def = self.pending.take().expect("finish_colon with no pending def");
         if !def.cf.is_empty() {
             anyhow::bail!("unbalanced control flow in `{}`", def.name);
+        }
+        if !def.locals.is_empty() {
+            // free the locals frame before returning
+            def.body.push(crate::aenc::add_imm(21, 21, (def.locals.len() * 8) as u32));
         }
         crate::aenc::emit_unnest_ret(&mut def.body);
         self.last_body_words = def.body.len();

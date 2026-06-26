@@ -57,6 +57,8 @@ pub enum Tok {
     Stk(Stk),
     Cmp(Cmp),
     Mem(Mem),
+    LocalFetch(u32),  // push local[i] (LP-relative)
+    LocalStore(u32),  // local[i] = TOS; drop
     Call(u64),
 }
 
@@ -120,6 +122,7 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
 
 const TOS: u32 = 0; // x0 — always holds the top of stack within a window
 const DSP: u32 = 19;
+const LP: u32 = 21; // locals-frame pointer
 const POOL: [u32; 7] = [9, 10, 11, 12, 13, 14, 15]; // register window below TOS
 
 /// Register-windowing lowerer (O2). The invariant: TOS is in x0; the next cells
@@ -328,6 +331,17 @@ impl<'a> Low<'a> {
         }
     }
 
+    fn local_fetch(&mut self, i: u32) {
+        self.push_down();
+        self.out.push(ldr_off(TOS, LP, i * 8));
+    }
+
+    fn local_store(&mut self, i: u32) {
+        self.out.push(str_off(TOS, LP, i * 8)); // local[i] = TOS
+        let r = self.pop_nos(); // drop TOS, raise NOS
+        self.out.push(mov_reg(TOS, r));
+    }
+
     fn mem(&mut self, m: Mem) {
         match m {
             Mem::Fetch => self.out.push(ldr0(TOS, TOS)),
@@ -401,6 +415,8 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>) {
             Tok::Stk(s) => low.stk(s),
             Tok::Cmp(c) => low.cmp(c),
             Tok::Mem(m) => low.mem(m),
+            Tok::LocalFetch(i) => low.local_fetch(i),
+            Tok::LocalStore(i) => low.local_store(i),
             Tok::Call(xt) => {
                 low.settle();
                 emit_call(xt, low.out);
