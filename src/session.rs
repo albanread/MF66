@@ -136,6 +136,8 @@ struct ColonDef {
     toks: Vec<Tok>,
     /// Local names by slot index (LP-relative frame); empty if none declared.
     locals: Vec<String>,
+    /// `:noname` — finish pushes the xt instead of creating a header.
+    noname: bool,
 }
 
 /// A pending control-flow mark (compile time).
@@ -654,19 +656,32 @@ impl Mf66Session {
                     .ok_or_else(|| anyhow::anyhow!("`variable` needs a name"))?;
                 let addr = self.allot_cell();
                 self.publish_constant(name, addr as i64)?;
-            } else if lk == ":" {
-                let name = tokens
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("`:` needs a name"))?;
+            } else if lk == ":" || lk == ":noname" {
+                let name = if lk == ":noname" {
+                    String::new()
+                } else {
+                    tokens
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("`:` needs a name"))?
+                        .to_string()
+                };
                 let mut body = Vec::new();
                 crate::aenc::emit_nest(&mut body);
                 self.pending = Some(ColonDef {
-                    name: name.to_string(),
+                    name,
                     body,
                     cf: Vec::new(),
                     toks: Vec::new(),
                     locals: Vec::new(),
+                    noname: lk == ":noname",
                 });
+            } else if lk == "2constant" {
+                let name = tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("`2constant` needs a name"))?;
+                let hi = self.pop_data().unwrap_or(0);
+                let lo = self.pop_data().unwrap_or(0);
+                self.publish_dconstant(name, lo, hi)?;
             } else {
                 self.interpret_token(tok)?;
             }
@@ -1030,8 +1045,14 @@ impl Mf66Session {
     }
 
     fn finish_colon(&mut self) -> Result<()> {
-        let name = self.pending.as_ref().expect("finish_colon: no def").name.clone();
+        let def = self.pending.as_ref().expect("finish_colon: no def");
+        let name = def.name.clone();
+        let noname = def.noname;
         let xt = self.commit_body()?;
+        if noname {
+            self.push(xt as i64); // `:noname … ;` leaves the xt
+            return Ok(());
+        }
         // Header (in the RW dict heap) via (create), then patch xt + type tag.
         self.push_name(&name);
         self.call("create")?;
@@ -1039,6 +1060,21 @@ impl Mf66Session {
         self.write_u64(header + DH_XTPTR, xt);
         self.write_u8(header + DH_TFA, TFA_TCOL);
         Ok(())
+    }
+
+    /// Publish `name` as a leaf word that pushes a double-cell constant `lo hi`.
+    fn publish_dconstant(&mut self, name: &str, lo: i64, hi: i64) -> Result<u64> {
+        let mut body = Vec::new();
+        crate::aenc::emit_lit(lo, &mut body); // TOS = lo
+        crate::aenc::emit_lit(hi, &mut body); // spill lo, TOS = hi → ( lo hi )
+        body.push(crate::aenc::ret());
+        let xt = self.code.commit(&body)?;
+        self.push_name(name);
+        self.call("create")?;
+        let header = self.read_user(USER_LATEST);
+        self.write_u64(header + DH_XTPTR, xt);
+        self.write_u8(header + DH_TFA, TFA_TCOL);
+        Ok(xt)
     }
 
     // ── OOP defining words ──────────────────────────────────────────────────
@@ -1140,6 +1176,7 @@ impl Mf66Session {
             cf: Vec::new(),
             toks: Vec::new(),
             locals: Vec::new(),
+            noname: false,
         });
         self.method_class = Some(class);
         Ok(())
@@ -1369,7 +1406,13 @@ fn parse_forth_float(tok: &str) -> Option<f64> {
     if !has_digit || !floaty {
         return None;
     }
-    match tok.parse::<f64>() {
+    // Forth allows a bare exponent marker: `1e` / `1.5E` mean `…e0`.
+    let norm = if tok.ends_with('e') || tok.ends_with('E') {
+        format!("{tok}0")
+    } else {
+        tok.to_string()
+    };
+    match norm.parse::<f64>() {
         Ok(f) if f.is_finite() => Some(f),
         _ => None,
     }
