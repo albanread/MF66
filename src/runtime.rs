@@ -86,6 +86,11 @@ pub extern "C" fn rt_double(n: u64) -> u64 {
     n.wrapping_mul(2)
 }
 
+/// `f.` — print a float in Forth style (shortest round-trip, trailing space).
+pub extern "C" fn rt_print_float(x: f64) {
+    capture_str(&format!("{x} "));
+}
+
 /// The built-in runtime externs every session binds before assembling the
 /// kernel. Names must match the `bl`/`aapcs_call` targets in the kernel.
 pub fn externs() -> Vec<(&'static str, *const ())> {
@@ -94,5 +99,6 @@ pub fn externs() -> Vec<(&'static str, *const ())> {
         ("rt_emit", rt_emit as *const ()),
         ("rt_type", rt_type as *const ()),
         ("rt_print_int", rt_print_int as *const ()),
+        ("rt_print_float", rt_print_float as *const ()),
     ]
 }

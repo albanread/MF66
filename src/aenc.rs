@@ -210,6 +210,56 @@ pub fn mvn(rd: u32, rm: u32) -> u32 {
     0xAA20_03E0 | ((rm & 0x1F) << 16) | (rd & 0x1F)
 }
 
+// ── Scalar double-precision FP encoders ───────────────────────────────────
+/// `fadd Dd, Dn, Dm`.
+pub fn fadd(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x1E60_2800 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `fsub Dd, Dn, Dm`.
+pub fn fsub(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x1E60_3800 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `fmul Dd, Dn, Dm`.
+pub fn fmul(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x1E60_0800 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `fdiv Dd, Dn, Dm`.
+pub fn fdiv(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x1E60_1800 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `fneg Dd, Dn`.
+pub fn fneg(rd: u32, rn: u32) -> u32 {
+    0x1E61_4000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `fmov Dd, Dn`.
+pub fn fmov_dd(rd: u32, rn: u32) -> u32 {
+    0x1E60_4000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `fmov Dd, Xn`  (general → double, raw bits).
+pub fn fmov_dx(rd: u32, rn: u32) -> u32 {
+    0x9E67_0000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `fmov Xd, Dn`  (double → general, raw bits).
+pub fn fmov_xd(rd: u32, rn: u32) -> u32 {
+    0x9E66_0000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `ldr Dt, [Xn], #imm`  (post-index).
+pub fn fldr_post(rt: u32, rn: u32, imm9: i32) -> u32 {
+    0xFC40_0400 | (((imm9 as u32) & 0x1FF) << 12) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+/// `str Dt, [Xn, #imm]!`  (pre-index).
+pub fn fstr_pre(rt: u32, rn: u32, imm9: i32) -> u32 {
+    0xFC00_0C00 | (((imm9 as u32) & 0x1FF) << 12) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+/// `ldr Dt, [Xn]`.
+pub fn fldr0(rt: u32, rn: u32) -> u32 {
+    0xFD40_0000 | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+/// `str Dt, [Xn]`.
+pub fn fstr0(rt: u32, rn: u32) -> u32 {
+    0xFD00_0000 | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+
 // AArch64 condition codes.
 pub const EQ: u32 = 0;
 pub const NE: u32 = 1;
@@ -294,6 +344,22 @@ mod cf_tests {
         assert_eq!(vec![neg(0, 0)], asm("neg x0, x0"));
         assert_eq!(vec![mvn(0, 0)], asm("mvn x0, x0"));
         assert_eq!(vec![ldr_post(9, 19, 8)], asm("ldr x9, [x19], #8"));
+    }
+
+    #[test]
+    fn fp_encoders_match_assembler() {
+        assert_eq!(vec![fadd(8, 8, 9)], asm("fadd d8, d8, d9"));
+        assert_eq!(vec![fsub(8, 9, 8)], asm("fsub d8, d9, d8"));
+        assert_eq!(vec![fmul(8, 8, 9)], asm("fmul d8, d8, d9"));
+        assert_eq!(vec![fdiv(8, 9, 8)], asm("fdiv d8, d9, d8"));
+        assert_eq!(vec![fneg(8, 8)], asm("fneg d8, d8"));
+        assert_eq!(vec![fmov_dd(0, 8)], asm("fmov d0, d8"));
+        assert_eq!(vec![fmov_dx(8, 0)], asm("fmov d8, x0"));
+        assert_eq!(vec![fmov_xd(0, 8)], asm("fmov x0, d8"));
+        assert_eq!(vec![fldr_post(9, 22, 8)], asm("ldr d9, [x22], #8"));
+        assert_eq!(vec![fstr_pre(8, 22, -8)], asm("str d8, [x22, #-8]!"));
+        assert_eq!(vec![fldr0(9, 22)], asm("ldr d9, [x22]"));
+        assert_eq!(vec![fstr0(8, 22)], asm("str d8, [x22]"));
     }
 }
 

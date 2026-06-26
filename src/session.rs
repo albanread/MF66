@@ -40,7 +40,10 @@ const USER_DSP_SAVE: usize = 0x60;
 const USER_SP0: usize = 0x68;
 const USER_RSP_CURRENT: usize = 0x70;
 const USER_LP0: usize = 0x15B0;
+const USER_FP0: usize = 0x1210;
+const USER_FSP: usize = 0x1218;
 const USER_FTOS_SAVE: usize = 0x1228;
+const FP_STACK_TOP: usize = 0x1400; // empty float-stack pointer (top of user_FP_STACK)
 /// Scratch region inside the user area (`push_pad`/`poke`/`expect_bytes`).
 const USER_PAD: u64 = 0x100;
 
@@ -161,6 +164,8 @@ impl Mf66Session {
         s.write_user(USER_LP0, base + LOCALS_TOP as u64);
         s.write_user(USER_SP0, dstack_top);
         s.write_user(USER_FTOS_SAVE, 0);
+        s.write_user(USER_FP0, base + FP_STACK_TOP as u64);
+        s.write_user(USER_FSP, base + FP_STACK_TOP as u64);
         s.write_user(USER_HOST_RSP, 0);
         s.write_user(USER_DSP_SAVE, dstack_top);
         s.write_user(UVAR_BASE, 10); // decimal default
@@ -356,9 +361,15 @@ impl Mf66Session {
             self.call("drop_")?;
             self.call("drop_")?;
             self.call("drop_")?;
-            let n = parse_forth_int(tok, base)
-                .ok_or_else(|| anyhow::anyhow!("undefined word: {tok}"))?;
-            self.push(n);
+            match parse_forth_int(tok, base) {
+                Some(n) => self.push(n),
+                None => {
+                    let f = parse_forth_float(tok)
+                        .ok_or_else(|| anyhow::anyhow!("undefined word: {tok}"))?;
+                    self.push(f.to_bits() as i64); // push raw bits, then flit → float stack
+                    self.call("flit")?;
+                }
+            }
         }
         Ok(())
     }
@@ -448,11 +459,17 @@ impl Mf66Session {
                 let toks = self.vocab.get(&xt).cloned().unwrap_or_else(|| vec![Tok::Call(xt)]);
                 self.pending.as_mut().unwrap().toks.extend(toks);
             }
-            None => {
-                let n = parse_forth_int(tok, base)
-                    .ok_or_else(|| anyhow::anyhow!("undefined word: {tok}"))?;
-                self.pending.as_mut().unwrap().toks.push(Tok::Lit(n));
-            }
+            None => match parse_forth_int(tok, base) {
+                Some(n) => self.pending.as_mut().unwrap().toks.push(Tok::Lit(n)),
+                None => {
+                    let f = parse_forth_float(tok)
+                        .ok_or_else(|| anyhow::anyhow!("undefined word: {tok}"))?;
+                    let flit = self.xt_of("flit")?;
+                    let def = self.pending.as_mut().unwrap();
+                    def.toks.push(Tok::Lit(f.to_bits() as i64)); // bits …
+                    def.toks.push(Tok::Call(flit)); // … then flit → float stack
+                }
+            },
         }
         Ok(())
     }
@@ -737,6 +754,21 @@ impl Drop for Mf66Session {
 /// Locate `kernel/main.masm` relative to the crate root.
 fn kernel_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernel/main.masm")
+}
+
+/// Parse a Forth floating-point literal (`1.5`, `1.5e0`, `-2.25`, `1e3`). Only a
+/// token that has a digit and a `.` or exponent is considered, and `inf`/`nan`
+/// are rejected, so integers and word names never match.
+fn parse_forth_float(tok: &str) -> Option<f64> {
+    let has_digit = tok.bytes().any(|b| b.is_ascii_digit());
+    let floaty = tok.contains('.') || tok.contains('e') || tok.contains('E');
+    if !has_digit || !floaty {
+        return None;
+    }
+    match tok.parse::<f64>() {
+        Ok(f) if f.is_finite() => Some(f),
+        _ => None,
+    }
 }
 
 /// Parse a Forth integer literal in `base` (2..=36), allowing a leading `-` and

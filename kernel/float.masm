@@ -1,0 +1,117 @@
+; MF66 kernel — scalar floating-point primitives (AArch64 port of WF66's float
+; word set). The FP stack mirrors the data stack's cached-top model:
+;   FTOS = d8  (the cached float top of stack)
+;   FSP  = x22 (points at the float NOS; grows down through user_FP_STACK)
+;   depth = (FP0 - FSP) / cell
+; A push spills the old FTOS to [FSP, #-cell]! and loads the new top into d8.
+; d8 and x22 are callee-saved, so the FP stack survives forth_main boundaries
+; (parked in user_FTOS_SAVE / user_FSP by the prologue/epilogue).
+
+; flit ( bits -- ) ( F: -- r )   push the f64 whose raw bits are on the data stack
+proc(flit)
+    str     FTOS, [FSP, #-cell]!    ; push old FTOS
+    fmov    FTOS, x0                ; FTOS = bits reinterpreted as double
+    ldr     x0, [DSP]               ; raise data NOS into TOS (drop bits)
+    stk(1, 0)
+    next()
+endp()
+
+; f+ ( F: a b -- a+b )
+proc(f_plus)
+    ldr     d9, [FSP], #cell        ; d9 = FNOS (a), pop
+    fadd    FTOS, FTOS, d9          ; FTOS = b + a
+    next()
+endp()
+
+; f- ( F: a b -- a-b )
+proc(f_minus)
+    ldr     d9, [FSP], #cell        ; d9 = FNOS (a)
+    fsub    FTOS, d9, FTOS          ; FTOS = a - b
+    next()
+endp()
+
+; f* ( F: a b -- a*b )
+proc(f_times)
+    ldr     d9, [FSP], #cell
+    fmul    FTOS, FTOS, d9          ; FTOS = b * a
+    next()
+endp()
+
+; f/ ( F: a b -- a/b )
+proc(f_slash)
+    ldr     d9, [FSP], #cell        ; d9 = FNOS (a)
+    fdiv    FTOS, d9, FTOS          ; FTOS = a / b
+    next()
+endp()
+
+; fnegate ( F: a -- -a )
+proc(f_negate)
+    fneg    FTOS, FTOS
+    next()
+endp()
+
+; fdup ( F: a -- a a )
+proc(fdup)
+    str     FTOS, [FSP, #-cell]!
+    next()
+endp()
+
+; fdrop ( F: a -- )
+proc(fdrop)
+    ldr     FTOS, [FSP], #cell
+    next()
+endp()
+
+; fswap ( F: a b -- b a )
+proc(fswap)
+    ldr     d9, [FSP]               ; d9 = a (FNOS)
+    str     FTOS, [FSP]             ; FNOS = b
+    fmov    FTOS, d9                ; FTOS = a
+    next()
+endp()
+
+; fover ( F: a b -- a b a )
+proc(fover)
+    ldr     d9, [FSP]               ; d9 = a (FNOS)
+    str     FTOS, [FSP, #-cell]!    ; push b
+    fmov    FTOS, d9                ; FTOS = a
+    next()
+endp()
+
+; f@ ( addr -- ) ( F: -- r )   fetch a float from addr
+proc(f_fetch)
+    str     FTOS, [FSP, #-cell]!    ; push old FTOS
+    ldr     FTOS, [x0]              ; FTOS = [addr]
+    ldr     x0, [DSP]               ; drop addr (raise NOS)
+    stk(1, 0)
+    next()
+endp()
+
+; f! ( addr -- ) ( F: r -- )   store a float to addr
+proc(f_store)
+    str     FTOS, [x0]              ; [addr] = FTOS
+    ldr     FTOS, [FSP], #cell      ; fdrop
+    ldr     x0, [DSP]               ; drop addr (raise NOS)
+    stk(1, 0)
+    next()
+endp()
+
+; fdepth ( -- n )   number of items on the float stack
+proc(fdepth)
+    str     x0, [DSP, #-cell]       ; spill old data TOS into the NOS slot
+    ldr     x9, [UP, #user_FP0]
+    sub     x0, x9, FSP             ; bytes = FP0 - FSP
+    lsr     x0, x0, #3              ; cells = bytes / 8
+    stk(0, 1)                       ; complete the push
+    next()
+endp()
+
+; f. ( F: r -- )   print the float top, followed by a space
+proc(f_dot)
+    str     x0, [DSP, #-cell]!      ; preserve the data TOS across the host call
+    fmov    d0, FTOS                ; arg0 = FTOS
+    aapcs_call(rt_print_float)      ; rt_print_float(double)
+    ldr     x0, [DSP], #cell        ; restore the data TOS
+    ldr     FTOS, [FSP], #cell      ; fdrop
+    next()
+endp()

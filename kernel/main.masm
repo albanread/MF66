@@ -29,6 +29,7 @@
 @include "number.masm"
 @include "dict.masm"
 @include "io.masm"
+@include "float.masm"
 
 ; forth_main — the only data-stack-representation translation layer.
 ;
@@ -70,6 +71,7 @@ proc(forth_main)
     add     DSP, DSP, #cell
 
     ldr     FTOS, [UP, #user_FTOS_SAVE]     ; restore FP top-of-stack
+    ldr     FSP, [UP, #user_FSP]            ; restore float-stack pointer (x22)
 
     blr     x9                              ; call target_xt
 
@@ -79,6 +81,7 @@ proc(forth_main)
     str     DSP, [UP, #user_DSP_SAVE]
 
     str     FTOS, [UP, #user_FTOS_SAVE]     ; park FP top-of-stack
+    str     FSP, [UP, #user_FSP]            ; persist float-stack pointer
     str     RP, [UP, #user_RSP_CURRENT]     ; persist Forth return-stack pointer
 
     ldp     x19, x20, [sp, #16]
