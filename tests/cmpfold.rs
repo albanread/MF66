@@ -39,3 +39,19 @@ fn out(s:&str)->String{ Mf66Session::new().unwrap().eval_out(s).unwrap() }
     assert_eq!(s.eval_out("4 4 ne .").unwrap(), "0 ");
     assert_eq!(s.eval_out("4 5 ne .").unwrap(), "-1 ");
 }
+
+#[test] fn min_max_inline_and_fold() {
+    let mut s=Mf66Session::new().unwrap();
+    // runtime min/max via cmp+csel
+    assert_eq!(s.eval_out("5 3 max . 5 3 min .").unwrap(), "5 3 ");
+    assert_eq!(s.eval_out("3 5 max . 3 5 min .").unwrap(), "5 3 ");
+    assert_eq!(s.eval_out("-7 2 max . -7 2 min .").unwrap(), "2 -7 ");
+    // unsigned: -1 is the largest unsigned
+    assert_eq!(s.eval_out("-1 1 umax . -1 1 umin .").unwrap(), "-1 1 ");
+    // const-fold inside a colon def → tiny body
+    s.eval(": clamp10 10 min 0 max ;").unwrap();
+    assert_eq!(s.eval_out("15 clamp10 . -3 clamp10 . 7 clamp10 .").unwrap(), "10 0 7 ");
+    s.eval(": k 5 3 max ;").unwrap();
+    assert_eq!(s.eval_out("k .").unwrap(), "5 ");
+    assert!(s.last_body_words() <= 10, "folded max body {} words", s.last_body_words());
+}

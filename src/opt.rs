@@ -66,6 +66,36 @@ pub enum FUn {
     Abs,
 }
 
+/// Branchless select words: `min max umin umax` (cmp + csel, foldable).
+#[derive(Clone, Copy)]
+pub enum Sel {
+    Min,
+    Max,
+    UMin,
+    UMax,
+}
+
+impl Sel {
+    /// Constant-fold `a <sel> b`.
+    fn eval(self, a: i64, b: i64) -> i64 {
+        match self {
+            Sel::Min => a.min(b),
+            Sel::Max => a.max(b),
+            Sel::UMin => (a as u64).min(b as u64) as i64,
+            Sel::UMax => (a as u64).max(b as u64) as i64,
+        }
+    }
+    /// csel condition selecting the NOS operand (`a`) when true.
+    fn cond(self) -> u32 {
+        match self {
+            Sel::Min => LT,  // a < b  → keep a
+            Sel::Max => GT,  // a > b  → keep a
+            Sel::UMin => LO, // a u< b → keep a
+            Sel::UMax => HI, // a u> b → keep a
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum Tok {
     Lit(i64),
@@ -74,6 +104,7 @@ pub enum Tok {
     DupBin(Bin),      // reduced: dup then op (op TOS with itself)
     Stk(Stk),
     Cmp(Cmp),
+    Sel(Sel),
     Mem(Mem),
     LocalFetch(u32),  // push local[i] (LP-relative)
     LocalStore(u32),  // local[i] = TOS; drop
@@ -591,6 +622,24 @@ impl<'a> Low<'a> {
         }
     }
 
+    /// min / max / umin / umax — branchless via cmp + csel, const-folded.
+    fn sel(&mut self, s: Sel) {
+        self.reserve(3);
+        self.ensure(2);
+        let b = self.vs.pop().unwrap();
+        let a = self.vs.pop().unwrap();
+        if let (Loc::Const(x), Loc::Const(y)) = (a, b) {
+            self.vs.push(Loc::Const(s.eval(x, y)));
+            return;
+        }
+        let ra = self.to_reg(a);
+        let rb = self.to_reg(b);
+        self.out.push(cmp_reg(ra, rb)); // a ? b
+        self.out.push(csel(ra, ra, rb, s.cond())); // keep a when cond, else b
+        self.freer(rb);
+        self.vs.push(Loc::Reg(ra));
+    }
+
     fn mem(&mut self, m: Mem) {
         self.reserve(3);
         match m {
@@ -904,6 +953,7 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>) {
             Tok::DupBin(op) => low.dup_bin(op),
             Tok::Stk(s) => low.stk(s),
             Tok::Cmp(c) => low.cmp(c),
+            Tok::Sel(s) => low.sel(s),
             Tok::Mem(m) => low.mem(m),
             Tok::LocalFetch(i) => low.local_fetch(i),
             Tok::LocalStore(i) => low.local_store(i),

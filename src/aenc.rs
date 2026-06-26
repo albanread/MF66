@@ -203,6 +203,10 @@ pub fn csetm(rd: u32, cond: u32) -> u32 {
     let inv = cond ^ 1; // invert low bit of the condition
     0xDA80_0000 | (31 << 16) | ((inv & 0xF) << 12) | (31 << 5) | (rd & 0x1F)
 }
+/// `csel Xd, Xn, Xm, <cond>`  (Xd = cond ? Xn : Xm). Oracle-verified vs llvm-mc.
+pub fn csel(rd: u32, rn: u32, rm: u32, cond: u32) -> u32 {
+    0x9A80_0000 | ((rm & 0x1F) << 16) | ((cond & 0xF) << 12) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
 /// `ldrb Wt, [Xn]`.
 pub fn ldrb0(rt: u32, rn: u32) -> u32 {
     0x3940_0000 | ((rn & 0x1F) << 5) | (rt & 0x1F)
