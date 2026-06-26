@@ -97,6 +97,11 @@ pub struct Mf66Session {
     objects: HashMap<String, (u64, String)>,
     /// `value` names → the data cell holding the value (for `to`).
     values: HashMap<String, u64>,
+    /// Words that push a fixed address (variables, buffers, `create`d words with
+    /// no `does>`). In compiled code their name folds to a literal address — the
+    /// address never changes — so `v @`/`v !` lower to a register ldr/str instead
+    /// of a veneer call.
+    var_addrs: HashMap<String, u64>,
     /// CREATE/DOES> defining words → (build tokens incl. `create`, does-code xt
     /// or 0). Replayed in Rust at use time. See finish_defining/instantiate.
     defining_words: HashMap<String, (Vec<String>, u64)>,
@@ -224,6 +229,7 @@ impl Mf66Session {
             bracket_interpret: false,
             values: HashMap::new(),
             defining_words: HashMap::new(),
+            var_addrs: HashMap::new(),
             last_receiver_class: None,
             dnu_xt: 0,
             send_xt: 0,
@@ -735,6 +741,7 @@ impl Mf66Session {
                     let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`create` needs a name"))?;
                     let addr = self.read_user(USER_VAR_HERE);
                     self.publish_constant(s, addr as i64)?; // NAME pushes the data field addr
+                    self.var_addrs.insert(s.to_string(), addr); // fold to a literal in code
                     continue;
                 }
                 "[defined]" => {
@@ -960,6 +967,13 @@ impl Mf66Session {
     }
 
     fn compile_token(&mut self, tok: &str) -> Result<()> {
+        // A variable/buffer name folds to its fixed address (a literal), so the
+        // optimizer can keep it in a register and `@`/`!` become a plain ldr/str
+        // with no veneer call.
+        if let Some(&addr) = self.var_addrs.get(tok) {
+            self.pending.as_mut().unwrap().toks.push(Tok::Lit(addr as i64));
+            return Ok(());
+        }
         // A bare ivar name (inside a method body) compiles to a SELF-relative fetch.
         if let Some(off) = self.ivar_offset(tok) {
             self.pending.as_mut().unwrap().toks.push(Tok::IvarFetch(off));
@@ -1330,6 +1344,8 @@ impl Mf66Session {
                     // here, so a blr+ret would loop on the clobbered x30).
                     crate::aenc::emit_tail_call(does_xt, &mut wbody);
                 } else {
+                    // no does> → the word pushes a fixed address; fold it inline.
+                    self.var_addrs.insert(target.to_string(), body_addr);
                     wbody.push(crate::aenc::ret());
                 }
                 let xt = self.code.commit(&wbody)?;
