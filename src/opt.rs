@@ -50,6 +50,21 @@ pub enum Mem {
     CFetch,
     CStore,
 }
+/// Floating-point binary ops modeled in the optimizer's FP virtual stack.
+#[derive(Clone, Copy, PartialEq)]
+pub enum FBin {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+/// Floating-point unary ops (single hardware instruction, no libm).
+#[derive(Clone, Copy, PartialEq)]
+pub enum FUn {
+    Neg,
+    Sqrt,
+    Abs,
+}
 
 #[derive(Clone, Copy)]
 pub enum Tok {
@@ -67,6 +82,11 @@ pub enum Tok {
     SelfPush,         // push the current receiver (user_SELF)
     PickN(u32),       // copy the item at depth N to TOS (0=dup, 1=over, …)
     RollN(u32),       // move the item at depth N to TOS (1=swap, 2=rot, …)
+    // Floating-point: modeled in a parallel FP virtual stack (FTOS=d8, FSP).
+    FLit(i64),        // float literal (raw bits)
+    FBin(FBin),       // f+ / f- / f* / f/
+    FUn(FUn),         // fnegate / fsqrt / fabs
+    FStk(Stk),        // fdup / fdrop / fswap / fover (FP stack motion)
     Call(u64),
 }
 
@@ -163,16 +183,34 @@ enum Loc {
 struct Low<'a> {
     out: &'a mut Vec<u32>,
     vs: Vec<Loc>,
-    used: [bool; 32], // which registers are live (in vs or a transient)
+    used: [bool; 32], // which GP registers are live (in vs or a transient)
     consumed: i64,    // entry-memory cells pulled below the window
+    // Parallel FP virtual stack (FTOS canonical = d8; pool d9–d15; FSP=x22).
+    fvs: Vec<u32>,    // d-registers; fvs.last() = FTOS
+    fused: [bool; 32],
+    fconsumed: i64,
 }
+
+const FTOS: u32 = 8; // d8 — canonical float top of stack at window boundaries
+const FSP: u32 = 22;
+const FPOOL: [u32; 7] = [9, 10, 11, 12, 13, 14, 15]; // d-register window pool
 
 impl<'a> Low<'a> {
     fn new(out: &'a mut Vec<u32>) -> Self {
-        // The incoming canonical form has TOS in x0; the rest is in memory.
+        // The incoming canonical form has TOS in x0 and FTOS in d8.
         let mut used = [false; 32];
         used[0] = true;
-        Low { out, vs: vec![Loc::Reg(0)], used, consumed: 0 }
+        let mut fused = [false; 32];
+        fused[FTOS as usize] = true;
+        Low {
+            out,
+            vs: vec![Loc::Reg(0)],
+            used,
+            consumed: 0,
+            fvs: vec![FTOS],
+            fused,
+            fconsumed: 0,
+        }
     }
 
     fn nfree(&self) -> usize {
@@ -199,7 +237,7 @@ impl<'a> Low<'a> {
     /// at the START of an op (while `vs` is consistent) so later allocs never settle.
     fn reserve(&mut self, n: usize) {
         if self.nfree() < n {
-            self.settle();
+            self.settle_data();
         }
     }
 
@@ -536,9 +574,136 @@ impl<'a> Low<'a> {
         self.vs.push(Loc::Reg(r));
     }
 
-    /// Write the virtual stack back to the canonical form (TOS in x0, the rest in
-    /// memory from DSP) and reset. Called before a Call and at the run's end.
+    // ── Floating-point virtual stack (parallel to the data stack) ────────────
+    fn ffree(&self) -> usize {
+        FPOOL.iter().filter(|&&r| !self.fused[r as usize]).count()
+    }
+    fn falloc(&mut self) -> u32 {
+        if self.ffree() == 0 {
+            self.fsettle();
+        }
+        let r = *FPOOL.iter().find(|&&r| !self.fused[r as usize]).expect("falloc");
+        self.fused[r as usize] = true;
+        r
+    }
+    /// A free GP register for materializing a float constant (settling the data
+    /// window if the GP pool is full — FP code rarely holds a deep data window).
+    fn gp_temp(&mut self) -> u32 {
+        if self.nfree() == 0 {
+            self.settle_data();
+        }
+        let r = *POOL.iter().find(|&&r| !self.used[r as usize]).expect("gp_temp");
+        self.used[r as usize] = true;
+        r
+    }
+    fn fensure(&mut self, n: usize) {
+        while self.fvs.len() < n {
+            let r = self.falloc();
+            self.out.push(fldr_off(r, FSP, (self.fconsumed * 8) as u32));
+            self.fconsumed += 1;
+            self.fvs.insert(0, r);
+        }
+    }
+    fn flit(&mut self, bits: i64) {
+        let g = self.gp_temp();
+        load_imm64(g, bits as u64, self.out);
+        let d = self.falloc();
+        self.out.push(fmov_dx(d, g)); // d = bits reinterpreted as double
+        self.used[g as usize] = false;
+        self.fvs.push(d);
+    }
+    fn fbin(&mut self, op: FBin) {
+        self.fensure(2);
+        let b = self.fvs.pop().unwrap();
+        let a = self.fvs.pop().unwrap();
+        self.out.push(match op {
+            FBin::Add => fadd(a, a, b),
+            FBin::Sub => fsub(a, a, b), // a - b
+            FBin::Mul => fmul(a, a, b),
+            FBin::Div => fdiv(a, a, b), // a / b
+        });
+        self.fused[b as usize] = false;
+        self.fvs.push(a);
+    }
+    fn fun(&mut self, op: FUn) {
+        self.fensure(1);
+        let a = *self.fvs.last().unwrap();
+        self.out.push(match op {
+            FUn::Neg => fneg(a, a),
+            FUn::Sqrt => fsqrt(a, a),
+            FUn::Abs => fabs(a, a),
+        });
+    }
+    fn fstk(&mut self, s: Stk) {
+        match s {
+            Stk::Dup => {
+                self.fensure(1);
+                let top = *self.fvs.last().unwrap();
+                let d = self.falloc();
+                self.out.push(fmov_dd(d, top));
+                self.fvs.push(d);
+            }
+            Stk::Drop => {
+                self.fensure(1);
+                let r = self.fvs.pop().unwrap();
+                self.fused[r as usize] = false;
+            }
+            Stk::Swap => {
+                self.fensure(2);
+                let n = self.fvs.len();
+                self.fvs.swap(n - 1, n - 2);
+            }
+            Stk::Over => {
+                self.fensure(2);
+                let n = self.fvs.len();
+                let u = self.fvs[n - 2];
+                let d = self.falloc();
+                self.out.push(fmov_dd(d, u));
+                self.fvs.push(d);
+            }
+            _ => {} // other motions unused for FP
+        }
+    }
+    /// Write the FP virtual stack back to canonical form (FTOS in d8, the rest in
+    /// memory from FSP) and reset.
+    fn fsettle(&mut self) {
+        if self.fvs.is_empty() {
+            self.fensure(1);
+        }
+        let l = self.fvs.len();
+        let delta = self.fconsumed - (l as i64 - 1);
+        if delta > 0 {
+            self.out.push(add_imm(FSP, FSP, (delta * 8) as u32));
+        } else if delta < 0 {
+            self.out.push(sub_imm(FSP, FSP, ((-delta) * 8) as u32));
+        }
+        for i in 0..l - 1 {
+            let off = ((l - 2 - i) as u32) * 8;
+            self.out.push(fstr_off(self.fvs[i], FSP, off));
+            self.fused[self.fvs[i] as usize] = false;
+        }
+        let top = self.fvs[l - 1];
+        if top != FTOS {
+            self.out.push(fmov_dd(FTOS, top));
+            self.fused[top as usize] = false;
+        }
+        self.fvs.clear();
+        self.fvs.push(FTOS);
+        self.fused = [false; 32];
+        self.fused[FTOS as usize] = true;
+        self.fconsumed = 0;
+    }
+
+    /// Settle both the data and FP windows to canonical form (before a Call and at
+    /// the run's end).
     fn settle(&mut self) {
+        self.settle_data();
+        self.fsettle();
+    }
+
+    /// Write the data virtual stack back to the canonical form (TOS in x0, the rest
+    /// in memory from DSP) and reset.
+    fn settle_data(&mut self) {
         if self.vs.is_empty() {
             self.ensure(1); // materialize a TOS from entry memory
         }
@@ -646,6 +811,10 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>) {
             Tok::SelfPush => low.self_push(),
             Tok::PickN(n) => low.pick_n(n),
             Tok::RollN(n) => low.roll_n(n),
+            Tok::FLit(bits) => low.flit(bits),
+            Tok::FBin(op) => low.fbin(op),
+            Tok::FUn(op) => low.fun(op),
+            Tok::FStk(s) => low.fstk(s),
             Tok::Call(xt) => {
                 low.settle();
                 emit_call(xt, low.out);

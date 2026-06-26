@@ -231,6 +231,14 @@ pub fn fdiv(rd: u32, rn: u32, rm: u32) -> u32 {
 pub fn fneg(rd: u32, rn: u32) -> u32 {
     0x1E61_4000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
 }
+/// `fabs Dd, Dn`.
+pub fn fabs(rd: u32, rn: u32) -> u32 {
+    0x1E60_C000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `fsqrt Dd, Dn`.
+pub fn fsqrt(rd: u32, rn: u32) -> u32 {
+    0x1E61_C000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
 /// `fmov Dd, Dn`.
 pub fn fmov_dd(rd: u32, rn: u32) -> u32 {
     0x1E60_4000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
@@ -258,6 +266,14 @@ pub fn fldr0(rt: u32, rn: u32) -> u32 {
 /// `str Dt, [Xn]`.
 pub fn fstr0(rt: u32, rn: u32) -> u32 {
     0xFD00_0000 | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+/// `ldr Dt, [Xn, #off]`  (unsigned scaled; off must be a multiple of 8).
+pub fn fldr_off(rt: u32, rn: u32, off: u32) -> u32 {
+    0xFD40_0000 | ((off / 8) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+}
+/// `str Dt, [Xn, #off]`  (unsigned scaled; off must be a multiple of 8).
+pub fn fstr_off(rt: u32, rn: u32, off: u32) -> u32 {
+    0xFD00_0000 | ((off / 8) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
 }
 
 // AArch64 condition codes.
@@ -353,6 +369,8 @@ mod cf_tests {
         assert_eq!(vec![fmul(8, 8, 9)], asm("fmul d8, d8, d9"));
         assert_eq!(vec![fdiv(8, 9, 8)], asm("fdiv d8, d9, d8"));
         assert_eq!(vec![fneg(8, 8)], asm("fneg d8, d8"));
+        assert_eq!(vec![fabs(8, 8)], asm("fabs d8, d8"));
+        assert_eq!(vec![fsqrt(8, 8)], asm("fsqrt d8, d8"));
         assert_eq!(vec![fmov_dd(0, 8)], asm("fmov d0, d8"));
         assert_eq!(vec![fmov_dx(8, 0)], asm("fmov d8, x0"));
         assert_eq!(vec![fmov_xd(0, 8)], asm("fmov x0, d8"));
@@ -360,6 +378,8 @@ mod cf_tests {
         assert_eq!(vec![fstr_pre(8, 22, -8)], asm("str d8, [x22, #-8]!"));
         assert_eq!(vec![fldr0(9, 22)], asm("ldr d9, [x22]"));
         assert_eq!(vec![fstr0(8, 22)], asm("str d8, [x22]"));
+        assert_eq!(vec![fldr_off(9, 22, 16)], asm("ldr d9, [x22, #16]"));
+        assert_eq!(vec![fstr_off(8, 22, 24)], asm("str d8, [x22, #24]"));
     }
 }
 

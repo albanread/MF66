@@ -862,10 +862,8 @@ impl Mf66Session {
                 None => {
                     let f = parse_forth_float(tok)
                         .ok_or_else(|| anyhow::anyhow!("undefined word: {tok}"))?;
-                    let flit = self.xt_of("flit")?;
-                    let def = self.pending.as_mut().unwrap();
-                    def.toks.push(Tok::Lit(f.to_bits() as i64)); // bits …
-                    def.toks.push(Tok::Call(flit)); // … then flit → float stack
+                    // FLit pushes onto the optimizer's FP virtual stack directly.
+                    self.pending.as_mut().unwrap().toks.push(Tok::FLit(f.to_bits() as i64));
                 }
             },
         }
@@ -901,6 +899,18 @@ impl Mf66Session {
             ("rot_word", &[Tok::Stk(Rot)]),
             ("minus_rot_word", &[Tok::Stk(MinusRot)]),
             ("tuck_word", &[Tok::Stk(Tuck)]),
+            // Floating point — modeled in the FP virtual stack.
+            ("f_plus", &[Tok::FBin(crate::opt::FBin::Add)]),
+            ("f_minus", &[Tok::FBin(crate::opt::FBin::Sub)]),
+            ("f_times", &[Tok::FBin(crate::opt::FBin::Mul)]),
+            ("f_slash", &[Tok::FBin(crate::opt::FBin::Div)]),
+            ("f_negate", &[Tok::FUn(crate::opt::FUn::Neg)]),
+            ("fsqrt_word", &[Tok::FUn(crate::opt::FUn::Sqrt)]),
+            ("fabs_word", &[Tok::FUn(crate::opt::FUn::Abs)]),
+            ("fdup", &[Tok::FStk(Dup)]),
+            ("fdrop", &[Tok::FStk(Drop)]),
+            ("fswap", &[Tok::FStk(Swap)]),
+            ("fover", &[Tok::FStk(Over)]),
             ("equal", &[Tok::Cmp(Eq)]),
             ("not_equal", &[Tok::Cmp(Ne)]),
             ("less", &[Tok::Cmp(Lt)]),
