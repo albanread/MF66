@@ -29,18 +29,38 @@
 @define FSP  x22
 @define FTOS d8
 
-; ── User-area layout (offsets from UP) — minimal Phase 1 subset ──────────
-@assign user_HOST_RSP    = 0x00      ; host sp stashed on forth_main entry
-@assign user_DSP_SAVE    = 0x08      ; final logical DSP written on exit
-@assign user_SP0         = 0x10      ; initial DSP at boot (= dsp_top); for `depth`
-@assign user_RSP_CURRENT = 0x18      ; forth's return-stack sp across forth_main calls
-@assign user_LP0         = 0x20      ; initial locals pointer (top of locals region)
-@assign user_FTOS_SAVE   = 0x28      ; FTOS (d8) parked across forth_main boundaries
-@assign user_BASE        = 0x30      ; numeric base (Phase 2)
-@assign user_STATE       = 0x38      ; interpret/compile (Phase 2)
-@assign user_LATEST      = 0x40      ; dictionary chain head (Phase 2)
-@assign user_HERE        = 0x48      ; dict bump pointer (Phase 2)
-@assign user_PAD         = 0x800     ; scratch region (tests/corpus harness)
+; ── User-area layout (offsets from UP) — adopted from WF66 kernel/macros.masm ──
+; The Forth-visible variables sit at low offsets; the forth_main save-slots are
+; higher; PAD is at 0x100. Some corpus tests assume these exact offsets (e.g.
+; `push_pad -0x100` to reach BASE at 0x00), and the interpreter (Phase 2) needs
+; STATE/LATEST/HERE/SOURCE_*/>IN, so MF66 mirrors WF66's layout exactly.
+@assign user_BASE        = 0x00      ; numeric base (10 default)
+@assign user_STATE       = 0x08      ; 0 = interpret, 1 = compile
+@assign user_LATEST      = 0x10      ; head of dictionary chain
+@assign user_HERE        = 0x18      ; bump pointer into dict heap
+@assign user_DICT_END    = 0x20      ; high limit of dict heap
+@assign user_SOURCE_ID   = 0x28      ; -1 = evaluate, 0 = stdin, n = file
+@assign user_SOURCE_ADDR = 0x30      ; pointer to source text
+@assign user_SOURCE_LEN  = 0x38      ; length of source text
+@assign user_TO_IN       = 0x40      ; current parse offset (>IN)
+@assign user_PARSE_BARRIER = 0x48    ; one-shot minimum >IN after restore-input
+@assign user_BYE_REQ     = 0x50      ; `bye` writes 1 here; quit checks cooperatively
+@assign user_HOST_RSP    = 0x58      ; forth_main stashes host sp here on entry
+@assign user_DSP_SAVE    = 0x60      ; forth_main writes final logical_dsp here on exit
+@assign user_SP0         = 0x68      ; initial DSP at boot (= dsp_top); read by `depth`
+@assign user_RSP_CURRENT = 0x70      ; forth's return-stack sp across forth_main calls
+@assign user_LATESTXT    = 0x78      ; xt of the most recently created/updated definition
+@assign user_HANDLER     = 0x80      ; catch/throw handler chain head on the rstack
+@assign user_THROW_CODE  = 0x88      ; uncaught THROW code returned to the host
+@assign user_ROOT_HANDLER= 0x90      ; 3-cell synthetic root handler frame
+@assign user_PAD         = 0x100     ; 256 bytes of scratch (corpus harness)
+@assign user_SOURCE_BUF  = 0x200     ; 4 KB line buffer
+@assign user_FP0         = 0x1210    ; empty floating-point stack pointer
+@assign user_FSP         = 0x1218    ; current floating-point stack pointer
+@assign user_FTOS_SAVE   = 0x1228    ; FTOS (d8) parked across forth_main boundaries
+@assign user_FP_STACK    = 0x1300    ; 256-byte floating-point stack area
+@assign user_WORD_BUF    = 0x1400    ; 256-byte transient counted-string buffer for WORD
+@assign user_LP0         = 0x15B0    ; initial locals-stack pointer (high end of LP region)
 
 ; ── proc/endp/next — the shape of a primitive ───────────────────────────
 ; proc(name): open a scope (so .local labels mangle uniquely), export the

@@ -20,17 +20,16 @@ const RSTACK_TOP: usize = 0x0010_0000; // return stack: 0x80000..0x100000, grows
 const USER_BASE: usize = 0x0010_0000; // user area: 0x100000..0x180000
 const LOCALS_TOP: usize = 0x0020_0000; // locals: 0x180000..0x200000, grows down
 
-// ── User-area offsets (must match kernel/macros.masm) ────────────────────
-const USER_HOST_RSP: usize = 0x00;
-const USER_DSP_SAVE: usize = 0x08;
-const USER_SP0: usize = 0x10;
-const USER_RSP_CURRENT: usize = 0x18;
-const USER_LP0: usize = 0x20;
-const USER_FTOS_SAVE: usize = 0x28;
-/// Scratch region inside the user area for memory/string-primitive tests
-/// (`push_pad`/`poke`/`expect_bytes`). Sits above the user-variable table with
-/// headroom for the full Phase 2+ table below it.
-const USER_PAD: u64 = 0x800;
+// ── User-area offsets (must match kernel/macros.masm, adopted from WF66) ──
+const UVAR_BASE: usize = 0x00; // the `base` numeric-base variable
+const USER_HOST_RSP: usize = 0x58;
+const USER_DSP_SAVE: usize = 0x60;
+const USER_SP0: usize = 0x68;
+const USER_RSP_CURRENT: usize = 0x70;
+const USER_LP0: usize = 0x15B0;
+const USER_FTOS_SAVE: usize = 0x1228;
+/// Scratch region inside the user area (`push_pad`/`poke`/`expect_bytes`).
+const USER_PAD: u64 = 0x100;
 
 const CELL: usize = 8;
 
@@ -107,6 +106,7 @@ impl Mf66Session {
         s.write_user(USER_FTOS_SAVE, 0);
         s.write_user(USER_HOST_RSP, 0);
         s.write_user(USER_DSP_SAVE, dstack_top);
+        s.write_user(UVAR_BASE, 10); // decimal default
         Ok(s)
     }
 
@@ -150,10 +150,12 @@ impl Mf66Session {
         Ok(())
     }
 
-    /// Clear the data stack (Phase 1 reset).
+    /// Clear the data stack and restore post-boot defaults.
     pub fn reset(&mut self) {
         self.current_dsp = self.dstack_top;
         self.write_user(USER_DSP_SAVE, self.dstack_top);
+        self.write_user(USER_RSP_CURRENT, self.rstack_top);
+        self.write_user(UVAR_BASE, 10);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────
