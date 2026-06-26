@@ -348,6 +348,45 @@ impl<'a> Low<'a> {
     }
 }
 
+/// Fused comparison for a `Cmp` immediately followed by `if`/`until`/`while`:
+/// consumes the operand(s) (canonical stack: TOS=x0, NOS=[DSP]), sets the CPU
+/// flags, and returns the condition code that holds iff the Forth comparison is
+/// TRUE — no `-1/0` flag is materialized. The caller branches on the inverse
+/// (false → branch). Assumes the rest of the run was already settled.
+pub fn fused_cmp(c: Cmp, out: &mut Vec<u32>) -> u32 {
+    const T: u32 = 9;
+    match c {
+        Cmp::ZEq | Cmp::ZNe | Cmp::ZLt | Cmp::ZGt => {
+            out.push(cmp_imm(TOS, 0));
+            out.push(ldr_post(TOS, DSP, 8)); // drop n, raise NOS into TOS
+            match c {
+                Cmp::ZEq => EQ,
+                Cmp::ZNe => NE,
+                Cmp::ZLt => LT,
+                Cmp::ZGt => GT,
+                _ => unreachable!(),
+            }
+        }
+        _ => {
+            out.push(ldr_post(T, DSP, 8)); // x9 = NOS (a)
+            let (rn, rm, ctrue) = match c {
+                Cmp::Eq => (TOS, T, EQ),
+                Cmp::Ne => (TOS, T, NE),
+                Cmp::Lt => (T, TOS, LT), // a < b
+                Cmp::Gt => (T, TOS, GT),
+                Cmp::Le => (T, TOS, LE),
+                Cmp::Ge => (T, TOS, GE),
+                Cmp::ULt => (T, TOS, LO),
+                Cmp::UGt => (T, TOS, HI),
+                _ => unreachable!(),
+            };
+            out.push(cmp_reg(rn, rm));
+            out.push(ldr_post(TOS, DSP, 8)); // drop b, raise next into TOS
+            ctrue
+        }
+    }
+}
+
 /// Lower one reduced token run to AArch64 with register windowing (appended to
 /// `out`). Settles before each call and at the end so the canonical TOS=x0 /
 /// rest-in-memory form holds at every window boundary.

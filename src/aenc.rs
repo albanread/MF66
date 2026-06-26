@@ -87,6 +87,15 @@ pub fn cbz(rt: u32, off: i32) -> u32 {
 pub fn b(off: i32) -> u32 {
     0x1400_0000 | ((off as u32) & 0x03FF_FFFF)
 }
+/// `b.<cond> off`  — conditional branch; `off` is a signed instruction count.
+pub fn bcond(cond: u32, off: i32) -> u32 {
+    0x5400_0000 | (((off as u32) & 0x7FFFF) << 5) | (cond & 0xF)
+}
+/// Patch a previously-emitted `b.<cond>` (keeping its condition) to `target`.
+pub fn patch_bcond(out: &mut [u32], at: usize, target: usize) {
+    let cond = out[at] & 0xF;
+    out[at] = bcond(cond, target as i32 - at as i32);
+}
 
 /// `ldr Xt, [Xn, #imm]`  (unsigned scaled offset; imm is bytes, must be /8).
 pub fn ldr_off(rt: u32, rn: u32, imm: u32) -> u32 {
@@ -253,6 +262,8 @@ mod cf_tests {
         assert_eq!(asm("b .L\nnop\n.L:")[0], b(2));
         // backward (negative) offset
         assert_eq!(asm(".L:\nnop\nb .L")[1], b(-1));
+        assert_eq!(asm("b.ge .L\nnop\n.L:")[0], bcond(GE, 2));
+        assert_eq!(asm("b.eq .L\nnop\n.L:")[0], bcond(EQ, 2));
     }
 
     #[test]

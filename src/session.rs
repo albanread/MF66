@@ -93,10 +93,11 @@ struct ColonDef {
 
 /// A pending control-flow mark (compile time).
 enum Cf {
-    FwdCbz(usize), // a forward `cbz` to patch (if / while)
-    FwdB(usize),   // a forward `b` to patch (else)
-    Begin(usize),  // a backward target word index (begin)
-    Do(usize),     // a DO-loop body top (loop / +loop branch back here)
+    FwdCbz(usize),   // a forward `cbz` to patch (if / while)
+    FwdBcond(usize), // a forward `b.<cond>` to patch (fused cmp + if / while)
+    FwdB(usize),     // a forward `b` to patch (else)
+    Begin(usize),    // a backward target word index (begin)
+    Do(usize),       // a DO-loop body top (loop / +loop branch back here)
 }
 
 impl Mf66Session {
@@ -358,6 +359,15 @@ impl Mf66Session {
     /// else a call if it's a word, else a literal if it's a number.
     fn compile_token(&mut self, tok: &str) -> Result<()> {
         let lk = tok.to_ascii_lowercase();
+        // cmp-branch fusion: a comparison immediately before if/until/while folds
+        // into one cmp + b.<cond> (no -1/0 flag materialized).
+        if matches!(lk.as_str(), "if" | "until" | "while") {
+            if let Some(Tok::Cmp(c)) = self.pending.as_ref().and_then(|d| d.toks.last()).copied() {
+                self.pending.as_mut().unwrap().toks.pop(); // detach the cmp
+                self.flush_toks(); // lower the rest of the run
+                return self.compile_control_fused(&lk, c);
+            }
+        }
         if matches!(
             lk.as_str(),
             "if" | "else" | "then" | "begin" | "until" | "while" | "repeat" | "do" | "loop" | "+loop"
@@ -448,7 +458,7 @@ impl Mf66Session {
     /// pending definition's body + control-flow stack; branch offsets are
     /// word-relative. `if`/`while` consume the TOS flag (false → branch).
     fn compile_control(&mut self, tok: &str) -> Result<()> {
-        use crate::aenc::{b, emit_flag_test_cbz, patch_b, patch_cbz};
+        use crate::aenc::{b, emit_flag_test_cbz, patch_b, patch_bcond, patch_cbz};
         let def = self.pending.as_mut().expect("control word outside a definition");
         match tok {
             "if" => {
@@ -461,6 +471,7 @@ impl Mf66Session {
                 let here = def.body.len();
                 match def.cf.pop() {
                     Some(Cf::FwdCbz(i)) => patch_cbz(&mut def.body, i, here),
+                    Some(Cf::FwdBcond(i)) => patch_bcond(&mut def.body, i, here),
                     _ => anyhow::bail!("`else` without `if`"),
                 }
                 def.cf.push(Cf::FwdB(bidx));
@@ -469,6 +480,7 @@ impl Mf66Session {
                 let here = def.body.len();
                 match def.cf.pop() {
                     Some(Cf::FwdCbz(i)) => patch_cbz(&mut def.body, i, here),
+                    Some(Cf::FwdBcond(i)) => patch_bcond(&mut def.body, i, here),
                     Some(Cf::FwdB(i)) => patch_b(&mut def.body, i, here),
                     _ => anyhow::bail!("`then` without `if`/`else`"),
                 }
@@ -486,10 +498,7 @@ impl Mf66Session {
                 def.cf.push(Cf::FwdCbz(i));
             }
             "repeat" => {
-                let wcbz = match def.cf.pop() {
-                    Some(Cf::FwdCbz(i)) => i,
-                    _ => anyhow::bail!("`repeat` without `while`"),
-                };
+                let wbranch = def.cf.pop();
                 let target = match def.cf.pop() {
                     Some(Cf::Begin(t)) => t,
                     _ => anyhow::bail!("`repeat` without `begin`"),
@@ -498,7 +507,11 @@ impl Mf66Session {
                 def.body.push(b(0));
                 patch_b(&mut def.body, bidx, target); // branch back to begin
                 let here = def.body.len();
-                patch_cbz(&mut def.body, wcbz, here); // while's exit → after repeat
+                match wbranch {
+                    Some(Cf::FwdCbz(i)) => patch_cbz(&mut def.body, i, here),
+                    Some(Cf::FwdBcond(i)) => patch_bcond(&mut def.body, i, here),
+                    _ => anyhow::bail!("`repeat` without `while`"),
+                }
             }
             "do" => {
                 crate::aenc::emit_do(&mut def.body);
@@ -517,6 +530,36 @@ impl Mf66Session {
                     _ => anyhow::bail!("`+loop` without `do`"),
                 };
                 crate::aenc::emit_plus_loop(&mut def.body, top);
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    /// Fused comparison + control test (cmp-branch fusion): emit the comparison
+    /// (consuming its operands), then a single `b.<cond>` on the inverse so the
+    /// branch is taken when the Forth test is false — no `-1/0` flag in between.
+    fn compile_control_fused(&mut self, tok: &str, c: crate::opt::Cmp) -> Result<()> {
+        use crate::aenc::{bcond, patch_bcond};
+        let ctrue = {
+            let def = self.pending.as_mut().unwrap();
+            crate::opt::fused_cmp(c, &mut def.body)
+        };
+        let binv = ctrue ^ 1; // branch when the comparison is FALSE
+        let def = self.pending.as_mut().unwrap();
+        match tok {
+            "if" | "while" => {
+                let i = def.body.len();
+                def.body.push(bcond(binv, 0));
+                def.cf.push(Cf::FwdBcond(i));
+            }
+            "until" => {
+                let i = def.body.len();
+                def.body.push(bcond(binv, 0));
+                match def.cf.pop() {
+                    Some(Cf::Begin(t)) => patch_bcond(&mut def.body, i, t),
+                    _ => anyhow::bail!("`until` without `begin`"),
+                }
             }
             _ => unreachable!(),
         }
