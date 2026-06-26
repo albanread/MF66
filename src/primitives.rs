@@ -204,4 +204,8 @@ pub const PRIMITIVES: &[(&str, &str, bool)] = &[
     ("f.", "f_dot", false),
     ("number?", "number_q", false),
     ("execute", "execute", false),
+    // Exceptions (MF66 exceptions.masm)
+    ("catch", "catch_word", false),
+    ("throw", "throw_word", false),
+    ("abort", "abort_word", false),
 ];

@@ -1,0 +1,68 @@
+; MF66 kernel — exception handling (catch / throw), AArch64 port of WF66's
+; kernel/execute.masm catch_word/throw_word.
+;
+; The handler frame lives on the Forth return stack (RP=x28). On x86 WF66 keeps
+; only [saved_DSP, old_handler] because `call catch` already left catch's return
+; address on rsp; on AArch64 `bl`/`blr` writes x30 (LR), so catch's own return
+; address is NOT on RP — we save it in the frame too. Both the normal-return and
+; the throw paths then `ret` through x30 = catch's caller, so a throw unwinds
+; every intervening colon frame in one step (RP := HANDLER) just like WF66.
+;
+; Frame layout on RP (RP points at the lowest, [RP] = saved DSP):
+;   [RP + 0 ] = saved DSP
+;   [RP + 8 ] = previous HANDLER
+;   [RP + 16] = catch's return address (x30 at entry)
+
+; catch  ( i*x xt -- j*x 0 | i*x n )
+;     Execute xt under a fresh handler. Normal completion appends 0; a THROW
+;     inside xt unwinds here, restoring DSP and yielding the throw code n.
+proc(catch_word)
+    mov     x9, TOS                     ; x9 = xt
+    ldr     x10, [UP, #user_HANDLER]    ; previous handler
+    str     x30, [RP, #-cell]!          ; frame[2]: catch's return address
+    str     x10, [RP, #-cell]!          ; frame[1]: previous handler
+    str     DSP, [RP, #-cell]!          ; frame[0]: saved DSP
+    str     RP, [UP, #user_HANDLER]     ; HANDLER = RP (frame top)
+
+    ldr     TOS, [DSP]                  ; drop xt (raise NOS into TOS)
+    add     DSP, DSP, #cell
+
+    blr     x9                          ; execute xt
+
+    ; Normal return: push a 0 throw code, restore the handler, discard the frame.
+    str     TOS, [DSP, #-cell]!         ; spill xt's top result (make room for 0)
+    mov     TOS, #0                     ; exc# = 0
+    ldr     x10, [RP, #8]               ; previous handler
+    str     x10, [UP, #user_HANDLER]
+    ldr     x30, [RP, #16]              ; catch's return address
+    add     RP, RP, #24                 ; discard the handler frame
+    ret
+endp()
+
+; throw  ( n -- )
+;     Zero is a no-op (just drops n). Non-zero unwinds the return stack to the
+;     current handler frame, restores DSP and the previous handler, and returns
+;     directly to the caller outside that catch — with n left on the stack.
+proc(throw_word)
+    cbz     TOS, .zero
+
+    ldr     RP, [UP, #user_HANDLER]     ; unwind RP to the handler frame
+    ldr     DSP, [RP]                   ; restore saved DSP
+    ldr     x10, [RP, #8]               ; previous handler
+    str     x10, [UP, #user_HANDLER]
+    ldr     x30, [RP, #16]              ; catch's return address
+    add     RP, RP, #24                 ; discard the handler frame
+    ret                                 ; return to catch's caller, TOS = n
+
+.zero:
+    ldr     TOS, [DSP]                  ; drop the 0
+    stk(1, 0)
+    next()
+endp()
+
+; abort  ( i*x -- )   THROW -1
+proc(abort_word)
+    mov     TOS, #-1
+    bl      throw_word
+    next()                              ; unreachable when a handler is active
+endp()

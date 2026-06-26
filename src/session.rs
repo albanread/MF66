@@ -39,6 +39,7 @@ const USER_HOST_RSP: usize = 0x58;
 const USER_DSP_SAVE: usize = 0x60;
 const USER_SP0: usize = 0x68;
 const USER_RSP_CURRENT: usize = 0x70;
+const USER_HANDLER: usize = 0x80;
 const USER_LP0: usize = 0x15B0;
 const USER_FP0: usize = 0x1210;
 const USER_FSP: usize = 0x1218;
@@ -166,6 +167,7 @@ impl Mf66Session {
         s.write_user(USER_FTOS_SAVE, 0);
         s.write_user(USER_FP0, base + FP_STACK_TOP as u64);
         s.write_user(USER_FSP, base + FP_STACK_TOP as u64);
+        s.write_user(USER_HANDLER, 0); // no active catch handler
         s.write_user(USER_HOST_RSP, 0);
         s.write_user(USER_DSP_SAVE, dstack_top);
         s.write_user(UVAR_BASE, 10); // decimal default
@@ -295,6 +297,21 @@ impl Mf66Session {
                 continue;
             }
             let lk = tok.to_ascii_lowercase(); // Forth is case-insensitive
+            // ' / ['] name — push (interpret) or compile (literal) the word's xt.
+            if lk == "'" || lk == "[']" {
+                let name = tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("`{tok}` needs a name"))?;
+                let xt = self
+                    .xt_of_forth_name(name)?
+                    .ok_or_else(|| anyhow::anyhow!("undefined word: {name}"))?;
+                if self.pending.is_some() {
+                    self.pending.as_mut().unwrap().toks.push(Tok::Lit(xt as i64));
+                } else {
+                    self.push(xt as i64);
+                }
+                continue;
+            }
             if self.pending.is_some() {
                 if lk == ";" {
                     self.finish_colon()?;
