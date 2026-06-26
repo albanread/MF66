@@ -200,10 +200,16 @@ region}` in one ±128 MB span (calls = `bl`; data addresses = `adrp+add`).
 
 1. **Layout** — add the full dict/overlay/user-var block to `kernel/macros.masm`
    (header `dh_*`, overlay `dn_*`, `wl_*`, `tfa_*`, the dict user vars), byte-identical.
+   **✅ DONE** (`kernel/macros.masm`: dict user vars + `dh_*`/`dn_*`/`wl_*`/`tfa_*`
+   + the branchless `foldup` ASCII-fold macro).
 2. **Find/hash** — `init_dictionary_overlay`, `publish_header_overlay` (FNV-1a),
    `search_header_in_wordlist`/`_in_order`, `find_name`. Testable: build a couple
-   headers, `find` them.
-3. **Construction** — `create`, `publish_primitive`, `set_xt`/`set_comp`/`set_flags`,
+   headers, `find` them. **✅ DONE** (`kernel/dict.masm` + a header-only `(create)`;
+   `Mf66Session` boots the overlay, `create_word`/`find` helpers; `tests/dict.rs`
+   — create→find, case-insensitive, collisions, nt counted-name, redefinition
+   shadowing, 6 green; FNV-1a uses 32-bit `mul w`, byte-identical to WF66).
+3. **Construction** — `create` (header-only ✅; CREATE-stub/`>body`/`forget`
+   deferred), `publish_primitive`, `set_xt`/`set_comp`/`set_flags`,
    the navigation words (`>ct`/`>comp`/`>name`/`name>interpret`/`name>compile`/`tfa@`),
    `wordlist`/search-order words. (`forget_last`, the CREATE stub, and `>body` come
    with control-flow/CREATE — defer the stub-bearing parts until needed.)

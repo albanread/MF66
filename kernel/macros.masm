@@ -67,7 +67,61 @@
 @assign user_FTOS_SAVE   = 0x1228    ; FTOS (d8) parked across forth_main boundaries
 @assign user_FP_STACK    = 0x1300    ; 256-byte floating-point stack area
 @assign user_WORD_BUF    = 0x1400    ; 256-byte transient counted-string buffer for WORD
+@assign user_FORGET_FENCE= 0x98      ; newest header that must not be forgotten
 @assign user_LP0         = 0x15B0    ; initial locals-stack pointer (high end of LP region)
+@assign user_CURRENT     = 0x1500    ; wid receiving new definitions
+@assign user_FORTH_WID   = 0x1508    ; built-in FORTH wordlist
+@assign user_ORDER_COUNT = 0x1510    ; active entries in the search order
+@assign user_INDEX_HERE  = 0x1518    ; overlay/wordlist arena bump pointer (grows DOWN)
+@assign user_INDEX_LATEST= 0x1520    ; newest overlay node (creation-order chain, for forget)
+@assign user_CONTEXT     = 0x1528    ; search order array (16 wids), CONTEXT[0] first
+@assign user_TOOLS_WID   = 0x17C8    ; wid of the TOOLS wordlist
+@assign user_PRIVATE_WID = 0x17D0    ; wid of the PRIVATE wordlist
+@assign user_VAR_HERE    = 0x1820    ; RW/no-exec data-space bump pointer (grows UP)
+@assign user_VAR_LIMIT   = 0x1828    ; high limit of data space
+
+; ── Dictionary header layout (dh_*) — BYTE-IDENTICAL to WF66 (cell=8) ────
+; Base = address in LATEST and in each dh_link. nt = base+dh_nt; xt = dh_xtptr.
+@assign dh_link   = 0                 ; prev header (LATEST chain)
+@assign dh_ct     = 8                 ; compile-mode action: compile_word | execute (IMMEDIATE)
+@assign dh_xtptr  = 16                ; runtime xt (code entry / colon body start)
+@assign dh_comp   = 24                ; compile emitter: compile_comma | inline_* | fold_*
+@assign dh_rec    = 32                ; reserved
+@assign dh_vfa    = 40                ; reserved (u16)
+@assign dh_ofa    = 42                ; inline body length (u16; 0 = not inlinable)
+@assign dh_stk    = 44                ; stack effect (u16; reserved)
+@assign dh_tfa    = 46                ; word type (u8): 0 prim, 0x82 col, 0x91 cre, 0x93 ivar
+@assign dh_nt     = 47                ; name length byte (the name token nt = base+dh_nt)
+@assign dh_name   = 48                ; first name char
+
+@assign tfa_tcol  = 0x82              ; colon definition
+@assign tfa_tcre  = 0x91             ; CREATE-family (has a body)
+@assign tfa_tivar = 0x93             ; value-property ivar
+
+; ── Hash-overlay node (dn_*) + wordlist (wl_*) — BYTE-IDENTICAL ──────────
+@assign dn_bucket_next = 0            ; next node in this bucket (collision chain)
+@assign dn_global_prev = 8            ; previous node in creation order (forget LIFO)
+@assign dn_header      = 16           ; -> header base
+@assign dn_wid         = 24           ; owning wordlist
+@assign dn_hash        = 32           ; full 32-bit FNV-1a hash (u32)
+@assign dn_len         = 36           ; name length (u8)
+@assign dn_first       = 37           ; folded first char (u8)
+@assign dn_size        = 40
+
+@assign wl_bucket_count = 512
+@assign wl_bucket_mask  = 511        ; wl_bucket_count - 1 (low 9 bits)
+@assign wl_size         = 4096       ; wl_bucket_count * cell
+@assign search_order_max = 16
+
+; foldup(c, t) — ASCII upper-case fold of byte in w-reg `c`, using w-reg `t` as
+; scratch (branchless, label-free; matches WF66's `if a<=c<=z: c-=32`).
+@macro foldup(c, t)
+    sub     &t, &c, #0x61          ; c - 'a'
+    cmp     &t, #25
+    cset    &t, ls                 ; t = (c in a..z) ? 1 : 0
+    lsl     &t, &t, #5             ; t *= 32
+    sub     &c, &c, &t             ; c -= 32 if it was lower-case
+@endmacro
 
 ; ── proc/endp/next — the shape of a primitive ───────────────────────────
 ; proc(name): open a scope (so .local labels mangle uniquely), export the

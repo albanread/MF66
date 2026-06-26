@@ -14,14 +14,24 @@ use wfasm::native_macos::MacJit;
 use wfasm::Assembler;
 
 // ── Region layout (byte offsets within the allocation) ───────────────────
-const REGION_SIZE: usize = 4 * 1024 * 1024; // 4 MB
+const REGION_SIZE: usize = 8 * 1024 * 1024; // 8 MB
 const DSTACK_TOP: usize = 0x0008_0000; // data stack: 0..0x80000, grows down from here
 const RSTACK_TOP: usize = 0x0010_0000; // return stack: 0x80000..0x100000, grows down
 const USER_BASE: usize = 0x0010_0000; // user area: 0x100000..0x180000
 const LOCALS_TOP: usize = 0x0020_0000; // locals: 0x180000..0x200000, grows down
+const DICT_BASE: usize = 0x0020_0000; // dict code/header heap (HERE grows up)
+const DICT_TOP: usize = 0x0060_0000; // = DICT_END; index/overlay arena grows DOWN from here
+const VAR_BASE: usize = 0x0060_0000; // data bodies (VAR_HERE grows up)
+const VAR_TOP: usize = 0x0080_0000; // = VAR_LIMIT
 
 // ── User-area offsets (must match kernel/macros.masm, adopted from WF66) ──
 const UVAR_BASE: usize = 0x00; // the `base` numeric-base variable
+const USER_LATEST: usize = 0x10;
+const USER_HERE: usize = 0x18;
+const USER_DICT_END: usize = 0x20;
+const USER_LATESTXT: usize = 0x78;
+const USER_VAR_HERE: usize = 0x1820;
+const USER_VAR_LIMIT: usize = 0x1828;
 const USER_HOST_RSP: usize = 0x58;
 const USER_DSP_SAVE: usize = 0x60;
 const USER_SP0: usize = 0x68;
@@ -107,6 +117,16 @@ impl Mf66Session {
         s.write_user(USER_HOST_RSP, 0);
         s.write_user(USER_DSP_SAVE, dstack_top);
         s.write_user(UVAR_BASE, 10); // decimal default
+        // Dictionary heaps (empty): code/header heap grows up from DICT_BASE; the
+        // overlay arena grows down from DICT_END; data bodies grow up from VAR_BASE.
+        s.write_user(USER_LATEST, 0);
+        s.write_user(USER_LATESTXT, 0);
+        s.write_user(USER_HERE, base + DICT_BASE as u64);
+        s.write_user(USER_DICT_END, base + DICT_TOP as u64);
+        s.write_user(USER_VAR_HERE, base + VAR_BASE as u64);
+        s.write_user(USER_VAR_LIMIT, base + VAR_TOP as u64);
+        // Carve the FORTH wordlist + install the search order.
+        s.call("init_dictionary_overlay")?;
         Ok(s)
     }
 
@@ -148,6 +168,36 @@ impl Mf66Session {
         (self.forth_main)(xt, self.current_dsp, self.rstack_top, self.user_base);
         self.current_dsp = self.read_user(USER_DSP_SAVE);
         Ok(())
+    }
+
+    /// Write `name` into PAD and push (c-addr, u) for a dictionary primitive.
+    fn push_name(&mut self, name: &str) {
+        let pad = self.pad_base();
+        let bytes = name.as_bytes();
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pad as *mut u8, bytes.len()) };
+        self.push(pad as i64);
+        self.push(bytes.len() as i64);
+    }
+
+    /// Build a (header-only) dictionary entry for `name` via the kernel `(create)`.
+    pub fn create_word(&mut self, name: &str) -> Result<()> {
+        self.push_name(name);
+        self.call("create")
+    }
+
+    /// Look up `name` via the kernel `find-name`. Returns the name-token address
+    /// (`nt`) if found, else `None`. Clears the data stack afterward.
+    pub fn find(&mut self, name: &str) -> Result<Option<u64>> {
+        self.push_name(name);
+        self.call("find_name")?;
+        let s = self.stack(); // top-first: [-1, nt] if found, else [0, u, c-addr]
+        let result = if s.first() == Some(&-1) && s.len() >= 2 {
+            Some(s[1] as u64)
+        } else {
+            None
+        };
+        self.reset();
+        Ok(result)
     }
 
     /// Clear the data stack and restore post-boot defaults.

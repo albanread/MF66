@@ -1,3 +1,255 @@
+; MF66 kernel — dictionary: header construction, hash overlay & lookup.
+; Ported from WF66 kernel/dict.masm; layout is byte-identical (see
+; docs/design/mf66-dictionary.md). Two structures: the dh_link header chain and
+; a 512-bucket dn_* hash overlay (what find searches). Internal helpers use a
+; register convention (x9=addr/name, x10=len, x11=wid/header); Forth primitives
+; (find_name/create/init_dictionary_overlay) use TOS=x0/DSP=x19/UP=x20.
+;
+; The FNV-1a hash MUST stay byte-identical: 32-bit `mul w` (truncating), basis
+; 0x811C9DC5, prime 0x01000193, ASCII upper-fold (foldup). Forth true = -1.
+
+; init_dictionary_overlay  ( -- )   carve the FORTH wordlist (boot).
+proc(init_dictionary_overlay)
+    ldr     x9, [UP, #user_DICT_END]
+    str     x9, [UP, #user_INDEX_HERE]
+    str     xzr, [UP, #user_INDEX_LATEST]
+    str     xzr, [UP, #user_ORDER_COUNT]
+    mov     x10, #wl_size                 ; 4096 (movz)
+    sub     x9, x9, x10                   ; carve one wordlist down from INDEX_HERE
+    ldr     x11, [UP, #user_HERE]
+    cmp     x9, x11
+    b.ls    .ovf                          ; collided with the code/header heap
+    str     x9, [UP, #user_INDEX_HERE]
+    mov     x10, #0                       ; zero all 512 buckets
+.zl:
+    cmp     x10, #wl_bucket_count
+    b.hs    .zd
+    add     x11, x9, x10, lsl #3
+    str     xzr, [x11]
+    add     x10, x10, #1
+    b       .zl
+.zd:
+    str     x9, [UP, #user_FORTH_WID]
+    str     x9, [UP, #user_CURRENT]
+    str     x9, [UP, #user_CONTEXT]       ; CONTEXT[0] = FORTH wid
+    mov     x10, #1
+    str     x10, [UP, #user_ORDER_COUNT]
+    next()
+.ovf:
+    brk     #0x10                         ; TODO: throw -8 (dict overflow)
+endp()
+
+; publish_header_overlay  ( x9=name x10=len x11=header -> )  leaf, internal.
+; Hash the name, allocate a dn_* node (down from INDEX_HERE), link it into the
+; CURRENT wid's bucket + the global creation-order chain.
+proc(publish_header_overlay)
+    mov     w12, #0x9DC5
+    movk    w12, #0x811C, lsl #16         ; FNV basis
+    mov     w13, #0x0193
+    movk    w13, #0x0100, lsl #16         ; FNV prime
+    mov     x8, #0
+.hl:
+    cmp     x8, x10
+    b.hs    .hd
+    ldrb    w14, [x9, x8]
+    foldup(w14, w0)
+    cbnz    x8, .nf
+    mov     w15, w14                      ; first folded char
+.nf:
+    eor     w12, w12, w14
+    mul     w12, w12, w13
+    add     x8, x8, #1
+    b       .hl
+.hd:
+    ldr     x1, [UP, #user_INDEX_HERE]
+    sub     x1, x1, #dn_size              ; node = INDEX_HERE - dn_size
+    ldr     x2, [UP, #user_HERE]
+    cmp     x1, x2
+    b.ls    .ovf
+    str     x1, [UP, #user_INDEX_HERE]
+    ldr     x2, [UP, #user_CURRENT]       ; wid
+    and     x3, x12, #wl_bucket_mask
+    add     x3, x2, x3, lsl #3            ; &bucket
+    ldr     x4, [x3]                      ; old head
+    str     x4, [x1, #dn_bucket_next]
+    str     x1, [x3]                      ; bucket head = node
+    ldr     x4, [UP, #user_INDEX_LATEST]
+    str     x4, [x1, #dn_global_prev]
+    str     x1, [UP, #user_INDEX_LATEST]
+    str     x11, [x1, #dn_header]
+    str     x2,  [x1, #dn_wid]
+    str     w12, [x1, #dn_hash]
+    strb    w10, [x1, #dn_len]
+    strb    w15, [x1, #dn_first]
+    ret
+.ovf:
+    brk     #0x10                         ; TODO: throw -8
+endp()
+
+; search_header_in_wordlist  ( x9=addr x10=len x11=wid -> x0=header|0 )  leaf.
+proc(search_header_in_wordlist)
+    mov     x0, #0
+    cbz     x10, .ret                     ; len 0 -> not found
+    cmp     x10, #32
+    b.hi    .ret                          ; len > 32 -> not found
+    mov     w12, #0x9DC5
+    movk    w12, #0x811C, lsl #16
+    mov     w13, #0x0193
+    movk    w13, #0x0100, lsl #16
+    mov     x8, #0
+.hl:
+    cmp     x8, x10
+    b.hs    .hd
+    ldrb    w14, [x9, x8]
+    foldup(w14, w1)
+    cbnz    x8, .nf
+    mov     w15, w14
+.nf:
+    eor     w12, w12, w14
+    mul     w12, w12, w13
+    add     x8, x8, #1
+    b       .hl
+.hd:
+    and     x1, x12, #wl_bucket_mask
+    add     x1, x11, x1, lsl #3
+    ldr     x13, [x1]                     ; head node
+.scan:
+    cbz     x13, .ret
+    ldr     w1, [x13, #dn_hash]
+    cmp     w1, w12
+    b.ne    .next
+    ldrb    w1, [x13, #dn_len]
+    cmp     w1, w10
+    b.ne    .next
+    ldrb    w1, [x13, #dn_first]
+    cmp     w1, w15
+    b.ne    .next
+    ldr     x2, [x13, #dn_header]
+    add     x3, x2, #dh_name              ; header name chars
+    mov     x8, #0
+.cl:
+    cmp     x8, x10
+    b.hs    .match
+    ldrb    w4, [x9, x8]
+    foldup(w4, w5)
+    ldrb    w6, [x3, x8]
+    foldup(w6, w5)
+    cmp     w4, w6
+    b.ne    .next
+    add     x8, x8, #1
+    b       .cl
+.match:
+    mov     x0, x2
+    ret
+.next:
+    ldr     x13, [x13, #dn_bucket_next]
+    b       .scan
+.ret:
+    ret
+endp()
+
+; search_header_in_order  ( x9=addr x10=len -> x0=header|0 )  non-leaf.
+proc(search_header_in_order)
+    stp     x30, x25, [sp, #-32]!
+    stp     x26, x27, [sp, #16]
+    mov     x25, x9                       ; addr
+    mov     x26, x10                      ; len
+    mov     x27, #0                       ; counter
+.lo:
+    ldr     x8, [UP, #user_ORDER_COUNT]
+    cmp     x27, x8
+    b.hs    .nf
+    mov     x9, x25
+    mov     x10, x26
+    mov     x8, #user_CONTEXT             ; 0x1528 (movz)
+    add     x8, UP, x8
+    add     x8, x8, x27, lsl #3           ; &CONTEXT[counter]
+    ldr     x11, [x8]
+    bl      search_header_in_wordlist
+    cbnz    x0, .done
+    add     x27, x27, #1
+    b       .lo
+.nf:
+    mov     x0, #0
+.done:
+    ldp     x26, x27, [sp, #16]
+    ldp     x30, x25, [sp], #32
+    ret
+endp()
+
+; find-name  ( c-addr u -- nt -1 | c-addr u 0 )   search-order lookup.
+proc(find_name)
+    stp     x30, x0, [sp, #-16]!          ; save LR + u (TOS)
+    mov     x10, x0                       ; len = u
+    ldr     x9, [DSP]                     ; addr = c-addr (NOS)
+    bl      search_header_in_order
+    cbz     x0, .miss
+    add     x9, x0, #dh_nt                ; nt = header + dh_nt
+    str     x9, [DSP]                     ; NOS = nt
+    mov     x0, #-1                       ; TOS = -1 (found)
+    ldr     x30, [sp], #16
+    next()
+.miss:
+    ldr     x0, [sp, #8]                  ; recover u
+    str     x0, [DSP, #-cell]!            ; ( c-addr u -- c-addr u ? ) push u down
+    mov     x0, #0                        ; TOS = 0 (not found)
+    ldr     x30, [sp], #16
+    next()
+endp()
+
+; (create)  ( c-addr u -- )   build a header at HERE (header-only; the caller
+; sets the real xt). dh_ct/dh_comp are placeholders until the compiler exists.
+proc(create)
+    mov     x10, x0                       ; len
+    ldr     x9, [DSP]                     ; name addr
+    ldr     x11, [UP, #user_HERE]         ; header base
+    ldr     x12, [UP, #user_LATEST]
+    str     x12, [x11, #dh_link]
+    str     xzr, [x11, #dh_ct]            ; TODO: compile_word
+    str     xzr, [x11, #dh_comp]          ; TODO: compile_comma
+    str     xzr, [x11, #dh_rec]
+    strh    wzr, [x11, #dh_vfa]
+    strh    wzr, [x11, #dh_ofa]
+    strh    wzr, [x11, #dh_stk]
+    strb    wzr, [x11, #dh_tfa]
+    strb    w10, [x11, #dh_nt]            ; name length
+    add     x12, x11, #dh_name
+    mov     x13, #0
+.cpy:
+    cmp     x13, x10
+    b.hs    .cpyd
+    ldrb    w14, [x9, x13]
+    strb    w14, [x12, x13]
+    add     x13, x13, #1
+    b       .cpy
+.cpyd:
+    add     x12, x11, #dh_name
+    add     x12, x12, x10                 ; end of name
+    add     x12, x12, #7
+    and     x12, x12, #-8                 ; align up to 8
+    add     x13, x12, #cell               ; xt = body start (cell reserved for backoffset)
+    add     x14, x11, #dh_ct              ; backoffset = (header+dh_ct) - xt
+    sub     x14, x14, x13
+    str     x14, [x13, #-cell]
+    ldr     x15, [UP, #user_INDEX_HERE]
+    cmp     x13, x15
+    b.hs    .ovf                          ; code heap collided with index arena
+    stp     x30, x11, [sp, #-32]!
+    str     x13, [sp, #16]
+    bl      publish_header_overlay        ; (x9=name x10=len x11=header)
+    ldr     x13, [sp, #16]
+    ldp     x30, x11, [sp], #32
+    str     x13, [x11, #dh_xtptr]         ; provisional body = xt
+    str     x13, [UP, #user_HERE]
+    str     x11, [UP, #user_LATEST]
+    str     x13, [UP, #user_LATESTXT]
+    ldr     x0, [DSP, #cell]              ; drop ( c-addr u -- ): new TOS = below c-addr
+    stk(2, 0)
+    next()
+.ovf:
+    brk     #0x10                         ; TODO: throw -8
+endp()
+
 ; MF66 kernel — dictionary helpers (ported from WF66 kernel/dict.masm).
 ; Internal form: TOS in x0, NOS at [DSP] (x19). See docs/porting-guide.md.
 
