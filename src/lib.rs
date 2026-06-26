@@ -12,7 +12,9 @@
 #![cfg(target_os = "macos")]
 
 pub mod abi;
+pub mod aenc;
 pub mod asm_macros;
+pub mod codearena;
 pub mod jit;
 pub mod primitives;
 pub mod runtime;

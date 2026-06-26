@@ -41,6 +41,11 @@ const USER_FTOS_SAVE: usize = 0x1228;
 /// Scratch region inside the user area (`push_pad`/`poke`/`expect_bytes`).
 const USER_PAD: u64 = 0x100;
 
+// ── Header field offsets (must match kernel/macros.masm) ──────────────────
+const DH_XTPTR: u64 = 16;
+const DH_TFA: u64 = 46;
+const TFA_TCOL: u8 = 0x82; // colon-definition type tag
+
 const CELL: usize = 8;
 
 /// `forth_main(target_xt, logical_dsp_in, rsp_top, user_base) -> 0`.
@@ -59,6 +64,17 @@ pub struct Mf66Session {
     user_base: u64,
     /// Current logical data-stack pointer (== dstack_top when empty).
     current_dsp: u64,
+
+    /// Executable region for compiled colon-word bodies.
+    code: crate::codearena::CodeArena,
+    /// Colon-compiler state (None = interpreting).
+    pending: Option<ColonDef>,
+}
+
+/// In-progress colon definition: the word name + the accumulated body words.
+struct ColonDef {
+    name: String,
+    body: Vec<u32>,
 }
 
 impl Mf66Session {
@@ -99,6 +115,7 @@ impl Mf66Session {
         let rstack_top = base + RSTACK_TOP as u64;
         let user_base = base + USER_BASE as u64;
 
+        let code = crate::codearena::CodeArena::with_capacity(4 * 1024 * 1024)?;
         let mut s = Mf66Session {
             _jit: jit,
             forth_main,
@@ -108,6 +125,8 @@ impl Mf66Session {
             rstack_top,
             user_base,
             current_dsp: dstack_top,
+            code,
+            pending: None,
         };
 
         s.write_user(USER_RSP_CURRENT, rstack_top);
@@ -214,34 +233,109 @@ impl Mf66Session {
         self.call("publish_primitive")
     }
 
-    /// Interpret Forth `text`: for each whitespace-delimited token, find+execute
-    /// it, else parse it as a number (in the current `base`) and push it, else
-    /// error. Leaves results on the data stack. (Bring-up: tokenizing/number
-    /// parsing is Rust-side for now; the kernel-side parse + interpret loop comes
-    /// with output + the WF66 front-end.)
+    /// Interpret/compile Forth `text`. In interpret state each token is
+    /// found+executed or parsed as a number and pushed. `:` begins a colon
+    /// definition (compile state); subsequent tokens are *compiled* into a body
+    /// (a call per word, a literal per number) until `;`, which finishes the
+    /// word. (Bring-up: tokenizing/number parsing + the `:`/`;` handling are
+    /// Rust-side; the kernel parse + interpret loop and immediate words come next.)
     pub fn eval(&mut self, text: &str) -> Result<()> {
-        let base = self.read_user(UVAR_BASE) as u32;
-        for tok in text.split_whitespace() {
-            self.push_name(tok);
-            self.call("find_name")?;
-            if self.stack().first() == Some(&-1) {
-                // found: ( … nt -1 ) -> drop flag, nt -> xt, execute
-                self.call("drop_")?;
-                self.call("name_to_interpret")?;
-                self.call("execute")
-                    .with_context(|| format!("execute {tok}"))?;
+        let mut tokens = text.split_whitespace();
+        while let Some(tok) = tokens.next() {
+            if self.pending.is_some() {
+                if tok == ";" {
+                    self.finish_colon()?;
+                } else {
+                    self.compile_token(tok)?;
+                }
+            } else if tok == ":" {
+                let name = tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("`:` needs a name"))?;
+                let mut body = Vec::new();
+                crate::aenc::emit_nest(&mut body);
+                self.pending = Some(ColonDef { name: name.to_string(), body });
             } else {
-                // not found: ( … c-addr u 0 ) -> drop all three, then it must be a number
-                self.call("drop_")?;
-                self.call("drop_")?;
-                self.call("drop_")?;
-                let n = parse_forth_int(tok, base)
-                    .ok_or_else(|| anyhow::anyhow!("undefined word: {tok}"))?;
-                self.push(n);
+                self.interpret_token(tok)?;
             }
         }
         Ok(())
     }
+
+    /// Interpret one token: find+execute, else number→push, else error.
+    fn interpret_token(&mut self, tok: &str) -> Result<()> {
+        let base = self.read_user(UVAR_BASE) as u32;
+        self.push_name(tok);
+        self.call("find_name")?;
+        if self.stack().first() == Some(&-1) {
+            self.call("drop_")?;
+            self.call("name_to_interpret")?;
+            self.call("execute").with_context(|| format!("execute {tok}"))?;
+        } else {
+            self.call("drop_")?;
+            self.call("drop_")?;
+            self.call("drop_")?;
+            let n = parse_forth_int(tok, base)
+                .ok_or_else(|| anyhow::anyhow!("undefined word: {tok}"))?;
+            self.push(n);
+        }
+        Ok(())
+    }
+
+    /// Resolve `tok` to an xt without disturbing the data stack net (find_name +
+    /// name>interpret leave the xt, which we read and drop).
+    fn xt_of_forth_name(&mut self, tok: &str) -> Result<Option<u64>> {
+        self.push_name(tok);
+        self.call("find_name")?;
+        if self.stack().first() == Some(&-1) {
+            self.call("drop_")?; // drop -1
+            self.call("name_to_interpret")?; // nt -> xt
+            let xt = self.stack()[0] as u64;
+            self.call("drop_")?; // drop xt
+            Ok(Some(xt))
+        } else {
+            self.call("drop_")?; // 0
+            self.call("drop_")?; // u
+            self.call("drop_")?; // c-addr
+            Ok(None)
+        }
+    }
+
+    /// Compile one token into the pending colon body: a call if it's a word,
+    /// else a literal if it's a number.
+    fn compile_token(&mut self, tok: &str) -> Result<()> {
+        let base = self.read_user(UVAR_BASE) as u32;
+        match self.xt_of_forth_name(tok)? {
+            Some(xt) => {
+                let def = self.pending.as_mut().unwrap();
+                crate::aenc::emit_call(xt, &mut def.body);
+            }
+            None => {
+                let n = parse_forth_int(tok, base)
+                    .ok_or_else(|| anyhow::anyhow!("undefined word: {tok}"))?;
+                let def = self.pending.as_mut().unwrap();
+                crate::aenc::emit_lit(n, &mut def.body);
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish the pending colon definition: emit unnest+ret, commit the body to
+    /// the code arena, create the header, and point it at the body (tfa = colon).
+    fn finish_colon(&mut self) -> Result<()> {
+        let mut def = self.pending.take().expect("finish_colon with no pending def");
+        crate::aenc::emit_unnest_ret(&mut def.body);
+        let xt = self.code.commit(&def.body)?;
+        // Header (in the RW dict heap) via (create), then patch xt + type tag.
+        self.push_name(&def.name);
+        self.call("create")?;
+        let header = self.read_user(USER_LATEST);
+        self.write_u64(header + DH_XTPTR, xt);
+        self.write_u8(header + DH_TFA, TFA_TCOL);
+        Ok(())
+    }
+
+    /// Publish every kernel primitive (the `PRIMITIVES` table) into the dictionary.
 
     /// Interpret `text` and return everything it printed (via `.`/`emit`/`type`/…).
     pub fn eval_out(&mut self, text: &str) -> Result<String> {
@@ -286,6 +380,14 @@ impl Mf66Session {
     }
     fn write_user(&mut self, off: usize, v: u64) {
         unsafe { ((self.user_base + off as u64) as *mut u64).write(v) };
+    }
+    /// Write a cell at an absolute address in the (RW) dict heap.
+    fn write_u64(&mut self, addr: u64, v: u64) {
+        unsafe { (addr as *mut u64).write_unaligned(v) };
+    }
+    /// Write a byte at an absolute address in the (RW) dict heap.
+    fn write_u8(&mut self, addr: u64, v: u8) {
+        unsafe { (addr as *mut u8).write(v) };
     }
 }
 
