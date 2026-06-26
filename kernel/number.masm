@@ -33,6 +33,14 @@ proc(decimal_word)
     next()
 endp()
 
+; hex  ( -- )    set BASE to 16.
+proc(hex_word)
+    mov     x9, #16                 ; AArch64 has no store-immediate; stage 16 in a scratch
+    str     x9, [UP, #user_BASE]    ; BASE := 16
+    stk(0, 0)                       ; ( -- ): no net stack effect, emits nothing
+    next()
+endp()
+
 ; digit  ( char base -- n flag )
 ;     Convert one ASCII digit in the given base. On success: replace
 ;     (char base) with (n -1). On failure: leave the original char in

@@ -61,31 +61,29 @@ endp()
 | `mov byte [..], al` | `strb w0, [..]` | |
 | `rep movsb` | post-indexed `ldrb`/`strb` loop | one shared idiom; see strings later |
 
-### Conditional branches → `cset`/`csetm`/`csel` + `cbz`/`cbnz`  (CRITICAL — no `b.<cond>`)
+### Conditional branches & NEON — now supported (JASM ≥ f3efa55)
 
-**Never emit `b.<cond>` (e.g. `b.ge`, `b.eq`) inside a `proc`.** The front-end's
-local-label mangler eats the `.cond` suffix as if it were a local label, so
-`b.ge .done` is corrupted to `b<proc>$$ge …` and the a64 encoder rejects it. The
-kernel uses NO `b.<cond>` anywhere. Instead:
+`b.<cond>` and NEON `.arr` operands inside a `proc` **work as of JASM commit
+f3efa55** (the lexer no longer splits compound dotted tokens). So you may write
+`cmp …; b.ge .done` and `cnt v0.8b, v0.8b` / `uaddlv h0, v0.8b` directly.
+(Earlier the @scope local-label mangler corrupted the `.cond`/`.arr` suffix into
+`b<proc>$$ge`; the kernel batches ported before the fix therefore use the
+branchless workarounds below — those remain correct, just no longer required.)
 
-- **Branchless select** (preferred): `cmp` then `csel`/`csinc`/`cneg`, or
-  `csetm` for a flag — covers min/max/abs/compares with no branch at all.
-- **Real branch on a condition**: materialize the predicate then branch on zero:
-  `cmp …; cset x14, <cond>; cbz x14, .done` (or `cbnz`). `.done` is an ordinary
-  scope-local label and is fine; only the `.cond` *suffix on `b`* is the trap.
-- Unconditional `b .label` is fine. Loops use `cbz`/`cbnz`/`tbz`/`tbnz` + `b`.
+Style guidance still favours branchless where natural:
+- **Branchless select** (preferred for codegen): `cmp` then `csel`/`csinc`/`cneg`,
+  or `csetm` for a Forth flag — covers min/max/abs/compares with no branch.
+- **Real branches**: `b.<cond>` is fine now; `cset x14,<cond>; cbz/cbnz` and
+  `cbz/cbnz/tbz/tbnz` also work. `.label` (after whitespace) is a scope-local
+  label, mangled per-proc as intended.
 
-The same mangler trap applies to **any `.suffix` operand inside a proc**:
-- **No NEON `.arr` operands** (`v0.8b`, `cnt v0.16b`, `uaddlv h0, v0.8b`, …): the
-  `.8b` is eaten as a local label and the mnemonic is corrupted. Do bit-counting
-  etc. with **GPR SWAR** (mask + shift + multiply), not NEON. Scalar FP (`d`/`s`
-  registers, `fadd d0,d1,d2`) is fine — no dotted operands.
-- Also unsupported by the a64 encoder: **extended-register operands**
-  (`cmp w11, w0, uxtb`, `add x0, x1, w2, sxtw`). Pre-mask/extend into a scratch
-  first (`and w12, w0, #0xff`; `sxtw x2, w2`) then use the plain register form.
+Still genuine constraints:
+- **Extended-register operands** (`cmp w11, w0, uxtb`, `add x0, x1, w2, sxtw`)
+  are not supported by the a64 encoder. Pre-mask/extend into a scratch first
+  (`and w12, w0, #0xff`; `sxtw x2, w2`) then use the plain register form.
 - Immediate **expressions don't fold**: `#cell - 1` / `#3*cell` reach the encoder
   literally and fail. Use the concrete value (`#7`, `#24`). `#cell` alone is fine
-  (it's a define substitution, not arithmetic), as is `#-cell` (→ `#-8`).
+  (a define substitution, not arithmetic), as is `#-cell` (→ `#-8`).
 
 ### Flag / comparison idioms → `cmp` + `cset`/`csetm`  (critical)
 
