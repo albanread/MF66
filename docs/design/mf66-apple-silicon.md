@@ -245,6 +245,15 @@ x86-only) is gated off; metrics are diagnostic, never a gate.
    `aapcs_call` (**defensive** sp realign — always-correct; parity-elision is a
    Phase-5+ optimization, §2), `forth_main` prologue/epilogue (save x19–x28, x30,
    d8–d15). *Verify:* a 2-word kernel runs via `forth_main`.
+   **✅ DONE** (`kernel/{macros,main,prims}.masm`, `src/{session,asm_macros,
+   runtime}.rs`, `tests/phase1.rs`, `tests/kernel_lint.rs`): `forth_main`
+   (callee-saved save/restore, sp↔return-stack switch, wire-format
+   prologue/epilogue), proc/endp/next, an AArch64 `stk` Rust macro, and
+   `aapcs_call`; 6 primitives (dup/drop/swap/+/1+ and a host-call word) run
+   through `Mf66Session::{push,call,stack}`. The x18/q8–q15 grep gate is live.
+   **Gotcha found:** `and sp, sp, #-16` is illegal (AND-immediate cannot target
+   sp) — the realign math must go through a GPR (`and x17, x16, #-16; sub; mov
+   sp, x17`); verified byte-identical to llvm-mc.
 2. **Boot headless** — ⚠ port by **boot-criticality, not mechanical-vs-hard**:
    macros + stack + rstack + memory + the *subset* of arith (`+ - */mod`) and
    compare (`= < 0= 0<`) that `number`/`find` need + dict-find + number + parse +

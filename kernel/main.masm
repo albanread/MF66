@@ -1,0 +1,91 @@
+; ─────────────────────────────────────────────────────────────────────
+; MF66 — kernel entry point (AArch64 port of WF66's kernel/main.masm).
+;
+; The Rust driver allocates a region, lays it out as data stack / return
+; stack / user area / locals / dictionary, seeds the user area, and calls:
+;
+;   forth_main(target_xt, logical_dsp_in, rsp_top, user_base) → 0
+;       x0 = target_xt   x1 = logical_dsp_in   x2 = rsp_top   x3 = user_base
+;
+; This single entry handles both REPL invocations and direct primitive calls
+; from Mf66Session::call(). On return, [UP + user_DSP_SAVE] holds the new
+; logical_dsp the caller should adopt.
+;
+; REMINDER: x0 is the cached TOS. Anything that writes x0 destroys the user's
+; TOS unless it was spilled to [DSP] first. Scratch in x9–x15 (caller-saved).
+; ─────────────────────────────────────────────────────────────────────
+
+.text
+
+@include "macros.masm"
+@include "prims.masm"
+
+; forth_main — the only data-stack-representation translation layer.
+;
+; Wire-format (Rust ↔ kernel): a pure in-memory cell array. At depth N the top
+; lives at [logical_dsp + 0], NOS at [logical_dsp + cell], … and
+; logical_dsp = dsp_top - N*cell. Depth 0 ↔ logical_dsp == dsp_top.
+;
+; The kernel's internal form (TOS cached in x0, DSP points at NOS) is valid only
+; *inside* the kernel; the prologue/epilogue below translate to/from wire-format:
+;   prologue:  ldr TOS,[DSP]; add DSP,cell      ; cache top in x0
+;   epilogue:  sub DSP,cell;  str TOS,[DSP]      ; spill top back
+;
+; AAPCS64: all callee-saved GPRs (x19–x28) + the low 64 of v8–v15 are SAVED on
+; entry and RESTORED on exit, so Forth code (including FTOS=d8) may use them
+; freely without corrupting the host. This is the one boundary where they spill.
+proc(forth_main)
+    ; Save AAPCS64 callee-saved state: x29/x30 + x19–x28 + d8–d15 = 160 bytes.
+    stp     x29, x30, [sp, #-160]!
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    stp     x25, x26, [sp, #64]
+    stp     x27, x28, [sp, #80]
+    stp     d8,  d9,  [sp, #96]
+    stp     d10, d11, [sp, #112]
+    stp     d12, d13, [sp, #128]
+    stp     d14, d15, [sp, #144]
+
+    mov     x9, x0                          ; save target_xt (x0 becomes TOS)
+    mov     UP, x3                          ; UP = user_base
+    mov     x16, sp
+    str     x16, [UP, #user_HOST_RSP]       ; stash host sp
+    mov     DSP, x1                         ; DSP = logical_dsp_in
+    ldr     LP, [UP, #user_LP0]             ; LP = locals top
+    ldr     x16, [UP, #user_RSP_CURRENT]
+    mov     sp, x16                         ; switch to the Forth return stack
+
+    ; Prologue: memory wire-format → internal cached-TOS form.
+    ldr     TOS, [DSP]
+    add     DSP, DSP, #cell
+
+    ldr     FTOS, [UP, #user_FTOS_SAVE]     ; restore FP top-of-stack
+
+    blr     x9                              ; call target_xt
+
+    ; Epilogue: internal cached-TOS form → memory wire-format; publish DSP.
+    sub     DSP, DSP, #cell
+    str     TOS, [DSP]
+    str     DSP, [UP, #user_DSP_SAVE]
+
+    str     FTOS, [UP, #user_FTOS_SAVE]     ; park FP top-of-stack
+
+    mov     x16, sp
+    str     x16, [UP, #user_RSP_CURRENT]    ; persist Forth rstack pointer
+    ldr     x16, [UP, #user_HOST_RSP]
+    mov     sp, x16                         ; restore host sp
+
+    ldp     x19, x20, [sp, #16]
+    ldp     x21, x22, [sp, #32]
+    ldp     x23, x24, [sp, #48]
+    ldp     x25, x26, [sp, #64]
+    ldp     x27, x28, [sp, #80]
+    ldp     d8,  d9,  [sp, #96]
+    ldp     d10, d11, [sp, #112]
+    ldp     d12, d13, [sp, #128]
+    ldp     d14, d15, [sp, #144]
+    ldp     x29, x30, [sp], #160
+    mov     x0, #0                          ; forth_main returns 0
+    ret
+endp()

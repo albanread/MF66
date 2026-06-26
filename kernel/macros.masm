@@ -1,0 +1,80 @@
+; ─────────────────────────────────────────────────────────────────────
+; MF66 kernel — shared macros and the AArch64 register convention.
+;
+; Register convention (the MF66 ABI; see docs/design/mf66-apple-silicon.md §2):
+;   x0  = TOS    (top of data stack — always cached in a register)
+;   x19 = DSP    (data stack pointer, points at NOS, grows downward by cell)
+;   x20 = UP     (user-area pointer — per-task state)
+;   x21 = LP     (locals-frame pointer)
+;   x22 = FSP    (float stack pointer)
+;   d8  = FTOS   (float top of stack — callee-saved low 64; NOT d31)
+;   sp  = return stack (also the CPU call/ret stack since we are STC)
+;   x16 = call scratch (IP0; clobbered by every bl/blr incl. loader veneers)
+;
+; Everything that must survive a settle-barrier rt_* call (DSP/UP/LP/FSP/FTOS)
+; is AAPCS64 callee-saved, so it persists across call-outs with no spill.
+;
+; Subroutine-threaded: every primitive ends with `ret` (next()); colon words
+; invoke children with `bl` and MUST save/restore the link register x30 around
+; their body (the AArch64 nest/unnest — x30 is not auto-pushed like x86's rsp).
+; ─────────────────────────────────────────────────────────────────────
+
+@assign cell = 8
+@assert cell == 8, "MF66 requires 8-byte cells"
+
+@define TOS  x0
+@define DSP  x19
+@define UP   x20
+@define LP   x21
+@define FSP  x22
+@define FTOS d8
+
+; ── User-area layout (offsets from UP) — minimal Phase 1 subset ──────────
+@assign user_HOST_RSP    = 0x00      ; host sp stashed on forth_main entry
+@assign user_DSP_SAVE    = 0x08      ; final logical DSP written on exit
+@assign user_SP0         = 0x10      ; initial DSP at boot (= dsp_top); for `depth`
+@assign user_RSP_CURRENT = 0x18      ; forth's return-stack sp across forth_main calls
+@assign user_LP0         = 0x20      ; initial locals pointer (top of locals region)
+@assign user_FTOS_SAVE   = 0x28      ; FTOS (d8) parked across forth_main boundaries
+@assign user_BASE        = 0x30      ; numeric base (Phase 2)
+@assign user_STATE       = 0x38      ; interpret/compile (Phase 2)
+@assign user_LATEST      = 0x40      ; dictionary chain head (Phase 2)
+@assign user_HERE        = 0x48      ; dict bump pointer (Phase 2)
+
+; ── proc/endp/next — the shape of a primitive ───────────────────────────
+; proc(name): open a scope (so .local labels mangle uniquely), export the
+; symbol, and place the label. endp(): close the scope. next(): `ret` (STC).
+@macro proc(name)
+    @scope &name
+    .globl &name
+&name:
+@endmacro
+
+@macro endp()
+    @endscope
+@endmacro
+
+@macro next()
+    ret
+@endmacro
+
+; ── aapcs_call(target) — call a host extern under AAPCS64 ────────────────
+; Two AArch64 facts x86 didn't have: (1) `bl` overwrites x30 (LR), so the
+; caller's return address must be saved/restored — there is no implicit stack
+; push like x86 `call`; (2) the Forth return stack on sp is frequently at
+; 8-mod-16, but AAPCS64 needs sp 16-aligned at the bl. x16/x17 are the ABI
+; scratch (clobbered by the bl's veneer, so x16 is reloaded after; x17 is dead
+; before the call). NOTE: AND-immediate cannot target sp, so the alignment math
+; must go through a GPR.
+; Phase 1: always save LR + realign (correct regardless of parity). Phase 5+:
+; the optimizer elides the realign where sp is provably aligned (design §2).
+@macro aapcs_call(target)
+    mov     x16, sp                 ; x16 = original sp (the Forth return-stack ptr)
+    and     x17, x16, #-16          ; align in a GPR (AND-imm can't write sp)
+    sub     x17, x17, #16           ; reserve a 16-byte aligned save slot
+    mov     sp, x17
+    stp     x30, x16, [sp]          ; save LR + original sp
+    bl      &target
+    ldp     x30, x16, [sp]          ; restore LR + original sp
+    mov     sp, x16                 ; restore the Forth return-stack pointer
+@endmacro

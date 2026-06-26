@@ -35,16 +35,21 @@ must survive a settle-barrier `rt_*` call is callee-saved. `x16`/`x17`/`x18` are
 forbidden in any pool (`MacJit` veneers own x16; x18 is Darwin-reserved). Source
 of truth: [`src/abi.rs`](src/abi.rs).
 
-## Status — Phase 0 (substrate smoke test) ✅
+## Status — Phase 1 (kernel macro library + boot path) ✅
 
 ```
-$ cargo test          # 4 tests: ABI pool invariants + 3 JIT'd-AArch64 executions
+$ cargo test          # 11 tests across abi / kernel_lint / phase0 / phase1
 ```
 
-Phase 0 proves, from the MF66 crate, that a hand-written AArch64 word assembles
-through JASM, loads into `MAP_JIT` memory, flips W^X, and executes — including an
-AAPCS64 host callback routed through a far-call veneer, and a DSP-relative
-data-stack idiom. No WF66 code involved yet.
+- **Phase 0** — a hand-written AArch64 word assembles through JASM, loads into
+  `MAP_JIT` memory, flips W^X, and executes, incl. an AAPCS64 host callback via a
+  far-call veneer and a DSP-relative data-stack idiom.
+- **Phase 1** — the kernel macro library (`kernel/macros.masm`: register homes,
+  `proc`/`endp`/`next`, the AArch64 `stk` macro, `aapcs_call`) and `forth_main`
+  (callee-saved save/restore, `sp`↔return-stack switch, the wire-format
+  prologue/epilogue) drive real `proc(…)…endp()` primitives — `dup drop swap + 1+`
+  and a host-call word — through `Mf66Session::{push,call,stack}`. A grep gate
+  enforces the x18 / q8–q15 ban.
 
-Next: Phase 1 (kernel macro library + `forth_main` ABI) → Phase 2 (boot the
-kernel headless). See the design doc §8.
+Next: Phase 2 — boot the kernel headless (the boot-critical primitive subset +
+dictionary + interpreter). See the design doc §8.

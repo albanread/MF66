@@ -7,11 +7,15 @@
 //! the new work is the AArch64 lowering/back-end and the STC kernel.
 //!
 //! See `docs/design/mf66-apple-silicon.md` for the full plan and the verified
-//! ABI. This crate is at **Phase 0** (substrate smoke test).
+//! ABI. This crate is at **Phase 1** (kernel macro library + headless boot path).
 
 #![cfg(target_os = "macos")]
 
 pub mod abi;
+pub mod asm_macros;
 pub mod jit;
+pub mod runtime;
+pub mod session;
 
 pub use jit::Mf66Jit;
+pub use session::Mf66Session;

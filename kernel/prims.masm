@@ -1,0 +1,48 @@
+; ─────────────────────────────────────────────────────────────────────
+; MF66 — Phase 1 primitive set (a minimal kernel to prove the boot path).
+; Internal form: TOS cached in x0; DSP (x19) points at NOS; stack grows down.
+; Later phases split these across stack.masm / arith.masm / etc.
+; ─────────────────────────────────────────────────────────────────────
+
+; dup ( a -- a a ) — push the cached TOS down, leaving TOS unchanged.
+proc(dup_)
+    str     TOS, [DSP, #-cell]!     ; store TOS as the new NOS, DSP -= cell
+    next()
+endp()
+
+; drop ( a -- ) — raise NOS into TOS. stk(1,0) emits `add x19,x19,#cell`.
+proc(drop_)
+    ldr     TOS, [DSP]
+    stk(1, 0)
+    next()
+endp()
+
+; swap ( a b -- b a )
+proc(swap_)
+    ldr     x9,  [DSP]              ; x9 = NOS (a)
+    str     TOS, [DSP]             ; NOS = b
+    mov     TOS, x9                ; TOS = a
+    next()
+endp()
+
+; + ( a b -- a+b ) — exercises stk(2,1) → drop one cell.
+proc(plus)
+    ldr     x9, [DSP]              ; x9 = NOS (a)
+    add     TOS, TOS, x9          ; TOS = b + a
+    stk(2, 1)
+    next()
+endp()
+
+; 1+ ( n -- n+1 ) — stk(1,1) is balanced and emits nothing.
+proc(one_plus)
+    add     TOS, TOS, #1
+    stk(1, 1)
+    next()
+endp()
+
+; rt-double ( n -- 2n ) — call a host extern under AAPCS64. Exercises
+; aapcs_call (LR save + sp realign) and the bound-extern path through forth_main.
+proc(rt_double_word)
+    aapcs_call(rt_double)          ; x0 = n in, x0 = 2n out (TOS stays in x0)
+    next()
+endp()
