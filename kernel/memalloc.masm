@@ -1,0 +1,29 @@
+; MF66 kernel — ANS Memory-Allocation wordset over the OS heap (libc
+; malloc/free/realloc via rt_* externs). ior 0 = success. Secondary output
+; (the address) is written by the host through a PAD scratch cell.
+
+; allocate ( u -- a-addr ior )
+proc(allocate_word)
+    add     x1, UP, #user_PAD       ; &addr_out
+    aapcs_call(rt_allocate)         ; x0 = u in, x0 = ior out
+    ldr     x9, [UP, #user_PAD]     ; a-addr
+    str     x9, [DSP, #-cell]!      ; push a-addr (becomes NOS)
+    next()                          ; TOS = ior
+endp()
+
+; free ( a-addr -- ior )
+proc(free_word)
+    aapcs_call(rt_free)             ; x0 = addr in, x0 = ior out
+    next()
+endp()
+
+; resize ( a-addr u -- a-addr' ior )
+proc(resize_word)
+    mov     x1, x0                  ; u
+    ldr     x0, [DSP]               ; a-addr
+    add     x2, UP, #user_PAD       ; &addr_out
+    aapcs_call(rt_resize)           ; x0 = ior
+    ldr     x9, [UP, #user_PAD]     ; a-addr'
+    str     x9, [DSP]               ; NOS ← a-addr'
+    next()                          ; TOS = ior (balanced)
+endp()

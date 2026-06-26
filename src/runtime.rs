@@ -335,6 +335,40 @@ pub extern "C" fn rt_rename_file(a1: u64, u1: u64, a2: u64, u2: u64) -> u64 {
     }
 }
 
+// ── Memory-Allocation wordset (ANS): the OS heap via libc malloc/free/realloc ──
+/// allocate ( u -- a-addr ior ); kernel passes &addr_out (PAD). ior 0 = success.
+pub extern "C" fn rt_allocate(u: u64, addr_out: *mut u64) -> u64 {
+    let p = unsafe { libc::malloc(u as usize) };
+    if p.is_null() {
+        unsafe { *addr_out = 0 };
+        (-59i64) as u64 // ALLOCATE failure
+    } else {
+        unsafe { *addr_out = p as u64 };
+        0
+    }
+}
+
+/// free ( a-addr -- ior )
+pub extern "C" fn rt_free(addr: u64) -> u64 {
+    if addr != 0 {
+        unsafe { libc::free(addr as *mut libc::c_void) };
+    }
+    0
+}
+
+/// resize ( a-addr u -- a-addr' ior ); kernel passes &addr_out. On failure the
+/// original block is left intact and addr_out keeps the old address.
+pub extern "C" fn rt_resize(addr: u64, u: u64, addr_out: *mut u64) -> u64 {
+    let p = unsafe { libc::realloc(addr as *mut libc::c_void, u as usize) };
+    if p.is_null() {
+        unsafe { *addr_out = addr };
+        (-61i64) as u64 // RESIZE failure
+    } else {
+        unsafe { *addr_out = p as u64 };
+        0
+    }
+}
+
 /// The built-in runtime externs every session binds before assembling the
 /// kernel. Names must match the `bl`/`aapcs_call` targets in the kernel.
 pub fn externs() -> Vec<(&'static str, *const ())> {
@@ -368,5 +402,8 @@ pub fn externs() -> Vec<(&'static str, *const ())> {
         ("rt_delete_file", rt_delete_file as *const ()),
         ("rt_flush_file", rt_flush_file as *const ()),
         ("rt_rename_file", rt_rename_file as *const ()),
+        ("rt_allocate", rt_allocate as *const ()),
+        ("rt_free", rt_free as *const ()),
+        ("rt_resize", rt_resize as *const ()),
     ]
 }

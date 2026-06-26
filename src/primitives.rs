@@ -237,6 +237,10 @@ pub const PRIMITIVES: &[(&str, &str, bool)] = &[
     ("delete-file", "delete_file_word", false),
     ("flush-file", "flush_file_word", false),
     ("rename-file", "rename_file_word", false),
+    // Memory allocation (MF66 memalloc.masm)
+    ("allocate", "allocate_word", false),
+    ("free", "free_word", false),
+    ("resize", "resize_word", false),
     ("number?", "number_q", false),
     ("execute", "execute", false),
     // Exceptions (MF66 exceptions.masm)
