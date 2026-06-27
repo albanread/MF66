@@ -1609,6 +1609,11 @@ impl Mf66Session {
         );
         let _ = writeln!(
             s,
+            "  fp: f@ fused {}  f! fused {}  (no settle/call)  redundant f@-refetches {}  ← FP heat gap",
+            total.fp_fetches, total.fp_stores, total.redundant_ffetches
+        );
+        let _ = writeln!(
+            s,
             "  redundant @-refetches {}  ← heat-policy gap (hot value re-read from memory, not kept in a reg)",
             total.redundant_fetches
         );
@@ -1688,6 +1693,8 @@ impl Mf66Session {
             ("f_negate", &[Tok::FUn(crate::opt::FUn::Neg)]),
             ("fsqrt_word", &[Tok::FUn(crate::opt::FUn::Sqrt)]),
             ("fabs_word", &[Tok::FUn(crate::opt::FUn::Abs)]),
+            ("f_fetch", &[Tok::FFetch]), // f@ — fused absolute load, no settle
+            ("f_store", &[Tok::FStore]), // f! — fused absolute store, no settle
             ("fdup", &[Tok::FStk(Dup)]),
             ("fdrop", &[Tok::FStk(Drop)]),
             ("fswap", &[Tok::FStk(Swap)]),

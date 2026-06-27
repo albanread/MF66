@@ -124,6 +124,8 @@ pub enum Tok {
     FBin(FBin),       // f+ / f- / f* / f/
     FUn(FUn),         // fnegate / fsqrt / fabs
     FStk(Stk),        // fdup / fdrop / fswap / fover (FP stack motion)
+    FFetch,           // f@ ( addr -- ) ( F: -- r ): direct fldr — no settle/call
+    FStore,           // f! ( addr -- ) ( F: r -- ): direct fstr — no settle/call
     Call(u64),
 }
 
@@ -244,6 +246,9 @@ pub struct Metrics {
     pub local_loads: u32,   // local read served from the LP frame (ldr)
     pub local_hits: u32,    // local read served from a register (recent store, no ldr)
     pub local_spills: u32,  // deferred local stores flushed to the frame at a barrier
+    pub fp_fetches: u32,    // f@ fused to a direct fldr (was a settle-barrier call)
+    pub fp_stores: u32,     // f! fused to a direct fstr
+    pub redundant_ffetches: u32, // f@ of a const address already fetched in the window
     pub redundant_fetches: u32, // @/c@ of a const address already fetched in the
                             // window — a hot value re-read from memory instead of
                             // kept in a register (the heat-policy gap / promote_hot_cells)
@@ -279,6 +284,9 @@ impl Metrics {
         self.local_loads += o.local_loads;
         self.local_hits += o.local_hits;
         self.local_spills += o.local_spills;
+        self.fp_fetches += o.fp_fetches;
+        self.fp_stores += o.fp_stores;
+        self.redundant_ffetches += o.redundant_ffetches;
         self.redundant_fetches += o.redundant_fetches;
         self.dsp_adjusts += o.dsp_adjusts;
         self.calls += o.calls;
@@ -411,6 +419,7 @@ struct Low<'a> {
     fconsumed: i64,
     m: Metrics, // accumulated codegen metrics for this run
     fetched: Vec<i64>, // const addresses @-fetched in the current window (heat probe)
+    ffetched: Vec<i64>, // const addresses f@-fetched in the current FP window
     // Local register cache: index → (pool register holding the current value,
     // dirty = unspilled store). A stored local (dirty) or a HOT read local (≥2
     // reads in the run) is kept resident so subsequent reads are a `mov`, not a
@@ -441,6 +450,7 @@ impl<'a> Low<'a> {
             fconsumed: 0,
             m: Metrics::default(),
             fetched: Vec::new(),
+            ffetched: Vec::new(),
             lcache: std::collections::HashMap::new(),
             hot_locals: std::collections::HashSet::new(),
         }
@@ -999,6 +1009,40 @@ impl<'a> Low<'a> {
             FUn::Abs => fabs(a, a),
         });
     }
+
+    /// f@ ( addr -- ) ( F: -- r ): pop the data-stack address and load the float
+    /// straight into the FP virtual stack — a direct `fldr`, no settle/call.
+    fn ffetch(&mut self) {
+        self.ensure(1);
+        let a = self.vs.pop().unwrap();
+        if let Loc::Const(addr) = a {
+            if self.ffetched.contains(&addr) {
+                self.m.redundant_ffetches += 1;
+            } else {
+                self.ffetched.push(addr);
+            }
+        }
+        let g = self.to_reg(a); // address in a GP reg (Const → load_imm)
+        let d = self.falloc();
+        self.out.push(fldr0(d, g)); // d = [addr]
+        self.freer(g);
+        self.fvs.push(d);
+        self.m.fp_fetches += 1;
+    }
+
+    /// f! ( addr -- ) ( F: r -- ): pop the data-stack address and FP TOS, store —
+    /// a direct `fstr`, no settle/call.
+    fn fstore(&mut self) {
+        self.ensure(1);
+        let a = self.vs.pop().unwrap();
+        let g = self.to_reg(a);
+        self.fensure(1);
+        let d = self.fvs.pop().unwrap();
+        self.out.push(fstr0(d, g)); // [addr] = d
+        self.freer(g);
+        self.fused[d as usize] = false;
+        self.m.fp_stores += 1;
+    }
     fn fstk(&mut self, s: Stk) {
         match s {
             Stk::Dup => {
@@ -1057,6 +1101,7 @@ impl<'a> Low<'a> {
         self.fused = [false; 32];
         self.fused[FTOS as usize] = true;
         self.fconsumed = 0;
+        self.ffetched.clear(); // a settle ends the FP window; later f@ are fresh
     }
 
     /// Settle both the data and FP windows to canonical form (before a Call and at
@@ -1220,6 +1265,8 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>, m: &mut Metrics) {
             Tok::FLit(bits) => low.flit(bits),
             Tok::FBin(op) => low.fbin(op),
             Tok::FUn(op) => low.fun(op),
+            Tok::FFetch => low.ffetch(),
+            Tok::FStore => low.fstore(),
             Tok::FStk(s) => {
                 let before = low.out.len();
                 low.fstk(s);
