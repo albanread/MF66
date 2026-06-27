@@ -444,6 +444,10 @@ struct Low<'a> {
     // pessimization). hot_locals is the read-≥2 set for this run.
     lcache: std::collections::HashMap<u32, (u32, bool)>,
     hot_locals: std::collections::HashSet<u32>,
+    // Float locals PINNED to a fixed d-register for a whole loop (cross-iteration
+    // residency): index → d-register. Reserved (never reallocated or spilled)
+    // across the loop's runs; reads/writes are fmov, not frame fldr/fstr.
+    fpins: std::collections::HashMap<u32, u32>,
 }
 
 const FTOS: u32 = 8; // d8 — canonical float top of stack at window boundaries
@@ -451,12 +455,15 @@ const FSP: u32 = 22;
 const FPOOL: [u32; 7] = [9, 10, 11, 12, 13, 14, 15]; // d-register window pool
 
 impl<'a> Low<'a> {
-    fn new(out: &'a mut Vec<u32>) -> Self {
+    fn new(out: &'a mut Vec<u32>, fpins: std::collections::HashMap<u32, u32>) -> Self {
         // The incoming canonical form has TOS in x0 and FTOS in d8.
         let mut used = [false; 32];
         used[0] = true;
         let mut fused = [false; 32];
         fused[FTOS as usize] = true;
+        for &d in fpins.values() {
+            fused[d as usize] = true; // reserve pinned d-registers for the loop
+        }
         Low {
             out,
             vs: vec![Loc::Reg(0)],
@@ -474,6 +481,7 @@ impl<'a> Low<'a> {
             hot_flocals: std::collections::HashSet::new(),
             lcache: std::collections::HashMap::new(),
             hot_locals: std::collections::HashSet::new(),
+            fpins,
         }
     }
 
@@ -935,9 +943,17 @@ impl<'a> Low<'a> {
         }
     }
 
-    /// Float local read → FP stack. A hot/stored float local is reused from its
-    /// cache d-register (`fmov`); a cold single-read loads from the frame (`fldr`).
+    /// Float local read → FP stack. A pinned float local is copied from its
+    /// loop-carried d-register; a hot/stored one from its cache d-register
+    /// (`fmov`); a cold single-read loads from the frame (`fldr`).
     fn local_ffetch(&mut self, i: u32) {
+        if let Some(&dp) = self.fpins.get(&i) {
+            let d = self.falloc();
+            self.out.push(fmov_dd(d, dp)); // copy the pinned (loop-carried) value
+            self.fvs.push(d);
+            self.m.fp_hits += 1;
+            return;
+        }
         if let Some(&(dc, _)) = self.flcache.get(&i) {
             let d = self.falloc();
             self.out.push(fmov_dd(d, dc));
@@ -959,11 +975,17 @@ impl<'a> Low<'a> {
         }
     }
 
-    /// Float local store: cache the value (dirty); the `fstr` to `[LP+i*8]` is
-    /// deferred to the next barrier (spill_flocals).
+    /// Float local store: update the pinned d-register (loop-carried), else cache
+    /// the value (dirty); the `fstr` to `[LP+i*8]` is deferred to a barrier.
     fn local_fstore(&mut self, i: u32) {
         self.fensure(1);
         let d = self.fvs.pop().unwrap();
+        if let Some(&dp) = self.fpins.get(&i) {
+            self.out.push(fmov_dd(dp, d)); // write into the pinned register
+            self.fused[d as usize] = false;
+            self.m.fp_hits += 1;
+            return;
+        }
         if let Some((old, _)) = self.flcache.insert(i, (d, true)) {
             if old != d {
                 self.fused[old as usize] = false;
@@ -1252,6 +1274,9 @@ impl<'a> Low<'a> {
         self.fvs.push(FTOS);
         self.fused = [false; 32];
         self.fused[FTOS as usize] = true;
+        for &d in self.fpins.values() {
+            self.fused[d as usize] = true; // pinned loop registers survive the settle
+        }
         self.fconsumed = 0;
         self.ffetched.clear(); // a settle ends the FP window; later f@ are fresh
     }
@@ -1361,8 +1386,13 @@ pub fn fused_cmp(c: Cmp, out: &mut Vec<u32>) -> u32 {
 /// model (appended to `out`). Constants and stack motion stay virtual; code is
 /// emitted only at consume/settle. Settles before each call and at the end so the
 /// canonical TOS=x0 / rest-in-memory form holds at every window boundary.
-pub fn lower(toks: &[Tok], out: &mut Vec<u32>, m: &mut Metrics) {
-    let mut low = Low::new(out);
+pub fn lower(
+    toks: &[Tok],
+    out: &mut Vec<u32>,
+    m: &mut Metrics,
+    fpins: std::collections::HashMap<u32, u32>,
+) {
+    let mut low = Low::new(out, fpins);
     // Hotness pre-scan: a local read ≥2 times in this run is worth keeping in a
     // register (cold single-reads load on demand — no caching, no pessimization).
     let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
