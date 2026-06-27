@@ -1362,19 +1362,19 @@ impl Mf66Session {
     /// (declaration order; rightmost input = TOS) into it. Uninitialized locals
     /// (after `|`) just reserve a slot.
     fn open_locals(&mut self, names: Vec<String>, inputs: usize) {
-        use crate::aenc::{ldr_post, str_off, sub_imm};
-        self.flush_toks();
-        self.disable_inline(); // a locals frame → not inlinable (yet)
+        // Emit the frame open as a balanced body token so the lowerer sets it up
+        // (and so a straight-line locals word can be spliced into a caller as a
+        // nested sub-frame). The matching teardown is the commit_body epilogue
+        // for a standalone body, or a CloseLocals appended to the inline IR.
         let count = names.len();
         let def = self.pending.as_mut().unwrap();
-        if count > 0 {
-            def.body.push(sub_imm(21, 21, (count * 8) as u32)); // allocate frame
-            for i in (0..inputs).rev() {
-                def.body.push(str_off(0, 21, (i * 8) as u32)); // local[i] = TOS
-                def.body.push(ldr_post(0, 19, 8)); // raise NOS into TOS
-            }
-        }
         def.locals = names;
+        if count > 0 {
+            def.toks.push(Tok::OpenLocals {
+                total: count as u32,
+                inputs: inputs as u32,
+            });
+        }
     }
 
     /// `to <local>` — compile a store into the named local.
@@ -1598,6 +1598,14 @@ impl Mf66Session {
             total.stack_loads, total.stack_stores, total.dsp_adjusts, total.settles, total.calls
         );
         let _ = writeln!(s, "  data @ {}  ! {}", total.mem_fetches, total.mem_stores);
+        let _ = writeln!(
+            s,
+            "  locals: frame loads {}  register hits {} ({:.0}% resident)  deferred-store spills {}",
+            total.local_loads,
+            total.local_hits,
+            pct(total.local_hits, total.local_loads + total.local_hits),
+            total.local_spills
+        );
         let _ = writeln!(
             s,
             "  redundant @-refetches {}  ← heat-policy gap (hot value re-read from memory, not kept in a reg)",
@@ -1903,7 +1911,14 @@ impl Mf66Session {
         if !def.name.is_empty() {
             self.word_metrics.insert(def.name.clone(), def.metrics.clone());
         }
-        let inline_toks = def.inline_toks.take();
+        let mut inline_toks = def.inline_toks.take();
+        // The inline IR closes its own frame (the standalone body uses the
+        // epilogue teardown above); append the balanced CloseLocals.
+        if let Some(toks) = inline_toks.as_mut() {
+            if !def.locals.is_empty() {
+                toks.push(Tok::CloseLocals { total: def.locals.len() as u32 });
+            }
+        }
         let named = !def.name.is_empty();
         let xt = self.code.commit(&def.body)?;
         // Record a small straight-line leaf word for inlining into callers.
@@ -1920,19 +1935,13 @@ impl Mf66Session {
         Ok(xt)
     }
 
-    /// True if every token is context-free (safe to splice into any caller).
-    /// Locals/ivars/SELF references are frame/receiver-relative, so reject them.
+    /// True if every token is safe to splice into any caller. Locals are OK — a
+    /// word's `OpenLocals…CloseLocals` splices as a nested sub-frame and its
+    /// LocalFetch/Store offsets stay relative to that frame. Ivars/SELF are
+    /// receiver-relative, so reject them.
     fn inlinable_toks(toks: &[Tok]) -> bool {
-        toks.iter().all(|t| {
-            !matches!(
-                t,
-                Tok::LocalFetch(_)
-                    | Tok::LocalStore(_)
-                    | Tok::IvarFetch(_)
-                    | Tok::IvarStore(_)
-                    | Tok::SelfPush
-            )
-        })
+        toks.iter()
+            .all(|t| !matches!(t, Tok::IvarFetch(_) | Tok::IvarStore(_) | Tok::SelfPush))
     }
 
     /// Expand any `Call(xt)` to an already-inlined word into its tokens, so an

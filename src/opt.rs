@@ -108,6 +108,12 @@ pub enum Tok {
     Mem(Mem),
     LocalFetch(u32),  // push local[i] (LP-relative)
     LocalStore(u32),  // local[i] = TOS; drop
+    // Locals-frame open/close as balanced body tokens, so a locals word inlines
+    // into a caller as a correct NESTED sub-frame (LP dips and pops). Only the
+    // inline IR carries these; standalone bodies set up / tear down the frame
+    // directly (open_locals + the commit_body epilogue).
+    OpenLocals { total: u32, inputs: u32 }, // sub LP; pop `inputs` from data stack
+    CloseLocals { total: u32 },             // add LP (frame freed)
     IvarFetch(u32),   // push [SELF + off]  (OOP instance variable)
     IvarStore(u32),   // [SELF + off] = TOS; drop
     SelfPush,         // push the current receiver (user_SELF)
@@ -235,6 +241,9 @@ pub struct Metrics {
     pub stack_stores: u32,  // str spilling the window to canonical memory (settle)
     pub mem_fetches: u32,   // @ / c@ (data-memory loads)
     pub mem_stores: u32,    // ! / c! (data-memory stores)
+    pub local_loads: u32,   // local read served from the LP frame (ldr)
+    pub local_hits: u32,    // local read served from a register (recent store, no ldr)
+    pub local_spills: u32,  // deferred local stores flushed to the frame at a barrier
     pub redundant_fetches: u32, // @/c@ of a const address already fetched in the
                             // window — a hot value re-read from memory instead of
                             // kept in a register (the heat-policy gap / promote_hot_cells)
@@ -267,6 +276,9 @@ impl Metrics {
         self.stack_stores += o.stack_stores;
         self.mem_fetches += o.mem_fetches;
         self.mem_stores += o.mem_stores;
+        self.local_loads += o.local_loads;
+        self.local_hits += o.local_hits;
+        self.local_spills += o.local_spills;
         self.redundant_fetches += o.redundant_fetches;
         self.dsp_adjusts += o.dsp_adjusts;
         self.calls += o.calls;
@@ -399,6 +411,13 @@ struct Low<'a> {
     fconsumed: i64,
     m: Metrics, // accumulated codegen metrics for this run
     fetched: Vec<i64>, // const addresses @-fetched in the current window (heat probe)
+    // Local register cache: index → (pool register holding the current value,
+    // dirty = unspilled store). A stored local (dirty) or a HOT read local (≥2
+    // reads in the run) is kept resident so subsequent reads are a `mov`, not a
+    // frame `ldr`; cold single-read locals are loaded on demand (no caching, no
+    // pessimization). hot_locals is the read-≥2 set for this run.
+    lcache: std::collections::HashMap<u32, (u32, bool)>,
+    hot_locals: std::collections::HashSet<u32>,
 }
 
 const FTOS: u32 = 8; // d8 — canonical float top of stack at window boundaries
@@ -422,6 +441,8 @@ impl<'a> Low<'a> {
             fconsumed: 0,
             m: Metrics::default(),
             fetched: Vec::new(),
+            lcache: std::collections::HashMap::new(),
+            hot_locals: std::collections::HashSet::new(),
         }
     }
 
@@ -810,19 +831,83 @@ impl<'a> Low<'a> {
     }
 
     fn local_fetch(&mut self, i: u32) {
-        self.reserve(1);
-        let r = self.alloc();
-        self.out.push(ldr_off(r, LP, i * 8));
-        self.vs.push(Loc::Reg(r));
+        if let Some(&(r, _)) = self.lcache.get(&i) {
+            // resident (stored, or already loaded as a hot local) → reuse via copy
+            self.reserve(1);
+            let c = self.copy_of(Loc::Reg(r)); // mov; keeps the cache reg intact
+            self.vs.push(c);
+            self.m.local_hits += 1;
+        } else if self.hot_locals.contains(&i) {
+            // hot read (≥2 in this run): load once into the cache, then copy
+            self.reserve(2);
+            let rc = self.alloc();
+            self.out.push(ldr_off(rc, LP, i * 8));
+            self.m.local_loads += 1;
+            self.lcache.insert(i, (rc, false)); // clean — frame still matches
+            let c = self.copy_of(Loc::Reg(rc));
+            self.vs.push(c);
+        } else {
+            // cold read (once): load straight to the data stack, no caching
+            self.reserve(1);
+            let r = self.alloc();
+            self.out.push(ldr_off(r, LP, i * 8));
+            self.m.local_loads += 1;
+            self.vs.push(Loc::Reg(r));
+        }
     }
 
     fn local_store(&mut self, i: u32) {
         self.reserve(2);
         self.ensure(1);
         let a = self.vs.pop().unwrap();
-        let r = self.to_reg(a);
-        self.out.push(str_off(r, LP, i * 8));
-        self.freer(r);
+        let r = self.to_reg(a); // value now in r; the cache takes ownership (dirty)
+        if let Some((old, _)) = self.lcache.insert(i, (r, true)) {
+            if old != r {
+                self.freer(old); // a superseded cached value
+            }
+        }
+        // store deferred — flushed to the frame at the next barrier (spill_locals)
+    }
+
+    /// At a barrier, flush every DIRTY (unspilled-store) local to its LP frame
+    /// slot and free all cache registers (the frame becomes authoritative again;
+    /// caller-saved pool registers don't survive the upcoming call anyway).
+    fn spill_locals(&mut self) {
+        if self.lcache.is_empty() {
+            return;
+        }
+        let cached: Vec<(u32, (u32, bool))> = self.lcache.drain().collect();
+        for (i, (r, dirty)) in cached {
+            if dirty {
+                self.out.push(str_off(r, LP, i * 8));
+                self.m.local_spills += 1;
+            }
+            self.used[r as usize] = false;
+        }
+    }
+
+    /// `OpenLocals` (inline IR): allocate a nested LP sub-frame and pop the input
+    /// locals off the data stack into it.
+    fn open_locals(&mut self, total: u32, inputs: u32) {
+        self.settle(); // canonical data stack for the input pops; spills locals
+        if total > 0 {
+            self.out.push(sub_imm(LP, LP, total * 8));
+            for i in (0..inputs).rev() {
+                self.out.push(str_off(TOS, LP, i * 8)); // local[i] = TOS
+                self.out.push(ldr_post(TOS, DSP, 8)); // raise NOS into TOS
+            }
+        }
+    }
+
+    /// `CloseLocals` (inline IR): the locals are dead — drop the cache and pop the
+    /// sub-frame off LP.
+    fn close_locals(&mut self, total: u32) {
+        for (_, (r, _)) in self.lcache.drain() {
+            self.used[r as usize] = false; // dead at frame close; no spill
+        }
+        if total > 0 {
+            self.out.push(add_imm(LP, LP, total * 8));
+        }
     }
 
     fn ivar_fetch(&mut self, off: u32) {
@@ -985,6 +1070,7 @@ impl<'a> Low<'a> {
     /// Write the data virtual stack back to the canonical form (TOS in x0, the rest
     /// in memory from DSP) and reset.
     fn settle_data(&mut self) {
+        self.spill_locals(); // a barrier flushes deferred local stores to the frame
         if self.vs.is_empty() {
             self.ensure(1); // materialize a TOS from entry memory
         }
@@ -1080,6 +1166,15 @@ pub fn fused_cmp(c: Cmp, out: &mut Vec<u32>) -> u32 {
 /// canonical TOS=x0 / rest-in-memory form holds at every window boundary.
 pub fn lower(toks: &[Tok], out: &mut Vec<u32>, m: &mut Metrics) {
     let mut low = Low::new(out);
+    // Hotness pre-scan: a local read ≥2 times in this run is worth keeping in a
+    // register (cold single-reads load on demand — no caching, no pessimization).
+    let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for t in toks {
+        if let Tok::LocalFetch(i) = t {
+            *counts.entry(*i).or_default() += 1;
+        }
+    }
+    low.hot_locals = counts.into_iter().filter(|&(_, c)| c >= 2).map(|(i, _)| i).collect();
     for &t in toks {
         match t {
             Tok::Lit(n) => low.lit(n),
@@ -1117,6 +1212,8 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>, m: &mut Metrics) {
             Tok::Mem(mm) => low.mem(mm),
             Tok::LocalFetch(i) => low.local_fetch(i),
             Tok::LocalStore(i) => low.local_store(i),
+            Tok::OpenLocals { total, inputs } => low.open_locals(total, inputs),
+            Tok::CloseLocals { total } => low.close_locals(total),
             Tok::IvarFetch(off) => low.ivar_fetch(off),
             Tok::IvarStore(off) => low.ivar_store(off),
             Tok::SelfPush => low.self_push(),
