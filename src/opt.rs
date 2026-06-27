@@ -473,6 +473,11 @@ struct Low<'a> {
     // residency): index → d-register. Reserved (never reallocated or spilled)
     // across the loop's runs; reads/writes are fmov, not frame fldr/fstr.
     fpins: std::collections::HashMap<u32, u32>,
+    // Integer locals PINNED to a fixed x-register (the GP twin of fpins): index →
+    // x-register. Pinned from the HIGH end (x14/x15) so the do/loop counter
+    // machinery (x9-x12) never clobbers them; reads/writes are mov, not frame
+    // ldr/str. Like fpins, only sound in a call-free loop.
+    ipins: std::collections::HashMap<u32, u32>,
 }
 
 const FTOS: u32 = 8; // d8 — canonical float top of stack at window boundaries
@@ -480,7 +485,11 @@ const FSP: u32 = 22;
 const FPOOL: [u32; 7] = [9, 10, 11, 12, 13, 14, 15]; // d-register window pool
 
 impl<'a> Low<'a> {
-    fn new(out: &'a mut Vec<u32>, fpins: std::collections::HashMap<u32, u32>) -> Self {
+    fn new(
+        out: &'a mut Vec<u32>,
+        fpins: std::collections::HashMap<u32, u32>,
+        ipins: std::collections::HashMap<u32, u32>,
+    ) -> Self {
         // The incoming canonical form has TOS in x0 and FTOS in d8.
         let mut used = [false; 32];
         used[0] = true;
@@ -488,6 +497,9 @@ impl<'a> Low<'a> {
         fused[FTOS as usize] = true;
         for &d in fpins.values() {
             fused[d as usize] = true; // reserve pinned d-registers for the loop
+        }
+        for &r in ipins.values() {
+            used[r as usize] = true; // reserve pinned x-registers for the loop
         }
         Low {
             out,
@@ -507,6 +519,7 @@ impl<'a> Low<'a> {
             lcache: std::collections::HashMap::new(),
             hot_locals: std::collections::HashSet::new(),
             fpins,
+            ipins,
         }
     }
 
@@ -895,6 +908,14 @@ impl<'a> Low<'a> {
     }
 
     fn local_fetch(&mut self, i: u32) {
+        if let Some(&rp) = self.ipins.get(&i) {
+            // pinned: copy from the loop-carried register (no frame load)
+            self.reserve(1);
+            let c = self.copy_of(Loc::Reg(rp));
+            self.vs.push(c);
+            self.m.local_hits += 1;
+            return;
+        }
         if let Some(&(r, _)) = self.lcache.get(&i) {
             // resident (stored, or already loaded as a hot local) → reuse via copy
             self.reserve(1);
@@ -921,6 +942,20 @@ impl<'a> Low<'a> {
     }
 
     fn local_store(&mut self, i: u32) {
+        if let Some(&rp) = self.ipins.get(&i) {
+            // pinned: write the value into the loop-carried register (no frame store)
+            self.ensure(1);
+            match self.vs.pop().unwrap() {
+                Loc::Reg(r) if r == rp => {}
+                Loc::Reg(r) => {
+                    self.out.push(mov_reg(rp, r));
+                    self.freer(r);
+                }
+                Loc::Const(n) => load_imm64(rp, n as u64, self.out),
+            }
+            self.m.local_hits += 1;
+            return;
+        }
         self.reserve(2);
         self.ensure(1);
         let a = self.vs.pop().unwrap();
@@ -1390,6 +1425,9 @@ impl<'a> Low<'a> {
         self.vs.push(Loc::Reg(0));
         self.used = [false; 32];
         self.used[0] = true;
+        for &r in self.ipins.values() {
+            self.used[r as usize] = true; // pinned loop registers survive the settle
+        }
         self.consumed = 0;
         self.fetched.clear(); // a settle ends the window; re-reads after it are fresh
     }
@@ -1443,8 +1481,9 @@ pub fn lower(
     out: &mut Vec<u32>,
     m: &mut Metrics,
     fpins: std::collections::HashMap<u32, u32>,
+    ipins: std::collections::HashMap<u32, u32>,
 ) {
-    let mut low = Low::new(out, fpins);
+    let mut low = Low::new(out, fpins, ipins);
     // Hotness pre-scan: a local read ≥2 times in this run is worth keeping in a
     // register (cold single-reads load on demand — no caching, no pessimization).
     let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();

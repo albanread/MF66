@@ -129,16 +129,18 @@ pub struct Mf66Session {
     inline_words: HashMap<u64, Vec<Tok>>,
     /// Count of call sites where an inline word was spliced (calls eliminated).
     inline_splices: u32,
-    /// Float locals pinned to d-registers for the current loop (cross-iteration
-    /// residency): local index → d-register. Empty outside a pinned loop.
+    /// Float/int locals pinned to registers for the current loop (cross-iteration
+    /// residency): local index → d-register / x-register. Empty outside a pinned
+    /// loop.
     active_fpins: HashMap<u32, u32>,
+    active_ipins: HashMap<u32, u32>,
     /// Inner-loop nesting inside the pinned region (0 = the pinned loop itself,
     /// -1 = not in a pinned loop). The matching closer (nest 0) spills + clears.
     pin_nest: i32,
     /// Pins chosen by the loop-start peek-scan, held until `compile_control`
     /// activates them — AFTER the preceding run is flushed (so the pre-loop
     /// stores still land in the frame, where the load preamble reads them).
-    pending_pins: Option<HashMap<u32, u32>>,
+    pending_pins: Option<(HashMap<u32, u32>, HashMap<u32, u32>)>,
     /// CREATE/DOES> defining words → (build tokens incl. `create`, does-code xt
     /// or 0). Replayed in Rust at use time. See finish_defining/instantiate.
     defining_words: HashMap<String, (Vec<String>, u64)>,
@@ -301,6 +303,7 @@ impl Mf66Session {
             inline_words: HashMap::new(),
             inline_splices: 0,
             active_fpins: HashMap::new(),
+            active_ipins: HashMap::new(),
             pin_nest: -1,
             pending_pins: None,
             last_receiver_class: None,
@@ -1165,6 +1168,7 @@ impl Mf66Session {
                     // the loop's duration (peek-scan uses the input cursor here).
                     if matches!(lk.as_str(), "begin" | "do" | "?do")
                         && self.active_fpins.is_empty()
+                        && self.active_ipins.is_empty()
                         && self.pending_pins.is_none()
                     {
                         // Choose the pins now (needs the cursor) but DON'T activate
@@ -1401,15 +1405,24 @@ impl Mf66Session {
     /// (after `|`) just reserve a slot.
     /// Peek forward from `start` to the matching loop closer. If the loop body is
     /// call-free (every word compiles to a vstack op / literal / control word /
-    /// local — no settle-barrier Call that would clobber the pinned d-registers)
-    /// and the word has 1..=4 float locals, return the pin map (index → d9..).
-    fn scan_loop_pins(&self, b: &[u8], start: usize) -> Option<HashMap<u32, u32>> {
+    /// local — no settle-barrier Call that would clobber the pinned registers),
+    /// return the pin maps: float locals → d9.. (≤4), int locals → x15,x14 (≤2,
+    /// high end so the do/loop counter scratch x9-x12 never hits them).
+    fn scan_loop_pins(
+        &self,
+        b: &[u8],
+        start: usize,
+    ) -> Option<(HashMap<u32, u32>, HashMap<u32, u32>)> {
         let def = self.pending.as_ref()?;
         let fl: Vec<u32> = (0..def.locals.len())
             .filter(|&i| def.local_floats.get(i).copied().unwrap_or(false))
             .map(|i| i as u32)
             .collect();
-        if fl.is_empty() || fl.len() > 4 {
+        let il: Vec<u32> = (0..def.locals.len())
+            .filter(|&i| !def.local_floats.get(i).copied().unwrap_or(false))
+            .map(|i| i as u32)
+            .collect();
+        if fl.len() > 4 || (fl.is_empty() && il.is_empty()) {
             return None;
         }
         let mut pos = start;
@@ -1435,11 +1448,18 @@ impl Mf66Session {
                 }
             }
         }
-        let mut pins = HashMap::new();
+        let mut fpins = HashMap::new();
         for (k, &i) in fl.iter().enumerate() {
-            pins.insert(i, 9 + k as u32); // d9, d10, …
+            fpins.insert(i, 9 + k as u32); // d9, d10, …
         }
-        Some(pins)
+        let mut ipins = HashMap::new();
+        for (k, &i) in il.iter().take(2).enumerate() {
+            ipins.insert(i, 15 - k as u32); // x15, x14 (leave x9-x13 for the data stack)
+        }
+        if fpins.is_empty() && ipins.is_empty() {
+            return None;
+        }
+        Some((fpins, ipins))
     }
 
     /// A word that compiles without a settle-barrier Call (so the loop's pinned
@@ -1453,7 +1473,7 @@ impl Mf66Session {
             "u<", "u>", "0=", "0<>", "0<", "0>", "min", "max", "umin", "umax", "@",
             "!", "c@", "c!", "f+", "f-", "f*", "f/", "fnegate", "fsqrt", "fabs",
             "f@", "f!", "fdup", "fdrop", "fswap", "fover", "f<", "f0=", "f0<",
-            "f<=", "f>", "f>=", "f=", "f<>", "f0<>", "f0>", "if", "else", "then",
+            "f<=", "f>", "f>=", "f=", "f<>", "f0<>", "if", "else", "then",
             "begin", "until", "while", "repeat", "do", "loop", "+loop", "?do",
             "leave", "unloop", "exit", "unless",
         ];
@@ -1777,7 +1797,8 @@ impl Mf66Session {
     /// Reduce + lower the accumulated token run into the body, then clear it.
     /// Optimizer metrics accumulate into the pending definition.
     fn flush_toks(&mut self) {
-        let pins = self.active_fpins.clone();
+        let fpins = self.active_fpins.clone();
+        let ipins = self.active_ipins.clone();
         if let Some(def) = self.pending.as_mut() {
             if !def.toks.is_empty() {
                 let reduced = crate::opt::reduce(&def.toks, &mut def.metrics);
@@ -1785,7 +1806,7 @@ impl Mf66Session {
                 if let Some(acc) = def.inline_toks.as_mut() {
                     acc.extend_from_slice(&reduced);
                 }
-                crate::opt::lower(&reduced, &mut def.body, &mut def.metrics, pins);
+                crate::opt::lower(&reduced, &mut def.body, &mut def.metrics, fpins, ipins);
                 def.toks.clear();
             }
         }
@@ -1887,15 +1908,20 @@ impl Mf66Session {
         // The preceding run has now been flushed (frame stores landed), so the
         // load reads the correct initial values.
         if matches!(tok, "begin" | "do" | "?do") {
-            if let Some(pins) = self.pending_pins.take() {
-                self.active_fpins = pins;
+            if let Some((fp, ip)) = self.pending_pins.take() {
+                self.active_fpins = fp;
+                self.active_ipins = ip;
                 self.pin_nest = 0;
-                let loads: Vec<(u32, u32)> = self.active_fpins.iter().map(|(&i, &d)| (i, d)).collect();
+                let floads: Vec<(u32, u32)> = self.active_fpins.iter().map(|(&i, &d)| (i, d)).collect();
+                let iloads: Vec<(u32, u32)> = self.active_ipins.iter().map(|(&i, &r)| (i, r)).collect();
                 let def = self.pending.as_mut().unwrap();
-                for (i, d) in loads {
+                for (i, d) in floads {
                     def.body.push(crate::aenc::fldr_off(d, 21, i * 8)); // d = [LP+i*8]
                 }
-            } else if !self.active_fpins.is_empty() {
+                for (i, r) in iloads {
+                    def.body.push(crate::aenc::ldr_off(r, 21, i * 8)); // x = [LP+i*8]
+                }
+            } else if !self.active_fpins.is_empty() || !self.active_ipins.is_empty() {
                 self.pin_nest += 1; // a nested loop inside the pinned region
             }
         }
@@ -2012,16 +2038,20 @@ impl Mf66Session {
         }
         // Pin SPILL epilogue at the matching closer (where the loop exits): write
         // each pinned d-register back to its frame slot, then unpin.
-        if !self.active_fpins.is_empty()
+        if (!self.active_fpins.is_empty() || !self.active_ipins.is_empty())
             && matches!(tok, "until" | "again" | "repeat" | "loop" | "+loop")
         {
             if self.pin_nest > 0 {
                 self.pin_nest -= 1;
             } else {
-                let pins: Vec<(u32, u32)> = self.active_fpins.drain().collect();
+                let fp: Vec<(u32, u32)> = self.active_fpins.drain().collect();
+                let ip: Vec<(u32, u32)> = self.active_ipins.drain().collect();
                 let def = self.pending.as_mut().unwrap();
-                for (i, d) in pins {
+                for (i, d) in fp {
                     def.body.push(crate::aenc::fstr_off(d, 21, i * 8)); // [LP+i*8] = d
+                }
+                for (i, r) in ip {
+                    def.body.push(crate::aenc::str_off(r, 21, i * 8)); // [LP+i*8] = x
                 }
                 self.pin_nest = -1;
             }
@@ -2539,6 +2569,7 @@ impl Mf66Session {
         self.super_pending = false;
         self.bracket_interpret = false;
         self.active_fpins.clear();
+        self.active_ipins.clear();
         self.pin_nest = -1;
         self.pending_pins = None;
         self.reset();

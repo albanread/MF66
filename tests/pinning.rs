@@ -11,3 +11,16 @@ fn out(s:&str)->String{ Mf66Session::new().unwrap().eval_out(s).unwrap() }
     // a loop with a CALL (fsqrt is a call? no — vstack) — use f< (a call) → NOT pinned but still correct
     assert_eq!(out(": esc {: | float z :} 0e to z 0 begin z 9e f< while z 1e f+ to z 1+ repeat drop z f. ; esc"), "9 ");
 }
+
+#[test] fn pinned_int_locals() {
+    // call-free do-loop, int accumulator pinned (x15) across iterations
+    assert_eq!(out(": s {: | acc :} 0 to acc 100 0 do acc 1+ to acc loop acc . ; s"), "100 ");
+    // begin..until int local
+    assert_eq!(out(": cd {: | n :} 0 to n begin n 1+ to n n 5 = until n . ; cd"), "5 ");
+    // two int locals pinned (x15,x14)
+    assert_eq!(out(": t2 {: | a b :} 0 to a 0 to b 10 0 do a 2 + to a b 3 + to b loop a b + . ; t2"), "50 ");
+    // mixed: a float local (d9) AND an int local (x15) pinned in the same loop
+    assert_eq!(out(": mx {: | float z n :} 0e to z 0 to n 4 0 do z 1e f+ to z n 1+ to n loop n . z f. ; mx"), "4 4 ");
+    // do-loop using i (a Call) → must NOT pin, but still correct
+    assert_eq!(out(": si {: | acc :} 0 to acc 5 0 do acc i + to acc loop acc . ; si"), "10 ");
+}
