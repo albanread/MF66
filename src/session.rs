@@ -281,6 +281,8 @@ impl Mf66Session {
         self.eval(": falign ;")?; // data space is already cell-aligned
         // Misc Core-ext composed from existing primitives.
         self.eval(": ?: rot if drop else nip then ;")?; // ( f a b -- a|b )
+        self.eval(": true -1 ;")?;
+        self.eval(": false 0 ;")?;
         self.eval(": ?negate 0< if negate then ;")?; // ( n1 n2 -- n1|-n1 )
         self.eval(": under+ rot + swap ;")?; // ( a b c -- a+c b )
         self.eval(": d>s drop ;")?; // ( d -- n )
@@ -344,6 +346,58 @@ impl Mf66Session {
             ": ends-with? ew-suffix-u ! ew-suffix-addr ! \
                dup ew-suffix-u @ < if 2drop 0 \
                else ew-suffix-u @ - + ew-suffix-u @ ew-suffix-addr @ ew-suffix-u @ compare 0= then ;",
+        )?;
+        // REPLACES / SUBSTITUTE (Forth-2012 String-ext), ported from WF66 core.f
+        // (wordlist hiding dropped — all words land in the main dictionary).
+        self.eval("16 constant subst-max")?;
+        self.eval("create subst-table subst-max 4 cells * allot")?;
+        self.eval("variable subst-count")?;
+        self.eval("create subst-heap 2048 allot")?;
+        self.eval("variable subst-here")?;
+        self.eval(": subst-init subst-heap subst-here ! 0 subst-count ! ;")?;
+        self.eval("subst-init")?;
+        self.eval(": subst-slot 4 cells * subst-table + ;")?;
+        self.eval(": subst-name dup @ swap cell+ @ ;")?;
+        self.eval(": subst-val dup 2 cells + @ swap 3 cells + @ ;")?;
+        self.eval(": subst-alloc >r subst-here @ 2dup r@ cmove nip r@ subst-here +! r> ;")?;
+        self.eval(
+            ": subst-find subst-count @ 0 ?do \
+               2dup i subst-slot subst-name compare 0= if 2drop i true unloop exit then \
+               loop 2drop false ;",
+        )?;
+        self.eval(
+            ": replaces 2dup subst-find if \
+               >r 2drop subst-alloc r> subst-slot >r r@ 3 cells + ! r> 2 cells + ! \
+               else subst-count @ subst-max < if \
+               subst-count @ subst-slot >r 1 subst-count +! \
+               subst-alloc r@ cell+ ! r@ ! subst-alloc r@ 3 cells + ! r> 2 cells + ! \
+               else 2drop 2drop then then ;",
+        )?;
+        self.eval(
+            "variable sub-src variable sub-srclen variable sub-dst \
+             variable sub-dstmax variable sub-dstlen variable sub-count",
+        )?;
+        self.eval(
+            ": sub-emit sub-dstlen @ sub-dstmax @ < if \
+               sub-dst @ sub-dstlen @ + c! 1 sub-dstlen +! else drop then ;",
+        )?;
+        self.eval(": sub-emit-str bounds ?do i c@ sub-emit loop ;")?;
+        self.eval(": sub-advance 1 sub-src +! -1 sub-srclen +! ;")?;
+        self.eval(": sub-peek sub-src @ c@ ;")?;
+        self.eval(
+            ": substitute sub-dstmax ! sub-dst ! sub-srclen ! sub-src ! \
+               0 sub-dstlen ! 0 sub-count ! \
+               begin sub-srclen @ while \
+               sub-peek [char] % <> if sub-peek sub-emit sub-advance \
+               else sub-advance sub-srclen @ 0= if [char] % sub-emit \
+               else sub-peek [char] % = if [char] % sub-emit sub-advance \
+               else sub-src @ \
+               begin sub-srclen @ if sub-peek [char] % <> else 0 then while sub-advance repeat \
+               sub-src @ over - sub-srclen @ if sub-advance then \
+               2dup subst-find if >r 2drop r> subst-slot subst-val sub-emit-str 1 sub-count +! \
+               else [char] % sub-emit sub-emit-str [char] % sub-emit then \
+               then then then \
+               repeat sub-dst @ sub-dstlen @ sub-count @ ;",
         )?;
         Ok(())
     }
