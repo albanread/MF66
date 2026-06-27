@@ -65,6 +65,24 @@ pub enum FUn {
     Sqrt,
     Abs,
 }
+/// Floating-point comparison → data flag, inlined as `fcmp` + `csetm <cond>`
+/// (no settle-barrier Call). The `u32` is the AArch64 condition for the `csetm`;
+/// `Bin` compares the top two FP values, `Zero` compares the top against 0.0.
+/// `f< 0=` fuses by inverting the condition (`cond ^ 1`).
+#[derive(Clone, Copy, PartialEq)]
+pub enum FCmp {
+    Bin(u32),
+    Zero(u32),
+}
+impl FCmp {
+    /// The logical negation (for `<fcmp> 0=`): invert the condition's low bit.
+    fn negate(self) -> FCmp {
+        match self {
+            FCmp::Bin(c) => FCmp::Bin(c ^ 1),
+            FCmp::Zero(c) => FCmp::Zero(c ^ 1),
+        }
+    }
+}
 
 /// Branchless select words: `min max umin umax` (cmp + csel, foldable).
 #[derive(Clone, Copy)]
@@ -129,6 +147,7 @@ pub enum Tok {
     FStk(Stk),        // fdup / fdrop / fswap / fover (FP stack motion)
     FFetch,           // f@ ( addr -- ) ( F: -- r ): direct fldr — no settle/call
     FStore,           // f! ( addr -- ) ( F: r -- ): direct fstr — no settle/call
+    FCmp(FCmp),       // f< / f0= / f0< : fcmp + csetm → data flag, no settle/call
     Call(u64),
 }
 
@@ -376,11 +395,17 @@ pub fn reduce(toks: &[Tok], m: &mut Metrics) -> Vec<Tok> {
                 _ => out.push(t),
             },
             // logical negation of a comparison: `<cmp> 0=` → the inverse compare.
+            // Covers both integer (`< 0=` → `>=`) and FP (`f< 0=` → `f>=`) flags.
             Tok::Cmp(Cmp::ZEq) => match out.last().copied() {
                 Some(Tok::Cmp(c)) if c.negate().is_some() => {
                     let n = c.negate().unwrap();
                     out.pop();
                     out.push(Tok::Cmp(n));
+                    m.cmp_negates += 1;
+                }
+                Some(Tok::FCmp(c)) => {
+                    out.pop();
+                    out.push(Tok::FCmp(c.negate()));
                     m.cmp_negates += 1;
                 }
                 _ => out.push(t),
@@ -1113,6 +1138,33 @@ impl<'a> Low<'a> {
             FUn::Abs => fabs(a, a),
         });
     }
+    /// FP comparison → data flag: `fcmp` the FP operand(s), `csetm` a fresh GP
+    /// register with the condition, and bridge the flag onto the data stack. No
+    /// settle barrier — the FP compare stays inline (and pin-safe in loops).
+    fn fcmp_op(&mut self, c: FCmp) {
+        self.reserve(1); // a GP pool register for the boolean result
+        let cond = match c {
+            FCmp::Bin(cond) => {
+                self.fensure(2);
+                let b = self.fvs.pop().unwrap();
+                let a = self.fvs.pop().unwrap();
+                self.out.push(fcmp(a, b)); // a <cmp> b
+                self.fused[a as usize] = false;
+                self.fused[b as usize] = false;
+                cond
+            }
+            FCmp::Zero(cond) => {
+                self.fensure(1);
+                let a = self.fvs.pop().unwrap();
+                self.out.push(fcmp_zero(a)); // a <cmp> 0.0
+                self.fused[a as usize] = false;
+                cond
+            }
+        };
+        let g = self.alloc();
+        self.out.push(csetm(g, cond));
+        self.vs.push(Loc::Reg(g));
+    }
 
     /// Load fvariable `addr` into a fresh FP register (cache-aware for a const
     /// address); returns the d-register holding the value (cache copy for a hit).
@@ -1474,6 +1526,7 @@ pub fn lower(
             Tok::FUn(op) => low.fun(op),
             Tok::FFetch => low.ffetch(),
             Tok::FStore => low.fstore(),
+            Tok::FCmp(c) => low.fcmp_op(c),
             Tok::FStk(s) => {
                 let before = low.out.len();
                 low.fstk(s);

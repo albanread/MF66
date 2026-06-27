@@ -313,6 +313,14 @@ pub fn fldr_off(rt: u32, rn: u32, off: u32) -> u32 {
 pub fn fstr_off(rt: u32, rn: u32, off: u32) -> u32 {
     0xFD00_0000 | ((off / 8) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
 }
+/// `fcmp Dn, Dm`  (sets NZCV; feed the condition to `csetm`).
+pub fn fcmp(rn: u32, rm: u32) -> u32 {
+    0x1E60_2000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5)
+}
+/// `fcmp Dn, #0.0`  (compare to zero).
+pub fn fcmp_zero(rn: u32) -> u32 {
+    0x1E60_2008 | ((rn & 0x1F) << 5)
+}
 
 // AArch64 condition codes.
 pub const EQ: u32 = 0;
@@ -419,6 +427,10 @@ mod cf_tests {
         assert_eq!(vec![fstr0(8, 22)], asm("str d8, [x22]"));
         assert_eq!(vec![fldr_off(9, 22, 16)], asm("ldr d9, [x22, #16]"));
         assert_eq!(vec![fstr_off(8, 22, 24)], asm("str d8, [x22, #24]"));
+        assert_eq!(vec![fcmp(9, 8)], asm("fcmp d9, d8"));
+        assert_eq!(vec![fcmp(10, 12)], asm("fcmp d10, d12"));
+        assert_eq!(vec![fcmp_zero(8)], asm("fcmp d8, #0.0"));
+        assert_eq!(vec![fcmp_zero(13)], asm("fcmp d13, #0.0"));
     }
 }
 

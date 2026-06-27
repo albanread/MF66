@@ -135,8 +135,10 @@ pub struct Mf66Session {
     /// Inner-loop nesting inside the pinned region (0 = the pinned loop itself,
     /// -1 = not in a pinned loop). The matching closer (nest 0) spills + clears.
     pin_nest: i32,
-    /// Set when a pinned loop is established, until its load preamble is emitted.
-    pin_pending: bool,
+    /// Pins chosen by the loop-start peek-scan, held until `compile_control`
+    /// activates them — AFTER the preceding run is flushed (so the pre-loop
+    /// stores still land in the frame, where the load preamble reads them).
+    pending_pins: Option<HashMap<u32, u32>>,
     /// CREATE/DOES> defining words → (build tokens incl. `create`, does-code xt
     /// or 0). Replayed in Rust at use time. See finish_defining/instantiate.
     defining_words: HashMap<String, (Vec<String>, u64)>,
@@ -300,7 +302,7 @@ impl Mf66Session {
             inline_splices: 0,
             active_fpins: HashMap::new(),
             pin_nest: -1,
-            pin_pending: false,
+            pending_pins: None,
             last_receiver_class: None,
             dnu_xt: 0,
             send_xt: 0,
@@ -1163,12 +1165,12 @@ impl Mf66Session {
                     // the loop's duration (peek-scan uses the input cursor here).
                     if matches!(lk.as_str(), "begin" | "do" | "?do")
                         && self.active_fpins.is_empty()
+                        && self.pending_pins.is_none()
                     {
-                        if let Some(pins) = self.scan_loop_pins(b, pos) {
-                            self.active_fpins = pins;
-                            self.pin_pending = true;
-                            self.pin_nest = 0;
-                        }
+                        // Choose the pins now (needs the cursor) but DON'T activate
+                        // them yet — compile_control does that after flushing the
+                        // pre-loop run, so its stores reach the frame.
+                        self.pending_pins = self.scan_loop_pins(b, pos);
                     }
                     self.compile_token(tok)?;
                 }
@@ -1450,7 +1452,8 @@ impl Mf66Session {
             "nip", "rot", "-rot", "tuck", "?dup", "=", "<>", "<", ">", "<=", ">=",
             "u<", "u>", "0=", "0<>", "0<", "0>", "min", "max", "umin", "umax", "@",
             "!", "c@", "c!", "f+", "f-", "f*", "f/", "fnegate", "fsqrt", "fabs",
-            "f@", "f!", "fdup", "fdrop", "fswap", "fover", "if", "else", "then",
+            "f@", "f!", "fdup", "fdrop", "fswap", "fover", "f<", "f0=", "f0<",
+            "f<=", "f>", "f>=", "f=", "f<>", "f0<>", "f0>", "if", "else", "then",
             "begin", "until", "while", "repeat", "do", "loop", "+loop", "?do",
             "leave", "unloop", "exit", "unless",
         ];
@@ -1828,6 +1831,11 @@ impl Mf66Session {
             ("fdrop", &[Tok::FStk(Drop)]),
             ("fswap", &[Tok::FStk(Swap)]),
             ("fover", &[Tok::FStk(Over)]),
+            // FP compares → data flag (fcmp + csetm), inlined like the int compares
+            // so they carry no settle barrier and stay pin-safe inside loops.
+            ("f_less", &[Tok::FCmp(crate::opt::FCmp::Bin(crate::aenc::MI))]),
+            ("f_zero_equal", &[Tok::FCmp(crate::opt::FCmp::Zero(crate::aenc::EQ))]),
+            ("f_zero_less", &[Tok::FCmp(crate::opt::FCmp::Zero(crate::aenc::MI))]),
             ("equal", &[Tok::Cmp(Eq)]),
             ("not_equal", &[Tok::Cmp(Ne)]),
             ("less", &[Tok::Cmp(Lt)]),
@@ -1876,14 +1884,17 @@ impl Mf66Session {
         use crate::aenc::{b, emit_flag_test_cbz, patch_b, patch_bcond, patch_cbz};
         self.disable_inline(); // control flow → not a straight-line inline leaf
         // Pin LOAD preamble (before the loop marker) at the establishing begin/do.
+        // The preceding run has now been flushed (frame stores landed), so the
+        // load reads the correct initial values.
         if matches!(tok, "begin" | "do" | "?do") {
-            if self.pin_pending {
-                let pins: Vec<(u32, u32)> = self.active_fpins.iter().map(|(&i, &d)| (i, d)).collect();
+            if let Some(pins) = self.pending_pins.take() {
+                self.active_fpins = pins;
+                self.pin_nest = 0;
+                let loads: Vec<(u32, u32)> = self.active_fpins.iter().map(|(&i, &d)| (i, d)).collect();
                 let def = self.pending.as_mut().unwrap();
-                for (i, d) in pins {
+                for (i, d) in loads {
                     def.body.push(crate::aenc::fldr_off(d, 21, i * 8)); // d = [LP+i*8]
                 }
-                self.pin_pending = false;
             } else if !self.active_fpins.is_empty() {
                 self.pin_nest += 1; // a nested loop inside the pinned region
             }
@@ -2529,7 +2540,7 @@ impl Mf66Session {
         self.bracket_interpret = false;
         self.active_fpins.clear();
         self.pin_nest = -1;
-        self.pin_pending = false;
+        self.pending_pins = None;
         self.reset();
     }
 
