@@ -91,6 +91,20 @@ proc(rp_fetch)
     next()
 endp()
 
+; lp@  ( -- addr )   current locals-frame pointer (x21)
+proc(lp_fetch)
+    str     TOS, [DSP, #-cell]!
+    mov     TOS, LP
+    next()
+endp()
+
+; lp0@ ( -- addr )   initial locals-frame pointer (empty-frame top)
+proc(lp0_fetch)
+    str     TOS, [DSP, #-cell]!
+    ldr     TOS, [UP, #user_LP0]
+    next()
+endp()
+
 ; rp!  ( addr -- )   install a new return-stack pointer
 proc(rp_store)
     mov     RP, TOS

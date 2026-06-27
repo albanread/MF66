@@ -324,6 +324,10 @@ impl Mf66Session {
         self.eval("2 constant w/o")?;
         self.eval("3 constant r/w")?;
         self.eval(": bin ;")?;
+        // Locals-frame introspection: lp@ / lp0@ are primitives; lp-limit is the
+        // region floor (MF66's locals area is 512 KiB). lp-smoke exercises a frame.
+        self.eval(": lp-limit lp0@ 524288 - ;")?;
+        self.eval(": lp-smoke {: | a :} 42 ;")?;
         Ok(())
     }
 
@@ -749,6 +753,14 @@ impl Mf66Session {
                 self.push(addr as i64);
                 self.push(len as i64);
                 self.call("type_word")?;
+                continue;
+            }
+            // char / [char] NAME — push (or compile) the first byte of NAME.
+            if lk == "char" || lk == "[char]" {
+                let w = scan_word(b, &mut pos)
+                    .ok_or_else(|| anyhow::anyhow!("`{tok}` needs a character"))?;
+                let c = w.bytes().next().unwrap_or(0) as i64;
+                self.push_or_compile_lit(c);
                 continue;
             }
             // Receiver tracking for early binding: any token other than `->`

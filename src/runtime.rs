@@ -363,6 +363,13 @@ pub extern "C" fn rt_ud_mod(lo: u64, hi: u64, u: u64, qlo: *mut u64, qhi: *mut u
     (ud % d) as u64
 }
 
+/// ms ( u -- ): sleep u milliseconds (Facility wordset).
+pub extern "C" fn rt_ms(u: u64) {
+    if u > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(u));
+    }
+}
+
 /// free ( a-addr -- ior )
 pub extern "C" fn rt_free(addr: u64) -> u64 {
     if addr != 0 {
@@ -421,5 +428,6 @@ pub fn externs() -> Vec<(&'static str, *const ())> {
         ("rt_free", rt_free as *const ()),
         ("rt_resize", rt_resize as *const ()),
         ("rt_ud_mod", rt_ud_mod as *const ()),
+        ("rt_ms", rt_ms as *const ()),
     ]
 }

@@ -17,6 +17,14 @@ proc(free_word)
     next()
 endp()
 
+; ms ( u -- )   sleep u milliseconds (host)
+proc(ms_word)
+    aapcs_call(rt_ms)               ; x0 = u; no return value
+    ldr     TOS, [DSP]              ; drop u, raise NOS
+    stk(1, 0)
+    next()
+endp()
+
 ; resize ( a-addr u -- a-addr' ior )
 proc(resize_word)
     mov     x1, x0                  ; u
