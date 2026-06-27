@@ -64,6 +64,9 @@ pub enum FUn {
     Neg,
     Sqrt,
     Abs,
+    Floor, // frintm — round toward -inf
+    Round, // frinta — round to nearest, ties away
+    Trunc, // frintz — round toward zero
 }
 /// Floating-point comparison → data flag, inlined as `fcmp` + `csetm <cond>`
 /// (no settle-barrier Call). The `u32` is the AArch64 condition for the `csetm`;
@@ -1171,6 +1174,9 @@ impl<'a> Low<'a> {
             FUn::Neg => fneg(a, a),
             FUn::Sqrt => fsqrt(a, a),
             FUn::Abs => fabs(a, a),
+            FUn::Floor => frintm(a, a),
+            FUn::Round => frinta(a, a),
+            FUn::Trunc => frintz(a, a),
         });
     }
     /// FP comparison → data flag: `fcmp` the FP operand(s), `csetm` a fresh GP

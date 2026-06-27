@@ -24,3 +24,14 @@ fn out(s:&str)->String{ Mf66Session::new().unwrap().eval_out(s).unwrap() }
     // do-loop using i (a Call) → must NOT pin, but still correct
     assert_eq!(out(": si {: | acc :} 0 to acc 5 0 do acc i + to acc loop acc . ; si"), "10 ");
 }
+
+#[test] fn fp_pin_across_libm_and_rounding() {
+    // floor/fround/ftrunc are now inline vstack ops (no Call) — pinnable
+    assert_eq!(out(": fl {: | float z :} 3.7e to z 3 0 do z floor to z loop z f. ; fl"), "3 ");
+    // FP-preserving libm call (fsin) in the loop: float acc still pins across it.
+    // acc += sin(1.0) three times = 3*0.841470… ≈ 2.5244
+    assert_eq!(out(": ss {: float x | float acc :} 0e to acc 3 0 do x fsin acc f+ to acc loop acc f. ; 1e ss"),
+               Mf66Session::new().unwrap().eval_out(": sv 0e 3 0 do 1e fsin f+ loop f. ; sv").unwrap());
+    // a genuine barrier (user word) still blocks pinning but stays correct
+    assert_eq!(out(": dbl 2* ; : ub {: | acc :} 0 to acc 3 0 do acc 1+ dbl 2/ to acc loop acc . ; ub"), "3 ");
+}

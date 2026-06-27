@@ -225,6 +225,13 @@ struct Marker {
 }
 
 /// A pending control-flow mark (compile time).
+/// Pinning safety of a loop-body word (see `pin_safety`).
+enum PinSafety {
+    Full,    // no call — both float and int pins survive
+    FpOnly,  // FP-preserving libm call — float pins survive, int pins do not
+    Barrier, // clobbers the pin registers — no pinning
+}
+
 enum Cf {
     FwdCbz(usize),   // a forward `cbz` to patch (if / while)
     FwdBcond(usize), // a forward `b.<cond>` to patch (fused cmp + if / while)
@@ -1427,6 +1434,7 @@ impl Mf66Session {
         }
         let mut pos = start;
         let mut depth = 0i32;
+        let mut fp_only = false; // an FP-preserving libm call seen → float pins only
         loop {
             let w = scan_word(b, &mut pos)?; // ran off the end → not a clean loop
             let lk = w.to_ascii_lowercase();
@@ -1441,20 +1449,25 @@ impl Mf66Session {
                 "to" | "char" | "[char]" => {
                     scan_word(b, &mut pos); // consume the name argument
                 }
-                other => {
-                    if !Self::pin_safe_word(other, def) {
-                        return None; // a barrier (Call) in the body → unsafe to pin
-                    }
-                }
+                other => match Self::pin_safety(other, def) {
+                    PinSafety::Barrier => return None, // clobbers everything → no pins
+                    PinSafety::FpOnly => fp_only = true, // preserves d9-d15 but not GP scratch
+                    PinSafety::Full => {}
+                },
             }
         }
         let mut fpins = HashMap::new();
         for (k, &i) in fl.iter().enumerate() {
             fpins.insert(i, 9 + k as u32); // d9, d10, …
         }
+        // Int pins live in GP scratch (x14/x15), which an FP-preserving libm call
+        // (fsin etc.) still clobbers — so only pin int locals in a fully call-free
+        // loop. Float pins (d9-d15) survive those calls, so they stay allowed.
         let mut ipins = HashMap::new();
-        for (k, &i) in il.iter().take(2).enumerate() {
-            ipins.insert(i, 15 - k as u32); // x15, x14 (leave x9-x13 for the data stack)
+        if !fp_only {
+            for (k, &i) in il.iter().take(2).enumerate() {
+                ipins.insert(i, 15 - k as u32); // x15, x14 (leave x9-x13 for the data stack)
+            }
         }
         if fpins.is_empty() && ipins.is_empty() {
             return None;
@@ -1462,28 +1475,41 @@ impl Mf66Session {
         Some((fpins, ipins))
     }
 
-    /// A word that compiles without a settle-barrier Call (so the loop's pinned
-    /// d-registers survive it): a local, a literal, a control word, or one of the
-    /// inlined vstack primitives. Conservative — unknown words count as calls.
-    fn pin_safe_word(lk: &str, def: &ColonDef) -> bool {
+    /// Classify a loop-body word for pinning. `Full`: no call (vstack/literal/
+    /// control/local) — both float and int pins survive. `FpOnly`: a libm FP call
+    /// (fsin/fln/…) whose kernel wrapper preserves the callee-saved d8-d15 (so
+    /// float pins survive) but whose host call clobbers GP scratch x9-x17 (so int
+    /// pins do NOT). `Barrier`: anything else — no pins. Conservative.
+    fn pin_safety(lk: &str, def: &ColonDef) -> PinSafety {
         const SAFE: &[&str] = &[
             "+", "-", "*", "and", "or", "xor", "invert", "negate", "1+", "1-", "2+",
             "2-", "2*", "cell+", "cells", "char+", "dup", "drop", "swap", "over",
             "nip", "rot", "-rot", "tuck", "?dup", "=", "<>", "<", ">", "<=", ">=",
             "u<", "u>", "0=", "0<>", "0<", "0>", "min", "max", "umin", "umax", "@",
             "!", "c@", "c!", "f+", "f-", "f*", "f/", "fnegate", "fsqrt", "fabs",
-            "f@", "f!", "fdup", "fdrop", "fswap", "fover", "f<", "f0=", "f0<",
-            "f<=", "f>", "f>=", "f=", "f<>", "f0<>", "if", "else", "then",
-            "begin", "until", "while", "repeat", "do", "loop", "+loop", "?do",
-            "leave", "unloop", "exit", "unless",
+            "floor", "fround", "ftrunc", "f@", "f!", "fdup", "fdrop", "fswap",
+            "fover", "f<", "f0=", "f0<", "f<=", "f>", "f>=", "f=", "f<>", "f0<>",
+            "if", "else", "then", "begin", "until", "while", "repeat", "do",
+            "loop", "+loop", "?do", "leave", "unloop", "exit", "unless",
+        ];
+        // libm FP words: wrapper uses only d0/d1/d8, libm preserves d8-d15.
+        const FP_PRESERVING: &[&str] = &[
+            "fsin", "fcos", "ftan", "fexp", "fln", "flog", "fatan", "fasin",
+            "facos", "f**", "fatan2", "f.",
         ];
         if def.locals.iter().any(|n| n.eq_ignore_ascii_case(lk)) {
-            return true;
+            return PinSafety::Full;
         }
         if parse_forth_int(lk, 10).is_some() || parse_forth_float(lk).is_some() {
-            return true;
+            return PinSafety::Full;
         }
-        SAFE.iter().any(|s| s.eq_ignore_ascii_case(lk))
+        if SAFE.iter().any(|s| s.eq_ignore_ascii_case(lk)) {
+            return PinSafety::Full;
+        }
+        if FP_PRESERVING.iter().any(|s| s.eq_ignore_ascii_case(lk)) {
+            return PinSafety::FpOnly;
+        }
+        PinSafety::Barrier
     }
 
     fn open_locals(&mut self, names: Vec<String>, floats: Vec<bool>, inputs: usize) {
@@ -1846,6 +1872,11 @@ impl Mf66Session {
             ("f_negate", &[Tok::FUn(crate::opt::FUn::Neg)]),
             ("fsqrt_word", &[Tok::FUn(crate::opt::FUn::Sqrt)]),
             ("fabs_word", &[Tok::FUn(crate::opt::FUn::Abs)]),
+            // Single-instruction FP rounding (frintm/frinta/frintz) — inline like
+            // fsqrt/fabs, not Calls; no settle, fully pin-safe.
+            ("floor_word", &[Tok::FUn(crate::opt::FUn::Floor)]),
+            ("fround_word", &[Tok::FUn(crate::opt::FUn::Round)]),
+            ("ftrunc_word", &[Tok::FUn(crate::opt::FUn::Trunc)]),
             ("f_fetch", &[Tok::FFetch]), // f@ — fused absolute load, no settle
             ("f_store", &[Tok::FStore]), // f! — fused absolute store, no settle
             ("fdup", &[Tok::FStk(Dup)]),

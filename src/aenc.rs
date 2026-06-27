@@ -277,6 +277,18 @@ pub fn fabs(rd: u32, rn: u32) -> u32 {
 pub fn fsqrt(rd: u32, rn: u32) -> u32 {
     0x1E61_C000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
 }
+/// `frintm Dd, Dn`  (round toward -inf — `floor`).
+pub fn frintm(rd: u32, rn: u32) -> u32 {
+    0x1E65_4000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `frinta Dd, Dn`  (round to nearest, ties away — `fround`).
+pub fn frinta(rd: u32, rn: u32) -> u32 {
+    0x1E66_4000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `frintz Dd, Dn`  (round toward zero — `ftrunc`).
+pub fn frintz(rd: u32, rn: u32) -> u32 {
+    0x1E65_C000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
 /// `fmov Dd, Dn`.
 pub fn fmov_dd(rd: u32, rn: u32) -> u32 {
     0x1E60_4000 | ((rn & 0x1F) << 5) | (rd & 0x1F)
@@ -431,6 +443,10 @@ mod cf_tests {
         assert_eq!(vec![fcmp(10, 12)], asm("fcmp d10, d12"));
         assert_eq!(vec![fcmp_zero(8)], asm("fcmp d8, #0.0"));
         assert_eq!(vec![fcmp_zero(13)], asm("fcmp d13, #0.0"));
+        assert_eq!(vec![frintm(8, 8)], asm("frintm d8, d8"));
+        assert_eq!(vec![frinta(8, 8)], asm("frinta d8, d8"));
+        assert_eq!(vec![frintz(8, 8)], asm("frintz d8, d8"));
+        assert_eq!(vec![frintm(9, 12)], asm("frintm d9, d12"));
     }
 }
 
