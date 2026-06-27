@@ -167,6 +167,7 @@ enum Cf {
     FwdB(usize),     // a forward `b` to patch (else)
     Begin(usize),    // a backward target word index (begin)
     Do(usize, Vec<usize>), // DO-loop body top + forward branches (?do skip, leave)
+    Case,            // a CASE marker (endcase closes every of/endof `then` to here)
 }
 
 impl Mf66Session {
@@ -1184,6 +1185,38 @@ impl Mf66Session {
                 .toks
                 .push(Tok::Cmp(crate::opt::Cmp::ZEq));
             return self.compile_token("if");
+        }
+        // CASE / OF / ENDOF / ENDCASE — expand to if/else/then:
+        //   of ≡ `over = if drop`,  endof ≡ `else`,  endcase ≡ `drop` + close
+        //   every open `then` back to the CASE marker.
+        if lk == "case" {
+            self.pending.as_mut().unwrap().cf.push(Cf::Case);
+            return Ok(());
+        }
+        if lk == "of" {
+            let d = self.pending.as_mut().unwrap();
+            d.toks.push(Tok::Stk(crate::opt::Stk::Over));
+            d.toks.push(Tok::Cmp(crate::opt::Cmp::Eq));
+            self.compile_token("if")?; // over = fuses into the branch
+            self.pending.as_mut().unwrap().toks.push(Tok::Stk(crate::opt::Stk::Drop)); // matched: drop selector
+            return Ok(());
+        }
+        if lk == "endof" {
+            return self.compile_token("else");
+        }
+        if lk == "endcase" {
+            self.pending.as_mut().unwrap().toks.push(Tok::Stk(crate::opt::Stk::Drop)); // default: drop selector
+            self.flush_toks();
+            loop {
+                match self.pending.as_ref().unwrap().cf.last() {
+                    Some(Cf::Case) => {
+                        self.pending.as_mut().unwrap().cf.pop();
+                        return Ok(());
+                    }
+                    Some(_) => self.compile_control("then")?,
+                    None => anyhow::bail!("`endcase` without `case`"),
+                }
+            }
         }
         // cmp-branch fusion: a comparison immediately before if/until/while folds
         // into one cmp + b.<cond> (no -1/0 flag materialized).
