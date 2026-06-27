@@ -664,6 +664,52 @@ impl Mf66Session {
         Ok(xt)
     }
 
+    /// Define `name` as a CODE word: assemble the hand-written AArch64 `body`
+    /// (written in the kernel's macro/register convention — `TOS`, `DSP`, `cell`,
+    /// `stk`, `next`, …) through the JASM front-end + native encoder, commit the
+    /// self-contained machine code into the code arena, and bind `name` to it.
+    /// The body is the inside of a `proc … endp` (end it with `next` / `ret`).
+    /// Only self-contained leaf code is supported — anything needing a relocation
+    /// (a `bl` to a runtime extern or another word) is rejected.
+    pub fn define_code(&mut self, name: &str, body: &str) -> Result<u64> {
+        // The kernel's shared conventions (cell, register aliases, proc/endp/next)
+        // live in macros.masm; prepend it so the body assembles like a kernel proc.
+        const MACROS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/kernel/macros.masm"));
+        let source = format!("{MACROS}\nproc(mf66_code)\n{body}\nendp()\n");
+        let mut asm = Assembler::new();
+        asm.register_macro("stk", crate::asm_macros::stk);
+        let text = asm
+            .assemble("CODE", &source)
+            .map_err(|e| anyhow::anyhow!("code {name}: macro expansion: {e}"))?;
+        let module =
+            wfasm::a64::assemble(&text).map_err(|e| anyhow::anyhow!("code {name}: encode: {e}"))?;
+        if !module.externs.is_empty() {
+            anyhow::bail!(
+                "code {name}: references {:?} — only self-contained leaf code words are supported",
+                module.externs
+            );
+        }
+        if !module.relocs.is_empty() {
+            anyhow::bail!("code {name}: needs relocations (a bl/far branch) — only self-contained leaf code words are supported");
+        }
+        if module.code.len() % 4 != 0 {
+            anyhow::bail!("code {name}: encoded length {} not word-aligned", module.code.len());
+        }
+        let words: Vec<u32> = module
+            .code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let off = *module.symbols.get("mf66_code").unwrap_or(&0) as u64;
+        let xt = self.code.commit(&words)? + off;
+        self.push_name(name);
+        self.call("create")?;
+        let header = self.read_user(USER_LATEST);
+        self.write_u64(header + DH_XTPTR, xt);
+        self.write_u8(header + DH_TFA, TFA_TCOL);
+        Ok(xt)
+    }
+
     /// Allot a zeroed cell in data space and return its address.
     fn allot_cell(&mut self) -> u64 {
         let addr = self.read_user(USER_VAR_HERE);
@@ -998,6 +1044,35 @@ impl Mf66Session {
                 let header = self.read_user(USER_LATEST);
                 self.write_u64(header + DH_XTPTR, xt);
                 self.write_u8(header + DH_TFA, TFA_TCOL);
+                continue;
+            }
+            // CODE NAME <aarch64 asm> END-CODE — define a primitive whose body is
+            // hand-written assembly (kernel convention), assembled by JASM and
+            // committed to the code arena. The Forth escape hatch for hot code.
+            if lk == "code" {
+                let name = scan_word(b, &mut pos)
+                    .ok_or_else(|| anyhow::anyhow!("`code` needs a name"))?
+                    .to_string();
+                let body_start = pos;
+                let mut i = pos;
+                let body_end = loop {
+                    while i < b.len() && b[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    let ts = i;
+                    while i < b.len() && !b[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if ts == i {
+                        anyhow::bail!("`code {name}` reached end of input without `end-code`");
+                    }
+                    if b[ts..i].eq_ignore_ascii_case(b"end-code") {
+                        break ts;
+                    }
+                };
+                let body = String::from_utf8_lossy(&b[body_start..body_end]).into_owned();
+                pos = i; // past `end-code`
+                self.define_code(&name, &body)?;
                 continue;
             }
             // marker NAME — snapshot the dictionary, define NAME as a findable
