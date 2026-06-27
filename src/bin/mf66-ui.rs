@@ -32,18 +32,23 @@ fn main() -> Result<(), String> {
 
         loop {
             for we in mailbox::drain() {
-                if !matches!(we.event, UiEvent::Mouse(_)) {
-                    match ws.on_event(&we.event) {
-                        Reaction::Close => std::process::exit(0),
-                        Reaction::Submit(line) => {
-                            let result = session.eval_out(&line).map_err(|e| e.to_string());
-                            ws.record(line, result, session.stack(), session.compiling());
-                            if session.wants_bye() {
-                                std::process::exit(0);
-                            }
+                if matches!(we.event, UiEvent::Mouse(_)) {
+                    continue;
+                }
+                match ws.on_event(&we.event) {
+                    Reaction::Close => std::process::exit(0),
+                    Reaction::Submit(line) | Reaction::EvalBuffer(line) => {
+                        let result = session.eval_out(&line).map_err(|e| e.to_string());
+                        ws.record(line, result, session.stack(), session.compiling());
+                        if session.wants_bye() {
+                            std::process::exit(0);
                         }
-                        Reaction::None => {}
                     }
+                    Reaction::Save => {
+                        let r = ws.editor.save().map(|_| "saved".to_string()).map_err(|e| e.to_string());
+                        ws.record("⌘S".into(), r, session.stack(), session.compiling());
+                    }
+                    Reaction::None => {}
                 }
             }
             window::present_main(ws.render());

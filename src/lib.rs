@@ -22,6 +22,12 @@ pub mod primitives;
 pub mod runtime;
 pub mod session;
 #[cfg(feature = "ui")]
+pub mod editor;
+#[cfg(feature = "ui")]
+pub mod fsyntax;
+#[cfg(feature = "ui")]
+pub mod rope_buffer;
+#[cfg(feature = "ui")]
 pub mod workspace;
 #[cfg(feature = "ui")]
 pub mod wsdriver;

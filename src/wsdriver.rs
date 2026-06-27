@@ -17,7 +17,7 @@ use macide::render::CgCanvas;
 use rust_tcl::error::Error as TclError;
 use rust_tcl::{Arity, Registry, Value};
 
-use crate::workspace::{Reaction, Workspace};
+use crate::workspace::{Focus, Reaction, Workspace};
 use crate::Mf66Session;
 
 const W: usize = 1000;
@@ -49,6 +49,20 @@ fn do_eval(d: &mut Driver, line: &str) -> String {
         .record(line.to_string(), result, d.session.stack(), d.session.compiling());
     d.last = out.clone();
     out
+}
+
+/// Apply a workspace reaction (the host loop's equivalent): evaluate a submitted
+/// REPL line or editor buffer, or save the editor.
+fn react(d: &mut Driver, r: Reaction) {
+    match r {
+        Reaction::Submit(line) | Reaction::EvalBuffer(line) => {
+            do_eval(d, &line);
+        }
+        Reaction::Save => {
+            let _ = d.ws.editor.save();
+        }
+        Reaction::None | Reaction::Close => {}
+    }
 }
 
 /// The data stack as a space-separated string, bottom → top (natural reading
@@ -133,11 +147,56 @@ fn registry() -> Registry {
         let vk = map_key(a[0].as_str())
             .ok_or_else(|| TclError::runtime(format!("unknown key: {}", a[0].as_str())))?;
         with_driver(|d| {
-            if let Reaction::Submit(line) = d.ws.on_event(&key_ev(vk)) {
-                do_eval(d, &line);
-            }
+            let reaction = d.ws.on_event(&key_ev(vk));
+            react(d, reaction);
         });
         Ok(Value::new(""))
+    });
+
+    // ── editor / files ──
+    r.register("focus", Arity::exact(1), |_, a| {
+        let f = match a[0].as_str() {
+            "editor" => Focus::Editor,
+            "repl" => Focus::Repl,
+            o => return Err(TclError::runtime(format!("focus: editor|repl, not {o}"))),
+        };
+        with_driver(|d| d.ws.focus = f);
+        Ok(Value::new(""))
+    });
+    r.register("new", Arity::exact(0), |_, _| {
+        with_driver(|d| d.ws.editor.new_file());
+        Ok(Value::new(""))
+    });
+    r.register("open", Arity::exact(1), |_, a| {
+        let p = a[0].as_str().to_string();
+        with_driver(|d| d.ws.editor.load(&p)).map_err(|e| TclError::runtime(format!("open: {e}")))?;
+        Ok(Value::new(p))
+    });
+    r.register("save", Arity::exact(0), |_, _| {
+        with_driver(|d| d.ws.editor.save()).map_err(|e| TclError::runtime(format!("save: {e}")))?;
+        Ok(Value::new(""))
+    });
+    r.register("save-as", Arity::exact(1), |_, a| {
+        let p = a[0].as_str().to_string();
+        with_driver(|d| d.ws.editor.save_as(&p))
+            .map_err(|e| TclError::runtime(format!("save-as: {e}")))?;
+        Ok(Value::new(p))
+    });
+    r.register("format", Arity::exact(0), |_, _| {
+        with_driver(|d| d.ws.editor.format());
+        Ok(Value::new(""))
+    });
+    r.register("editor-set", Arity::exact(1), |_, a| {
+        let t = a[0].as_str().to_string();
+        with_driver(|d| d.ws.editor.set_text(&t));
+        Ok(Value::new(""))
+    });
+    r.register("editor-text", Arity::exact(0), |_, _| {
+        Ok(Value::new(with_driver(|d| d.ws.editor.text())))
+    });
+    r.register("eval-buffer", Arity::exact(0), |_, _| {
+        let buf = with_driver(|d| d.ws.editor.text());
+        Ok(Value::new(with_driver(|d| do_eval(d, &buf))))
     });
 
     // ── read-back (for assertions / agent observation) ──
