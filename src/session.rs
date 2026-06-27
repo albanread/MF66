@@ -156,6 +156,8 @@ struct ColonDef {
     /// raw (here) and replayed at use time rather than compiled.
     defining: bool,
     raw: Vec<String>,
+    /// Forward-branch indices from each `exit`, patched to the single epilogue.
+    exits: Vec<usize>,
 }
 
 /// A pending control-flow mark (compile time).
@@ -926,6 +928,7 @@ impl Mf66Session {
                     self_xt,
                     defining: false,
                     raw: Vec::new(),
+                    exits: Vec::new(),
                 });
             } else if lk == "2constant" {
                 let name = scan_word(b, &mut pos)
@@ -1285,9 +1288,12 @@ impl Mf66Session {
                 crate::aenc::emit_unloop(&mut def.body);
             }
             "exit" => {
-                // early return: emit the colon epilogue (caller must `unloop`
-                // first if inside a do-loop, per ANS).
-                crate::aenc::emit_unnest_ret(&mut def.body);
+                // early return: branch to the word's single epilogue (which runs
+                // the locals-frame teardown + unnest + ret). Caller must `unloop`
+                // first if inside a do-loop, per ANS.
+                let i = def.body.len();
+                def.body.push(crate::aenc::b(0));
+                def.exits.push(i);
             }
             "loop" => {
                 let (top, fwds) = match def.cf.pop() {
@@ -1356,10 +1362,17 @@ impl Mf66Session {
         if !def.cf.is_empty() {
             anyhow::bail!("unbalanced control flow in `{}`", def.name);
         }
+        // The single epilogue: every `exit` branches here so the locals teardown
+        // and unnest+ret exist once, not inlined at each early return.
+        let epilogue = def.body.len();
         if !def.locals.is_empty() {
             def.body.push(crate::aenc::add_imm(21, 21, (def.locals.len() * 8) as u32));
         }
         crate::aenc::emit_unnest_ret(&mut def.body);
+        let exits = std::mem::take(&mut def.exits);
+        for i in exits {
+            crate::aenc::patch_b(&mut def.body, i, epilogue);
+        }
         self.last_body_words = def.body.len();
         self.code.commit(&def.body)
     }
@@ -1418,6 +1431,7 @@ impl Mf66Session {
             self_xt,
             defining: false,
             raw: Vec::new(),
+            exits: Vec::new(),
         });
         for t in tokens {
             self.compile_token(t)?;
@@ -1582,6 +1596,7 @@ impl Mf66Session {
             self_xt,
             defining: false,
             raw: Vec::new(),
+            exits: Vec::new(),
         });
         self.method_class = Some(class);
         Ok(())

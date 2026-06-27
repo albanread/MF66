@@ -25,3 +25,12 @@ fn run(defs:&[&str], call:&str)->String{
     // unloop + exit out of a do-loop
     assert_eq!(run(&[": ul 5 0 do i 2 = if unloop 99 exit then loop -1 ;"], "ul ."), "99 ");
 }
+
+#[test] fn exit_restores_locals_frame() {
+    // a word with locals that exits early must still tear down its LP frame;
+    // call it many times — if LP leaked, this would drift/crash.
+    let mut s = Mf66Session::new().unwrap();
+    s.eval(": le {: a b :} a 0= if 111 exit then a b + ;").unwrap();
+    for _ in 0..2000 { assert_eq!(s.eval_out("0 5 le .").unwrap(), "111 "); s.reset_input(); }
+    assert_eq!(s.eval_out("3 4 le .").unwrap(), "7 ");
+}
