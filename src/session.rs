@@ -164,7 +164,7 @@ enum Cf {
     FwdBcond(usize), // a forward `b.<cond>` to patch (fused cmp + if / while)
     FwdB(usize),     // a forward `b` to patch (else)
     Begin(usize),    // a backward target word index (begin)
-    Do(usize),       // a DO-loop body top (loop / +loop branch back here)
+    Do(usize, Vec<usize>), // DO-loop body top + forward branches (?do skip, leave)
 }
 
 impl Mf66Session {
@@ -1092,7 +1092,8 @@ impl Mf66Session {
         }
         if matches!(
             lk.as_str(),
-            "if" | "else" | "then" | "begin" | "until" | "while" | "repeat" | "do" | "loop" | "+loop"
+            "if" | "else" | "then" | "begin" | "until" | "while" | "repeat" | "do" | "loop"
+                | "+loop" | "?do" | "leave" | "unloop" | "exit"
         ) {
             // Lower the accumulated straight-line run before the branch boundary.
             self.flush_toks();
@@ -1260,21 +1261,55 @@ impl Mf66Session {
             }
             "do" => {
                 crate::aenc::emit_do(&mut def.body);
-                def.cf.push(Cf::Do(def.body.len())); // loop body top
+                def.cf.push(Cf::Do(def.body.len(), Vec::new())); // loop body top
+            }
+            "?do" => {
+                // set up the frame, skip the body if index == limit
+                let skip = crate::aenc::emit_qdo(&mut def.body);
+                def.cf.push(Cf::Do(def.body.len(), vec![skip]));
+            }
+            "leave" => {
+                let i = crate::aenc::emit_leave(&mut def.body);
+                let fwds = def
+                    .cf
+                    .iter_mut()
+                    .rev()
+                    .find_map(|c| match c {
+                        Cf::Do(_, f) => Some(f),
+                        _ => None,
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("`leave` outside a do-loop"))?;
+                fwds.push(i);
+            }
+            "unloop" => {
+                crate::aenc::emit_unloop(&mut def.body);
+            }
+            "exit" => {
+                // early return: emit the colon epilogue (caller must `unloop`
+                // first if inside a do-loop, per ANS).
+                crate::aenc::emit_unnest_ret(&mut def.body);
             }
             "loop" => {
-                let top = match def.cf.pop() {
-                    Some(Cf::Do(t)) => t,
+                let (top, fwds) = match def.cf.pop() {
+                    Some(Cf::Do(t, f)) => (t, f),
                     _ => anyhow::bail!("`loop` without `do`"),
                 };
                 crate::aenc::emit_loop(&mut def.body, top);
+                let exit = def.body.len() - 1; // the frame-drop `add RP,RP,16`
+                for i in fwds {
+                    crate::aenc::patch_bcond(&mut def.body, i, exit);
+                }
             }
             "+loop" => {
-                let top = match def.cf.pop() {
-                    Some(Cf::Do(t)) => t,
+                let (top, fwds) = match def.cf.pop() {
+                    Some(Cf::Do(t, f)) => (t, f),
                     _ => anyhow::bail!("`+loop` without `do`"),
                 };
                 crate::aenc::emit_plus_loop(&mut def.body, top);
+                let exit = def.body.len() - 1;
+                for i in fwds {
+                    crate::aenc::patch_bcond(&mut def.body, i, exit);
+                }
             }
             _ => unreachable!(),
         }

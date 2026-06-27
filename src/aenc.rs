@@ -173,6 +173,30 @@ pub fn emit_plus_loop(out: &mut Vec<u32>, top: usize) {
     out.push(add_imm(RP, RP, 16));
 }
 
+/// `?do` ( limit index -- ): set up the loop frame like `do`, then skip the body
+/// if index == limit. Returns the forward-branch index to patch to the loop exit
+/// (the frame-drop emitted by `loop`/`+loop`).
+pub fn emit_qdo(out: &mut Vec<u32>) -> usize {
+    emit_do(out);
+    out.push(ldr0(9, RP)); // index
+    out.push(ldr_off(10, RP, CELL as u32)); // limit
+    out.push(cmp_reg(9, 10));
+    let i = out.len();
+    out.push(bcond(EQ, 0)); // index == limit → skip to exit (patched later)
+    i
+}
+/// `leave`: branch to the enclosing loop's exit (unconditional). Returns the
+/// branch index to patch at `loop`/`+loop`. The exit drops the frame.
+pub fn emit_leave(out: &mut Vec<u32>) -> usize {
+    let i = out.len();
+    out.push(bcond(AL, 0));
+    i
+}
+/// `unloop`: discard the innermost loop frame (for `exit` inside a do-loop).
+pub fn emit_unloop(out: &mut Vec<u32>) {
+    out.push(add_imm(RP, RP, 16));
+}
+
 // ── Optimizer lowering encoders ───────────────────────────────────────────
 /// `mul Xd, Xn, Xm`.
 pub fn mul(rd: u32, rn: u32, rm: u32) -> u32 {
@@ -302,6 +326,7 @@ pub const LT: u32 = 11;
 pub const GT: u32 = 12;
 pub const LE: u32 = 13;
 pub const MI: u32 = 4; // negative
+pub const AL: u32 = 14; // always
 
 const SCRATCH: u32 = 9; // x9
 
