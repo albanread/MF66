@@ -21,6 +21,8 @@ pub mod opt;
 pub mod primitives;
 pub mod runtime;
 pub mod session;
+#[cfg(feature = "ui")]
+pub mod workspace;
 
 pub use jit::Mf66Jit;
 pub use session::Mf66Session;

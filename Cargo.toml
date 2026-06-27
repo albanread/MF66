@@ -12,6 +12,23 @@ wfasm = { path = "../JASM/rust", default-features = false }
 anyhow = "1"
 libc = "0.2"
 
+# ── IDE workspace (optional) ──────────────────────────────────────────────────
+# `ui`  : the headless workspace state machine (events → DrawBatch). Pulls only
+#         the UI-neutral protocol — no AppKit — so it is unit-tested without a
+#         display (`cargo test --features ui`).
+# `gui` : the native macOS workspace window (the macide AppKit/Core-Text shell).
+#         Builds the `mf66-ui` binary (`cargo run --bin mf66-ui --features gui`).
+locus-ide-protocol = { path = "../locus/locus-ide-protocol", optional = true }
+macide = { path = "../locus/macide", optional = true, default-features = false, features = ["mac-gui"] }
+
+[features]
+ui = ["dep:locus-ide-protocol"]
+gui = ["ui", "dep:macide"]
+
+[[bin]]
+name = "mf66-ui"
+required-features = ["gui"]
+
 [lib]
 name = "mf66"
 path = "src/lib.rs"
