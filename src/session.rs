@@ -175,6 +175,8 @@ struct ColonDef {
     toks: Vec<Tok>,
     /// Local names by slot index (LP-relative frame); empty if none declared.
     locals: Vec<String>,
+    /// Per-local type: true = float (FP stack via fldr/fstr), false = integer.
+    local_floats: Vec<bool>,
     /// `:noname` — finish pushes the xt instead of creating a header.
     noname: bool,
     /// The code address this body will commit to (for `recurse`).
@@ -1113,10 +1115,13 @@ impl Mf66Session {
                 if lk == ";" {
                     self.finish_colon()?;
                 } else if lk == "{:" {
-                    // {: in0 in1 … | uninit … :}  — declare a locals frame
+                    // {: in0 in1 … | uninit … :}  — declare a locals frame. A
+                    // `float` keyword before a name marks it a float local (FP).
                     let mut names = Vec::new();
+                    let mut floats = Vec::new();
                     let mut inputs = 0usize;
                     let mut after_pipe = false;
+                    let mut next_float = false;
                     while let Some(t) = scan_word(b, &mut pos) {
                         if t == ":}" {
                             break;
@@ -1125,12 +1130,18 @@ impl Mf66Session {
                             after_pipe = true;
                             continue;
                         }
+                        if t.eq_ignore_ascii_case("float") {
+                            next_float = true;
+                            continue;
+                        }
                         if !after_pipe {
                             inputs += 1;
                         }
                         names.push(t.to_string());
+                        floats.push(next_float);
+                        next_float = false;
                     }
-                    self.open_locals(names, inputs);
+                    self.open_locals(names, floats, inputs);
                 } else if lk == "to" {
                     let target = scan_word(b, &mut pos)
                         .ok_or_else(|| anyhow::anyhow!("`to` needs a name"))?;
@@ -1177,6 +1188,7 @@ impl Mf66Session {
                     cf: Vec::new(),
                     toks: Vec::new(),
                     locals: Vec::new(),
+                    local_floats: Vec::new(),
                     noname: lk == ":noname",
                     self_xt,
                     defining: false,
@@ -1362,18 +1374,24 @@ impl Mf66Session {
     /// `{: … :}` — allocate a locals frame on LP (x21) and pop the input locals
     /// (declaration order; rightmost input = TOS) into it. Uninitialized locals
     /// (after `|`) just reserve a slot.
-    fn open_locals(&mut self, names: Vec<String>, inputs: usize) {
+    fn open_locals(&mut self, names: Vec<String>, floats: Vec<bool>, inputs: usize) {
         // Emit the frame open as a balanced body token so the lowerer sets it up
         // (and so a straight-line locals word can be spliced into a caller as a
         // nested sub-frame). The matching teardown is the commit_body epilogue
         // for a standalone body, or a CloseLocals appended to the inline IR.
         let count = names.len();
+        // bit i set ⇒ input i is a float (popped from the FP stack at open)
+        let float_mask: u32 = (0..inputs)
+            .filter(|&i| floats.get(i).copied().unwrap_or(false))
+            .fold(0u32, |m, i| m | (1 << i));
         let def = self.pending.as_mut().unwrap();
         def.locals = names;
+        def.local_floats = floats;
         if count > 0 {
             def.toks.push(Tok::OpenLocals {
                 total: count as u32,
                 inputs: inputs as u32,
+                float_mask,
             });
         }
     }
@@ -1395,7 +1413,13 @@ impl Mf66Session {
         let def = self.pending.as_ref().unwrap();
         match def.locals.iter().position(|n| n.eq_ignore_ascii_case(target)) {
             Some(i) => {
-                self.pending.as_mut().unwrap().toks.push(Tok::LocalStore(i as u32));
+                let is_f = def.local_floats.get(i).copied().unwrap_or(false);
+                let t = if is_f {
+                    Tok::LocalFStore(i as u32)
+                } else {
+                    Tok::LocalStore(i as u32)
+                };
+                self.pending.as_mut().unwrap().toks.push(t);
                 Ok(())
             }
             None => anyhow::bail!("`to {target}` — not a local/ivar"),
@@ -1427,13 +1451,24 @@ impl Mf66Session {
             self.super_pending = true;
             return Ok(());
         }
-        // A bare local name compiles to a fetch from its frame slot.
+        // A bare local name compiles to a fetch from its frame slot (FP for a
+        // float local, data stack for an integer local).
         if let Some(i) = self
             .pending
             .as_ref()
             .and_then(|d| d.locals.iter().position(|n| n.eq_ignore_ascii_case(tok)))
         {
-            self.pending.as_mut().unwrap().toks.push(Tok::LocalFetch(i as u32));
+            let is_f = self
+                .pending
+                .as_ref()
+                .and_then(|d| d.local_floats.get(i).copied())
+                .unwrap_or(false);
+            let t = if is_f {
+                Tok::LocalFFetch(i as u32)
+            } else {
+                Tok::LocalFetch(i as u32)
+            };
+            self.pending.as_mut().unwrap().toks.push(t);
             return Ok(());
         }
         let lk = tok.to_ascii_lowercase();
@@ -1957,6 +1992,8 @@ impl Mf66Session {
             .all(|t| !matches!(t, Tok::IvarFetch(_) | Tok::IvarStore(_) | Tok::SelfPush))
     }
 
+    // (LocalFFetch/LocalFStore are frame-relative like the int locals — fine to inline.)
+
     /// Expand any `Call(xt)` to an already-inlined word into its tokens, so an
     /// inline word that calls another inlines transitively (deps are defined
     /// earlier, hence already expanded).
@@ -2024,6 +2061,7 @@ impl Mf66Session {
             cf: Vec::new(),
             toks: Vec::new(),
             locals: Vec::new(),
+            local_floats: Vec::new(),
             noname: false,
             self_xt,
             defining: false,
@@ -2192,6 +2230,7 @@ impl Mf66Session {
             cf: Vec::new(),
             toks: Vec::new(),
             locals: Vec::new(),
+            local_floats: Vec::new(),
             noname: false,
             self_xt,
             defining: false,

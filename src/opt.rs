@@ -106,14 +106,17 @@ pub enum Tok {
     Cmp(Cmp),
     Sel(Sel),
     Mem(Mem),
-    LocalFetch(u32),  // push local[i] (LP-relative)
-    LocalStore(u32),  // local[i] = TOS; drop
+    LocalFetch(u32),  // push int local[i] (LP-relative) → data stack
+    LocalStore(u32),  // int local[i] = TOS; drop
+    LocalFFetch(u32), // push float local[i] → FP stack
+    LocalFStore(u32), // float local[i] = FTOS; FP-pop
     // Locals-frame open/close as balanced body tokens, so a locals word inlines
     // into a caller as a correct NESTED sub-frame (LP dips and pops). Only the
     // inline IR carries these; standalone bodies set up / tear down the frame
-    // directly (open_locals + the commit_body epilogue).
-    OpenLocals { total: u32, inputs: u32 }, // sub LP; pop `inputs` from data stack
-    CloseLocals { total: u32 },             // add LP (frame freed)
+    // directly (open_locals + the commit_body epilogue). `float_mask` bit i marks
+    // input i as a float (popped from the FP stack instead of the data stack).
+    OpenLocals { total: u32, inputs: u32, float_mask: u32 },
+    CloseLocals { total: u32 }, // add LP (frame freed)
     IvarFetch(u32),   // push [SELF + off]  (OOP instance variable)
     IvarStore(u32),   // [SELF + off] = TOS; drop
     SelfPush,         // push the current receiver (user_SELF)
@@ -909,16 +912,38 @@ impl<'a> Low<'a> {
     }
 
     /// `OpenLocals` (inline IR): allocate a nested LP sub-frame and pop the input
-    /// locals off the data stack into it.
-    fn open_locals(&mut self, total: u32, inputs: u32) {
-        self.settle(); // canonical data stack for the input pops; spills locals
+    /// locals off the data stack (int) or FP stack (float, per `float_mask`).
+    fn open_locals(&mut self, total: u32, inputs: u32, float_mask: u32) {
+        self.settle(); // both stacks canonical for the input pops
         if total > 0 {
             self.out.push(sub_imm(LP, LP, total * 8));
             for i in (0..inputs).rev() {
-                self.out.push(str_off(TOS, LP, i * 8)); // local[i] = TOS
-                self.out.push(ldr_post(TOS, DSP, 8)); // raise NOS into TOS
+                if float_mask & (1 << i) != 0 {
+                    self.out.push(fstr_off(FTOS, LP, i * 8)); // float local[i] = FTOS
+                    self.out.push(fldr_post(FTOS, FSP, 8)); // raise FP NOS into FTOS
+                } else {
+                    self.out.push(str_off(TOS, LP, i * 8)); // int local[i] = TOS
+                    self.out.push(ldr_post(TOS, DSP, 8)); // raise NOS into TOS
+                }
             }
         }
+    }
+
+    /// Float local read: load `[LP+i*8]` into the FP virtual stack (`fldr`).
+    fn local_ffetch(&mut self, i: u32) {
+        let d = self.falloc();
+        self.out.push(fldr_off(d, LP, i * 8));
+        self.fvs.push(d);
+        self.m.fp_fetches += 1;
+    }
+
+    /// Float local store: pop FTOS into `[LP+i*8]` (`fstr`).
+    fn local_fstore(&mut self, i: u32) {
+        self.fensure(1);
+        let d = self.fvs.pop().unwrap();
+        self.out.push(fstr_off(d, LP, i * 8));
+        self.fused[d as usize] = false;
+        self.m.fp_stores += 1;
     }
 
     /// `CloseLocals` (inline IR): the locals are dead — drop the cache and pop the
@@ -1351,7 +1376,11 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>, m: &mut Metrics) {
             Tok::Mem(mm) => low.mem(mm),
             Tok::LocalFetch(i) => low.local_fetch(i),
             Tok::LocalStore(i) => low.local_store(i),
-            Tok::OpenLocals { total, inputs } => low.open_locals(total, inputs),
+            Tok::LocalFFetch(i) => low.local_ffetch(i),
+            Tok::LocalFStore(i) => low.local_fstore(i),
+            Tok::OpenLocals { total, inputs, float_mask } => {
+                low.open_locals(total, inputs, float_mask)
+            }
             Tok::CloseLocals { total } => low.close_locals(total),
             Tok::IvarFetch(off) => low.ivar_fetch(off),
             Tok::IvarStore(off) => low.ivar_store(off),
