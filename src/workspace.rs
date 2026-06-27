@@ -100,6 +100,25 @@ impl Workspace {
         self.log.push(Line { text: s.into(), kind: Kind::Note });
     }
 
+    /// The current REPL input line (for read-back / agent inspection).
+    pub fn input_text(&self) -> String {
+        self.input.clone()
+    }
+
+    /// A plain-text snapshot of the visible screen — the output log plus the
+    /// input line. Lets an agent observe the workspace without a display.
+    pub fn screen_text(&self) -> String {
+        let mut out = String::new();
+        for l in &self.log {
+            out.push_str(&l.text);
+            out.push('\n');
+        }
+        let prompt = if self.compiling { "  … " } else { "ok> " };
+        out.push_str(prompt);
+        out.push_str(&self.input);
+        out
+    }
+
     /// Handle one UI event. Returns [`Reaction::Submit`] on Enter (the host then
     /// evaluates the line and calls [`record`](Self::record)).
     pub fn on_event(&mut self, ev: &UiEvent) -> Reaction {

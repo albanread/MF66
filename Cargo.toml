@@ -13,21 +13,29 @@ anyhow = "1"
 libc = "0.2"
 
 # ── IDE workspace (optional) ──────────────────────────────────────────────────
-# `ui`  : the headless workspace state machine (events → DrawBatch). Pulls only
-#         the UI-neutral protocol — no AppKit — so it is unit-tested without a
-#         display (`cargo test --features ui`).
-# `gui` : the native macOS workspace window (the macide AppKit/Core-Text shell).
-#         Builds the `mf66-ui` binary (`cargo run --bin mf66-ui --features gui`).
+# `ui`  : the headless workspace + the TCL agentic control layer. Pulls the
+#         UI-neutral protocol, the macide renderer (CgCanvas — headless Core
+#         Graphics, NO AppKit), the rust-tcl interpreter, and png. Unit-tested
+#         and script-driven without a display (`cargo test --features ui`,
+#         `cargo run --bin mf66-tcl --features ui -- script.tcl`).
+# `gui` : the native macOS window — adds macide's AppKit shell on top of `ui`.
+#         Builds `mf66-ui` (`cargo run --bin mf66-ui --features gui`).
 locus-ide-protocol = { path = "../locus/locus-ide-protocol", optional = true }
-macide = { path = "../locus/macide", optional = true, default-features = false, features = ["mac-gui"] }
+macide = { path = "../locus/macide", optional = true, default-features = false }
+rust-tcl = { path = "../locus/rust-tcl", optional = true }
+png = { version = "0.17", optional = true }
 
 [features]
-ui = ["dep:locus-ide-protocol"]
-gui = ["ui", "dep:macide"]
+ui = ["dep:locus-ide-protocol", "dep:macide", "dep:rust-tcl", "dep:png"]
+gui = ["ui", "macide/mac-gui"]
 
 [[bin]]
 name = "mf66-ui"
 required-features = ["gui"]
+
+[[bin]]
+name = "mf66-tcl"
+required-features = ["ui"]
 
 [lib]
 name = "mf66"

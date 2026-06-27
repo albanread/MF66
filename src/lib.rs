@@ -23,6 +23,8 @@ pub mod runtime;
 pub mod session;
 #[cfg(feature = "ui")]
 pub mod workspace;
+#[cfg(feature = "ui")]
+pub mod wsdriver;
 
 pub use jit::Mf66Jit;
 pub use session::Mf66Session;
