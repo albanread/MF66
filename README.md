@@ -28,6 +28,10 @@ The full plan, the verified ABI, and the phased roadmap live in
 raw subsystem review + adversarial critique that produced it are under
 [docs/review/](docs/review/).
 
+How the optimizing Forth compiler itself works — the token IR, the reduce pass,
+the deferred virtual-stack lowerer, register pinning, the STC ABI, and the
+`CODE … END-CODE` escape hatch — is documented in **[compiler.md](compiler.md)**.
+
 ## ABI (decided)
 
 `TOS=x0`, `DSP=x19`, `UP=x20`, `LP=x21`, `FTOS=d8`, `FSP=x22`; everything that
