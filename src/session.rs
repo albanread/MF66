@@ -1490,7 +1490,7 @@ impl Mf66Session {
             "floor", "fround", "ftrunc", "f@", "f!", "fdup", "fdrop", "fswap",
             "fover", "f<", "f0=", "f0<", "f<=", "f>", "f>=", "f=", "f<>", "f0<>",
             "if", "else", "then", "begin", "until", "while", "repeat", "do",
-            "loop", "+loop", "?do", "leave", "unloop", "exit", "unless",
+            "loop", "+loop", "?do", "leave", "unloop", "exit", "unless", "i", "j",
         ];
         // libm FP words: wrapper uses only d0/d1/d8, libm preserves d8-d15.
         const FP_PRESERVING: &[&str] = &[
@@ -1896,6 +1896,8 @@ impl Mf66Session {
             ("greater_equal", &[Tok::Cmp(Ge)]),
             ("u_less", &[Tok::Cmp(ULt)]),
             ("u_greater", &[Tok::Cmp(UGt)]),
+            ("i_word", &[Tok::LoopIdx(0)]), // do-loop index: ldr [RP], no Call
+            ("j_word", &[Tok::LoopIdx(16)]), // outer index: ldr [RP+16]
             ("zero_equal", &[Tok::Cmp(ZEq)]),
             ("zero_not_equal", &[Tok::Cmp(ZNe)]),
             ("zero_less", &[Tok::Cmp(ZLt)]),

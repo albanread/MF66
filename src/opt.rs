@@ -151,6 +151,7 @@ pub enum Tok {
     FFetch,           // f@ ( addr -- ) ( F: -- r ): direct fldr — no settle/call
     FStore,           // f! ( addr -- ) ( F: r -- ): direct fstr — no settle/call
     FCmp(FCmp),       // f< / f0= / f0< : fcmp + csetm → data flag, no settle/call
+    LoopIdx(u32),     // i / j : ldr from [RP+off] — loop index inline, no settle/call
     Call(u64),
 }
 
@@ -485,6 +486,7 @@ struct Low<'a> {
 
 const FTOS: u32 = 8; // d8 — canonical float top of stack at window boundaries
 const FSP: u32 = 22;
+const RP: u32 = 28; // return/loop stack pointer (x28); loop index at [RP], j at [RP+16]
 const FPOOL: [u32; 7] = [9, 10, 11, 12, 13, 14, 15]; // d-register window pool
 
 impl<'a> Low<'a> {
@@ -1095,6 +1097,15 @@ impl<'a> Low<'a> {
         self.vs.push(Loc::Reg(r));
     }
 
+    /// `i` / `j` — the do-loop index, read inline from the return stack ([RP+off])
+    /// instead of a settle-barrier Call to i_word. No settle; pin-safe.
+    fn loop_idx(&mut self, off: u32) {
+        self.reserve(1);
+        let r = self.alloc();
+        self.out.push(ldr_off(r, RP, off)); // r = [RP + off]  (i: off 0, j: off 16)
+        self.vs.push(Loc::Reg(r));
+    }
+
     fn ivar_store(&mut self, off: u32) {
         self.reserve(2);
         self.ensure(1);
@@ -1564,6 +1575,7 @@ pub fn lower(
             }
             Tok::CloseLocals { total } => low.close_locals(total),
             Tok::IvarFetch(off) => low.ivar_fetch(off),
+            Tok::LoopIdx(off) => low.loop_idx(off),
             Tok::IvarStore(off) => low.ivar_store(off),
             Tok::SelfPush => low.self_push(),
             Tok::FLit(bits) => low.flit(bits),
