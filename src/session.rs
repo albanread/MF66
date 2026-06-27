@@ -400,6 +400,22 @@ impl Mf66Session {
                then then then \
                repeat sub-dst @ sub-dstlen @ sub-count @ ;",
         )?;
+        // Limit constants, spacing, base-printers and misc utilities (WF66 core.f).
+        self.eval("32 constant bl")?;
+        self.eval(": space bl emit ;")?;
+        self.eval(": spaces 0 max 0 ?do space loop ;")?;
+        self.eval("-1 constant max-u")?;
+        self.eval("-1 1 rshift constant max-n")?; // 2^63 - 1
+        self.eval("1 63 lshift constant min-n")?; // -2^63
+        self.eval("255 constant max-char")?;
+        self.eval(": noop ;")?;
+        self.eval(": char- 1- ;")?; // ( c-addr -- c-addr-1 )
+        self.eval(": hex. base @ >r hex . r> base ! ;")?;
+        self.eval(": bin. base @ >r 2 base ! . r> base ! ;")?;
+        self.eval(": oct. base @ >r 8 base ! . r> base ! ;")?;
+        self.eval(": dec. base @ >r decimal . r> base ! ;")?;
+        self.eval(": assert rot 0= if type cr abort else 2drop then ;")?; // ( flag c-addr u -- )
+        self.eval(": ud.r >r <# #s #> r> over - 0 max spaces type ;")?; // ( ud width -- )
         Ok(())
     }
 
