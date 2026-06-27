@@ -303,6 +303,15 @@ impl Mf66Session {
         self.eval(": d0> d0<= 0= ;")?;
         self.eval(": dmax 2over 2over d< if 2swap then 2drop ;")?;
         self.eval(": dmin 2over 2over d< 0= if 2swap then 2drop ;")?;
+        self.eval(": du<= du> 0= ;")?;
+        self.eval(": du>= du< 0= ;")?;
+        self.eval(": m+ s>d d+ ;")?; // ( d n -- d' )
+        // Float helpers composed from the FP primitives.
+        self.eval(": f<> f= 0= ;")?;
+        self.eval(": f0<> f0= 0= ;")?;
+        // Misc convenience.
+        self.eval(": third 2 pick ;")?; // ( a b c -- a b c a )
+        self.eval(": environment? 2drop 0 ;")?; // ( c-addr u -- false ) unknown query
         // String helpers (compose from /string / compare / search)
         self.eval(": -trailing begin dup if 2dup + 1- c@ 32 = else 0 then while 1- repeat ;")?;
         self.eval(": -leading begin dup if over c@ 32 = else 0 then while 1 /string repeat ;")?;
@@ -328,6 +337,14 @@ impl Mf66Session {
         // region floor (MF66's locals area is 512 KiB). lp-smoke exercises a frame.
         self.eval(": lp-limit lp0@ 524288 - ;")?;
         self.eval(": lp-smoke {: | a :} 42 ;")?;
+        // ends-with? — needs `variable`, so it's defined here after the defining
+        // words are bootstrapped (ported from WF66 core.f).
+        self.eval("variable ew-suffix-u variable ew-suffix-addr")?;
+        self.eval(
+            ": ends-with? ew-suffix-u ! ew-suffix-addr ! \
+               dup ew-suffix-u @ < if 2drop 0 \
+               else ew-suffix-u @ - + ew-suffix-u @ ew-suffix-addr @ ew-suffix-u @ compare 0= then ;",
+        )?;
         Ok(())
     }
 
@@ -830,6 +847,14 @@ impl Mf66Session {
                     self.oop_defined_q(s)?;
                     continue;
                 }
+                "[undefined]" => {
+                    let s = scan_word(b, &mut pos)
+                        .ok_or_else(|| anyhow::anyhow!("`[undefined]` needs a name"))?;
+                    self.oop_defined_q(s)?; // -1 if defined, 0 if not
+                    let v = self.pop_data().unwrap_or(0);
+                    self.push(if v == 0 { -1 } else { 0 });
+                    continue;
+                }
                 "object?" => {
                     self.oop_object_q();
                     continue;
@@ -1095,6 +1120,16 @@ impl Mf66Session {
                     return Ok(());
                 }
             }
+        }
+        // `unless` ≡ `0= if` — push a zero-test, then compile as `if` (the cmp
+        // fuses into a single inverted branch).
+        if lk == "unless" {
+            self.pending
+                .as_mut()
+                .unwrap()
+                .toks
+                .push(Tok::Cmp(crate::opt::Cmp::ZEq));
+            return self.compile_token("if");
         }
         // cmp-branch fusion: a comparison immediately before if/until/while folds
         // into one cmp + b.<cond> (no -1/0 flag materialized).
