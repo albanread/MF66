@@ -379,6 +379,7 @@ impl Mf66Session {
         // Defining words, now built the real Forth way on CREATE/DOES>.
         self.eval(": constant create , does> @ ;")?;
         self.eval(": variable create 0 , ;")?; // pushes the cell address
+        self.eval(": fvariable create 0 , ;")?; // a float cell (8 bytes), via f@/f!
         self.eval(": 2variable create 0 , 0 , ;")?;
         // Structures (CREATE/DOES> all the way down).
         self.eval(": field: aligned create dup , cell + does> @ + ;")?;
