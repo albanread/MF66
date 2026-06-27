@@ -102,6 +102,9 @@ pub struct Mf66Session {
     /// address never changes — so `v @`/`v !` lower to a register ldr/str instead
     /// of a veneer call.
     var_addrs: HashMap<String, u64>,
+    /// Every CREATE-instance's data-field address (incl. does>-having ones like
+    /// `2value`/`defer`), so `is`/`2to`/`+to` can write into it.
+    instance_addrs: HashMap<String, u64>,
     /// CREATE/DOES> defining words → (build tokens incl. `create`, does-code xt
     /// or 0). Replayed in Rust at use time. See finish_defining/instantiate.
     defining_words: HashMap<String, (Vec<String>, u64)>,
@@ -233,6 +236,7 @@ impl Mf66Session {
             values: HashMap::new(),
             defining_words: HashMap::new(),
             var_addrs: HashMap::new(),
+            instance_addrs: HashMap::new(),
             last_receiver_class: None,
             dnu_xt: 0,
             send_xt: 0,
@@ -416,6 +420,12 @@ impl Mf66Session {
         self.eval(": dec. base @ >r decimal . r> base ! ;")?;
         self.eval(": assert rot 0= if type cr abort else 2drop then ;")?; // ( flag c-addr u -- )
         self.eval(": ud.r >r <# #s #> r> over - 0 max spaces type ;")?; // ( ud width -- )
+        // 2VALUE / DEFER via CREATE/DOES> (2to / is write into their cells).
+        self.eval(": 2value create , , does> 2@ ;")?;
+        self.eval(": defer create 0 , does> @ ?dup if execute then ;")?;
+        // Facility terminal stubs (no cursor addressing in this host).
+        self.eval(": at-xy 2drop ;")?;
+        self.eval(": page ;")?;
         Ok(())
     }
 
@@ -851,6 +861,63 @@ impl Mf66Session {
                 self.push_or_compile_lit(c);
                 continue;
             }
+            // Value-family stores: `is NAME` (defer), `2to NAME` (2value),
+            // `+to NAME` (value). Each pushes the target address then a store op,
+            // in interpret or compile state.
+            if lk == "is" || lk == "2to" || lk == "+to" {
+                let name = scan_word(b, &mut pos)
+                    .ok_or_else(|| anyhow::anyhow!("`{tok}` needs a name"))?;
+                let (addr, op): (u64, &str) = match lk.as_str() {
+                    "+to" => (
+                        *self
+                            .values
+                            .get(name)
+                            .ok_or_else(|| anyhow::anyhow!("`+to {name}` — not a value"))?,
+                        "plus_store",
+                    ),
+                    "2to" => (
+                        *self
+                            .instance_addrs
+                            .get(name)
+                            .ok_or_else(|| anyhow::anyhow!("`2to {name}` — not a 2value"))?,
+                        "two_store",
+                    ),
+                    _ => (
+                        *self
+                            .instance_addrs
+                            .get(name)
+                            .ok_or_else(|| anyhow::anyhow!("`is {name}` — not a deferred word"))?,
+                        "store",
+                    ),
+                };
+                if self.pending.is_some() {
+                    let xt = self.xt_of(op)?;
+                    let d = self.pending.as_mut().unwrap();
+                    d.toks.push(Tok::Lit(addr as i64));
+                    d.toks.push(Tok::Call(xt));
+                } else {
+                    self.push(addr as i64);
+                    self.call(op)?;
+                }
+                continue;
+            }
+            // synonym NEW OLD — define NEW to execute OLD.
+            if lk == "synonym" {
+                let newname = scan_word(b, &mut pos)
+                    .ok_or_else(|| anyhow::anyhow!("`synonym` needs a new name"))?
+                    .to_string();
+                let oldname = scan_word(b, &mut pos)
+                    .ok_or_else(|| anyhow::anyhow!("`synonym` needs an old name"))?;
+                let xt = self
+                    .xt_of_forth_name(oldname)?
+                    .ok_or_else(|| anyhow::anyhow!("`synonym`: `{oldname}` is undefined"))?;
+                self.push_name(&newname);
+                self.call("create")?;
+                let header = self.read_user(USER_LATEST);
+                self.write_u64(header + DH_XTPTR, xt);
+                self.write_u8(header + DH_TFA, TFA_TCOL);
+                continue;
+            }
             // Receiver tracking for early binding: any token other than `->`
             // begins a fresh receiver context.
             if lk != "->" {
@@ -911,6 +978,7 @@ impl Mf66Session {
                     let addr = self.read_user(USER_VAR_HERE);
                     self.publish_constant(s, addr as i64)?; // NAME pushes the data field addr
                     self.var_addrs.insert(s.to_string(), addr); // fold to a literal in code
+                    self.instance_addrs.insert(s.to_string(), addr);
                     continue;
                 }
                 "[defined]" => {
@@ -1603,6 +1671,7 @@ impl Mf66Session {
         for t in build.to_vec() {
             if t.eq_ignore_ascii_case("create") {
                 let body_addr = self.read_user(USER_VAR_HERE);
+                self.instance_addrs.insert(target.to_string(), body_addr);
                 let mut wbody = Vec::new();
                 crate::aenc::emit_lit(body_addr as i64, &mut wbody);
                 if does_xt != 0 {
