@@ -31,3 +31,15 @@ use mf66::Mf66Session;
     s.eval("outer").unwrap();                          // rolls back x, y, AND inner
     assert_eq!(s.eval_out("[defined] x [defined] y [defined] inner + + .").unwrap(), "0 ");
 }
+
+#[test] fn forget_word() {
+    let mut s = Mf66Session::new().unwrap();
+    s.eval("marker anchor : fg-foo 111 ; : fg-bar 222 ;").unwrap();
+    assert_eq!(s.eval_out("fg-foo fg-bar + .").unwrap(), "333 ");
+    s.eval("forget fg-foo").unwrap();                  // forgets fg-foo AND fg-bar
+    assert_eq!(s.eval_out("[defined] fg-foo .").unwrap(), "0 ");
+    assert_eq!(s.eval_out("[defined] fg-bar .").unwrap(), "0 ");
+    assert_eq!(s.eval_out("[defined] anchor .").unwrap(), "-1 ");   // anchor survives
+    s.eval("anchor").unwrap();                          // marker still works after forget
+    assert_eq!(s.eval_out("[defined] anchor .").unwrap(), "0 ");
+}

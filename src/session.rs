@@ -43,7 +43,11 @@ const DN_BUCKET_NEXT: u64 = 0;
 const DN_GLOBAL_PREV: u64 = 8;
 const DN_WID: u64 = 24;
 const DN_HASH: u64 = 32; // u32 in the low 4 bytes
+const DN_HEADER: u64 = 16;
+const DN_SIZE: u64 = 40;
 const WL_BUCKET_MASK: u64 = 511;
+const DH_LINK: u64 = 0; // prev header in the LATEST chain
+const DH_NT: u64 = 47; // name-length byte; the name token nt = header + dh_nt
 const USER_HOST_RSP: usize = 0x58;
 const USER_DSP_SAVE: usize = 0x60;
 const USER_SP0: usize = 0x68;
@@ -964,6 +968,14 @@ impl Mf66Session {
                 self.markers.insert(name, snap);
                 continue;
             }
+            // forget NAME — forget NAME and everything defined after it.
+            if lk == "forget" {
+                let name = scan_word(b, &mut pos)
+                    .ok_or_else(|| anyhow::anyhow!("`forget` needs a name"))?
+                    .to_ascii_lowercase();
+                self.forget_word(&name)?;
+                continue;
+            }
             // Receiver tracking for early binding: any token other than `->`
             // begins a fresh receiver context.
             if lk != "->" {
@@ -1218,6 +1230,60 @@ impl Mf66Session {
         self.defining_words = m.defining_words;
         let t = m.index_here;
         self.markers.retain(|_, mk| mk.index_here > t); // drop markers made after
+    }
+
+    /// forget NAME — forget NAME and every definition made after it (no snapshot;
+    /// reconstruct the rollback point from NAME's overlay node + header).
+    fn forget_word(&mut self, name: &str) -> Result<()> {
+        self.push_name(name);
+        self.call("find_name")?;
+        if self.stack().first() != Some(&-1) {
+            self.call("drop_")?;
+            self.call("drop_")?;
+            self.call("drop_")?;
+            anyhow::bail!("forget: `{name}` not found");
+        }
+        self.call("drop_")?; // drop the -1
+        let nt = self.stack()[0] as u64;
+        self.call("drop_")?; // drop the nt
+        let header = nt - DH_NT;
+        // locate NAME's overlay node (global creation chain, newest-first)
+        let mut node = self.read_user(USER_INDEX_LATEST);
+        while node != 0 && self.read_u64(node + DN_HEADER) != header {
+            node = self.read_u64(node + DN_GLOBAL_PREV);
+        }
+        if node == 0 {
+            anyhow::bail!("forget: no overlay node for `{name}`");
+        }
+        let prev = self.read_u64(node + DN_GLOBAL_PREV);
+        let link = self.read_u64(header + DH_LINK);
+        self.rollback_overlay(node + DN_SIZE, prev);
+        self.write_user(USER_LATEST, link);
+        self.write_user(USER_HERE, header);
+        self.prune_maps();
+        Ok(())
+    }
+
+    /// Drop Rust-side map entries whose name is no longer in the dictionary
+    /// (after a `forget`, which doesn't carry a snapshot of the maps).
+    fn prune_maps(&mut self) {
+        macro_rules! prune {
+            ($m:ident) => {{
+                let keys: Vec<String> = self.$m.keys().cloned().collect();
+                for k in keys {
+                    if self.xt_of_forth_name(&k).ok().flatten().is_none() {
+                        self.$m.remove(&k);
+                    }
+                }
+            }};
+        }
+        prune!(values);
+        prune!(var_addrs);
+        prune!(instance_addrs);
+        prune!(defining_words);
+        prune!(classes);
+        prune!(objects);
+        prune!(markers);
     }
 
     /// Interpret one token: find+execute, else number→push, else error.
