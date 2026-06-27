@@ -54,6 +54,7 @@ fn c_stack() -> Color { rgb(233, 196, 106) }
 fn c_accent() -> Color { rgb(120, 170, 255) }
 fn c_focus() -> Color { rgb(86, 156, 214) }
 fn c_caret() -> Color { rgb(220, 230, 255) }
+fn c_sel() -> Color { rgb(48, 66, 104) }
 
 // syntax tag → colour
 fn tag_color(t: Tag) -> Color {
@@ -238,11 +239,14 @@ impl Workspace {
                 if cmd {
                     return match *virtual_key {
                         VK_RETURN => Reaction::EvalBuffer(self.editor.text()),
-                        0x53 => Reaction::Save,                          // ⌘S
-                        0x46 if shift => {                                // ⌘⇧F format
-                            self.editor.format();
-                            Reaction::None
-                        }
+                        0x53 => Reaction::Save,                    // ⌘S save
+                        0x46 if shift => { self.editor.format(); Reaction::None } // ⌘⇧F format
+                        0x41 => { self.editor.select_all(); Reaction::None }      // ⌘A
+                        0x43 => { self.editor.copy(); Reaction::None }            // ⌘C
+                        0x58 => { self.editor.cut(); Reaction::None }             // ⌘X
+                        0x56 => { self.editor.paste(); Reaction::None }           // ⌘V
+                        0x5A if shift => { self.editor.redo(); Reaction::None }   // ⌘⇧Z
+                        0x5A => { self.editor.undo(); Reaction::None }            // ⌘Z
                         _ => Reaction::None,
                     };
                 }
@@ -250,12 +254,12 @@ impl Workspace {
                     VK_RETURN => self.editor.newline(),
                     VK_BACK => self.editor.backspace(),
                     VK_DELETE => self.editor.delete_forward(),
-                    VK_LEFT => self.editor.move_left(),
-                    VK_RIGHT => self.editor.move_right(),
-                    VK_UP => self.editor.move_up(),
-                    VK_DOWN => self.editor.move_down(),
-                    VK_HOME => self.editor.home(),
-                    VK_END => self.editor.end(),
+                    VK_LEFT => self.editor.move_left(shift),
+                    VK_RIGHT => self.editor.move_right(shift),
+                    VK_UP => self.editor.move_up(shift),
+                    VK_DOWN => self.editor.move_down(shift),
+                    VK_HOME => self.editor.home(shift),
+                    VK_END => self.editor.end(shift),
                     _ => {}
                 }
                 Reaction::None
@@ -333,12 +337,33 @@ impl Workspace {
         self.editor.ensure_visible(rows);
         let (crow, ccol) = self.editor.cursor();
         let top = self.editor.top;
+        let sel = self
+            .editor
+            .selection()
+            .map(|(s, e)| (self.editor.offset_rowcol(s), self.editor.offset_rowcol(e)));
         for vis in 0..rows {
             let row = top + vis;
             if row >= self.editor.line_count() {
                 break;
             }
             let y = TITLE_H + vis as f32 * LINE_H + FONT;
+            let row_top = TITLE_H + vis as f32 * LINE_H;
+            // selection background for this row
+            if let Some(((sr, sc), (er, ec))) = sel {
+                if row >= sr && row <= er {
+                    let from = if row == sr { sc } else { 0 };
+                    let to = if row == er {
+                        ec
+                    } else {
+                        self.editor.line(row).chars().count() + 1 // include the newline
+                    };
+                    let x0 = GUTTER + from as f32 * CHAR_W;
+                    let x1 = (GUTTER + to as f32 * CHAR_W).min(main_w);
+                    if x1 > x0 {
+                        cmds.push(fill(x0, row_top, x1, row_top + LINE_H, c_sel()));
+                    }
+                }
+            }
             cmds.push(text(&format!("{:>3}", row + 1), 6.0, y, c_gutter()));
             let mut x = GUTTER;
             for (frag, tag) in highlight(&self.editor.line(row)) {

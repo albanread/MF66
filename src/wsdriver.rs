@@ -76,13 +76,33 @@ fn stack_str(d: &Driver) -> String {
 fn char_ev(c: char) -> UiEvent {
     UiEvent::Char { codepoint: c as u32, modifiers: 0 }
 }
-fn key_ev(vk: u32) -> UiEvent {
-    UiEvent::Key { state: KeyState::Down, virtual_key: vk, modifiers: 0 }
+fn key_ev(vk: u32, mods: u32) -> UiEvent {
+    UiEvent::Key { state: KeyState::Down, virtual_key: vk, modifiers: mods }
 }
 
-/// Map a key name (studio convention) to its Win32 virtual-key code.
-fn map_key(name: &str) -> Option<u32> {
-    Some(match name {
+/// Map a key name (studio convention, with `Shift+`/`Ctrl+`/`Alt+`/`Cmd+`
+/// prefixes) to a `(virtual_key, modifiers)` pair.
+fn map_key(name: &str) -> Option<(u32, u32)> {
+    let mut mods = 0u32;
+    let mut s = name;
+    loop {
+        if let Some(r) = s.strip_prefix("Shift+") {
+            mods |= 1;
+            s = r;
+        } else if let Some(r) = s.strip_prefix("Ctrl+").or_else(|| s.strip_prefix("Control+")) {
+            mods |= 2;
+            s = r;
+        } else if let Some(r) = s.strip_prefix("Alt+") {
+            mods |= 4;
+            s = r;
+        } else if let Some(r) = s.strip_prefix("Cmd+").or_else(|| s.strip_prefix("Command+")) {
+            mods |= 8;
+            s = r;
+        } else {
+            break;
+        }
+    }
+    let vk = match s {
         "Enter" | "Return" => 0x0D,
         "Backspace" => 0x08,
         "Tab" => 0x09,
@@ -94,9 +114,10 @@ fn map_key(name: &str) -> Option<u32> {
         "Home" => 0x24,
         "End" => 0x23,
         "Delete" => 0x2E,
-        s if s.len() == 1 => s.chars().next().unwrap().to_ascii_uppercase() as u32,
+        s if s.chars().count() == 1 => s.chars().next().unwrap().to_ascii_uppercase() as u32,
         _ => return None,
-    })
+    };
+    Some((vk, mods))
 }
 
 /// Render the current workspace frame to a PNG (headless — Core Graphics, no
@@ -144,10 +165,10 @@ fn registry() -> Registry {
         Ok(Value::new(""))
     });
     r.register("key", Arity::exact(1), |_, a| {
-        let vk = map_key(a[0].as_str())
+        let (vk, mods) = map_key(a[0].as_str())
             .ok_or_else(|| TclError::runtime(format!("unknown key: {}", a[0].as_str())))?;
         with_driver(|d| {
-            let reaction = d.ws.on_event(&key_ev(vk));
+            let reaction = d.ws.on_event(&key_ev(vk, mods));
             react(d, reaction);
         });
         Ok(Value::new(""))
@@ -197,6 +218,35 @@ fn registry() -> Registry {
     r.register("eval-buffer", Arity::exact(0), |_, _| {
         let buf = with_driver(|d| d.ws.editor.text());
         Ok(Value::new(with_driver(|d| do_eval(d, &buf))))
+    });
+    // selection / clipboard / undo
+    r.register("editor-select-all", Arity::exact(0), |_, _| {
+        with_driver(|d| d.ws.editor.select_all());
+        Ok(Value::new(""))
+    });
+    r.register("editor-selection", Arity::exact(0), |_, _| {
+        Ok(Value::new(with_driver(|d| d.ws.editor.selected_text().unwrap_or_default())))
+    });
+    r.register("editor-copy", Arity::exact(0), |_, _| {
+        with_driver(|d| d.ws.editor.copy());
+        Ok(Value::new(""))
+    });
+    r.register("editor-cut", Arity::exact(0), |_, _| {
+        with_driver(|d| d.ws.editor.cut());
+        Ok(Value::new(""))
+    });
+    r.register("editor-paste", Arity::exact(0), |_, _| {
+        with_driver(|d| d.ws.editor.paste());
+        Ok(Value::new(""))
+    });
+    r.register("editor-clipboard", Arity::exact(0), |_, _| {
+        Ok(Value::new(with_driver(|d| d.ws.editor.clipboard().to_string())))
+    });
+    r.register("editor-undo", Arity::exact(0), |_, _| {
+        Ok(Value::new(with_driver(|d| if d.ws.editor.undo() { "1" } else { "0" }.to_string())))
+    });
+    r.register("editor-redo", Arity::exact(0), |_, _| {
+        Ok(Value::new(with_driver(|d| if d.ws.editor.redo() { "1" } else { "0" }.to_string())))
     });
 
     // ── read-back (for assertions / agent observation) ──
