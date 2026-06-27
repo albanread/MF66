@@ -61,7 +61,9 @@ fn react(d: &mut Driver, r: Reaction) {
         Reaction::Save => {
             let _ = d.ws.editor.save();
         }
-        Reaction::None | Reaction::Close => {}
+        // Native dialogs need a window; the headless driver uses the explicit
+        // `open`/`save-as PATH` verbs instead.
+        Reaction::OpenDialog | Reaction::SaveAsDialog | Reaction::None | Reaction::Close => {}
     }
 }
 

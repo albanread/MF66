@@ -42,8 +42,26 @@ fn main() -> Result<(), String> {
                         }
                     }
                     Reaction::Save => {
-                        let r = ws.editor.save().map(|_| "saved".to_string()).map_err(|e| e.to_string());
-                        ws.record("⌘S".into(), r, session.stack(), session.compiling());
+                        if ws.editor.path.is_some() {
+                            let r = ws.editor.save().map(|_| "saved".into()).map_err(|e| e.to_string());
+                            ws.record("⌘S".into(), r, session.stack(), session.compiling());
+                        } else if let Some(p) = window::save_file_dialog("untitled.f") {
+                            let r = ws.editor.save_as(&p).map(|_| format!("saved {p}")).map_err(|e| e.to_string());
+                            ws.record(format!("save {p}"), r, session.stack(), session.compiling());
+                        }
+                    }
+                    Reaction::OpenDialog => {
+                        if let Some(p) = window::open_file_dialog() {
+                            let r = ws.editor.load(&p).map(|_| format!("opened {p}")).map_err(|e| e.to_string());
+                            ws.record(format!("open {p}"), r, session.stack(), session.compiling());
+                        }
+                    }
+                    Reaction::SaveAsDialog => {
+                        let name = ws.editor.file_label().trim_end_matches(" *").to_string();
+                        if let Some(p) = window::save_file_dialog(&name) {
+                            let r = ws.editor.save_as(&p).map(|_| format!("saved {p}")).map_err(|e| e.to_string());
+                            ws.record(format!("save-as {p}"), r, session.stack(), session.compiling());
+                        }
                     }
                     Reaction::None => {}
                 }

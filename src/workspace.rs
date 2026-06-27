@@ -97,8 +97,12 @@ pub enum Reaction {
     Submit(String),
     /// Editor ⌘-Enter — evaluate the whole editor buffer.
     EvalBuffer(String),
-    /// ⌘-S — save the editor to its current path.
+    /// ⌘-S — save the editor (host saves to the current path, or prompts).
     Save,
+    /// ⌘-O — the host runs a native Open panel and loads the chosen file.
+    OpenDialog,
+    /// ⌘-⇧-S — the host runs a native Save-As panel.
+    SaveAsDialog,
     Close,
 }
 
@@ -242,7 +246,10 @@ impl Workspace {
                 if cmd {
                     return match *virtual_key {
                         VK_RETURN => Reaction::EvalBuffer(self.editor.text()),
-                        0x53 => Reaction::Save,                    // ⌘S save
+                        0x53 if shift => Reaction::SaveAsDialog,                  // ⌘⇧S save as
+                        0x53 => Reaction::Save,                                    // ⌘S save
+                        0x4F => Reaction::OpenDialog,                             // ⌘O open
+                        0x4E => { self.editor.new_file(); Reaction::None }        // ⌘N new
                         0x46 if shift => { self.editor.format(); Reaction::None } // ⌘⇧F format
                         0x41 => { self.editor.select_all(); Reaction::None }      // ⌘A
                         0x43 => { self.editor.copy(); Reaction::None }            // ⌘C
