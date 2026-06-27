@@ -246,9 +246,11 @@ pub struct Metrics {
     pub local_loads: u32,   // local read served from the LP frame (ldr)
     pub local_hits: u32,    // local read served from a register (recent store, no ldr)
     pub local_spills: u32,  // deferred local stores flushed to the frame at a barrier
-    pub fp_fetches: u32,    // f@ fused to a direct fldr (was a settle-barrier call)
+    pub fp_fetches: u32,    // f@ that loaded from memory (fldr) — was a barrier call
     pub fp_stores: u32,     // f! fused to a direct fstr
-    pub redundant_ffetches: u32, // f@ of a const address already fetched in the window
+    pub fp_hits: u32,       // f@ served from a cached d-register (fmov, no fldr)
+    pub fp_spills: u32,     // deferred fvariable stores flushed to memory at a barrier
+    pub redundant_ffetches: u32, // a const f@ re-read from memory the cache missed
     pub redundant_fetches: u32, // @/c@ of a const address already fetched in the
                             // window — a hot value re-read from memory instead of
                             // kept in a register (the heat-policy gap / promote_hot_cells)
@@ -286,6 +288,8 @@ impl Metrics {
         self.local_spills += o.local_spills;
         self.fp_fetches += o.fp_fetches;
         self.fp_stores += o.fp_stores;
+        self.fp_hits += o.fp_hits;
+        self.fp_spills += o.fp_spills;
         self.redundant_ffetches += o.redundant_ffetches;
         self.redundant_fetches += o.redundant_fetches;
         self.dsp_adjusts += o.dsp_adjusts;
@@ -419,7 +423,13 @@ struct Low<'a> {
     fconsumed: i64,
     m: Metrics, // accumulated codegen metrics for this run
     fetched: Vec<i64>, // const addresses @-fetched in the current window (heat probe)
-    ffetched: Vec<i64>, // const addresses f@-fetched in the current FP window
+    ffetched: Vec<i64>, // const addresses f@-fetched in the current FP window (cold probe)
+    // FP-variable register cache: const address → (d-register holding the current
+    // value, dirty = unspilled f!). A HOT fvariable (f@'d ≥2× in the run) is kept
+    // in a d-register so re-reads are an `fmov`, not an `fldr`; cold single-reads
+    // load on demand. hot_fvars is the f@-≥2 address set for this run.
+    fvcache: std::collections::HashMap<i64, (u32, bool)>,
+    hot_fvars: std::collections::HashSet<i64>,
     // Local register cache: index → (pool register holding the current value,
     // dirty = unspilled store). A stored local (dirty) or a HOT read local (≥2
     // reads in the run) is kept resident so subsequent reads are a `mov`, not a
@@ -451,6 +461,8 @@ impl<'a> Low<'a> {
             m: Metrics::default(),
             fetched: Vec::new(),
             ffetched: Vec::new(),
+            fvcache: std::collections::HashMap::new(),
+            hot_fvars: std::collections::HashSet::new(),
             lcache: std::collections::HashMap::new(),
             hot_locals: std::collections::HashSet::new(),
         }
@@ -1010,38 +1022,106 @@ impl<'a> Low<'a> {
         });
     }
 
-    /// f@ ( addr -- ) ( F: -- r ): pop the data-stack address and load the float
-    /// straight into the FP virtual stack — a direct `fldr`, no settle/call.
-    fn ffetch(&mut self) {
-        self.ensure(1);
-        let a = self.vs.pop().unwrap();
-        if let Loc::Const(addr) = a {
+    /// Load fvariable `addr` into a fresh FP register (cache-aware for a const
+    /// address); returns the d-register holding the value (cache copy for a hit).
+    fn ffetch_addr(&mut self, addr: i64) -> u32 {
+        if let Some(&(dc, _)) = self.fvcache.get(&addr) {
+            let d = self.falloc(); // hit: copy the cached value
+            self.out.push(fmov_dd(d, dc));
+            self.m.fp_hits += 1;
+            d
+        } else if self.hot_fvars.contains(&addr) {
+            // hot: load once into the cache, then copy
+            let g = self.gp_temp();
+            load_imm64(g, addr as u64, self.out);
+            let dc = self.falloc();
+            self.out.push(fldr0(dc, g));
+            self.used[g as usize] = false;
+            self.fvcache.insert(addr, (dc, false)); // clean — memory still matches
+            let d = self.falloc();
+            self.out.push(fmov_dd(d, dc));
+            self.m.fp_fetches += 1;
+            d
+        } else {
+            // cold single-read: load directly
             if self.ffetched.contains(&addr) {
                 self.m.redundant_ffetches += 1;
             } else {
                 self.ffetched.push(addr);
             }
+            let g = self.gp_temp();
+            load_imm64(g, addr as u64, self.out);
+            let d = self.falloc();
+            self.out.push(fldr0(d, g));
+            self.used[g as usize] = false;
+            self.m.fp_fetches += 1;
+            d
         }
-        let g = self.to_reg(a); // address in a GP reg (Const → load_imm)
-        let d = self.falloc();
-        self.out.push(fldr0(d, g)); // d = [addr]
-        self.freer(g);
-        self.fvs.push(d);
-        self.m.fp_fetches += 1;
     }
 
-    /// f! ( addr -- ) ( F: r -- ): pop the data-stack address and FP TOS, store —
-    /// a direct `fstr`, no settle/call.
+    /// f@ ( addr -- ) ( F: -- r ): pop the data-stack address and load the float
+    /// straight into the FP virtual stack — a direct `fldr` (or cached `fmov`).
+    fn ffetch(&mut self) {
+        self.ensure(1);
+        let a = self.vs.pop().unwrap();
+        let d = match a {
+            Loc::Const(addr) => self.ffetch_addr(addr),
+            _ => {
+                let g = self.to_reg(a);
+                let d = self.falloc();
+                self.out.push(fldr0(d, g));
+                self.freer(g);
+                self.m.fp_fetches += 1;
+                d
+            }
+        };
+        self.fvs.push(d);
+    }
+
+    /// f! ( addr -- ) ( F: r -- ): pop the data-stack address and FP TOS, store.
+    /// A const-address store is cached (dirty), spilled to memory at a barrier.
     fn fstore(&mut self) {
         self.ensure(1);
         let a = self.vs.pop().unwrap();
-        let g = self.to_reg(a);
         self.fensure(1);
         let d = self.fvs.pop().unwrap();
-        self.out.push(fstr0(d, g)); // [addr] = d
-        self.freer(g);
-        self.fused[d as usize] = false;
-        self.m.fp_stores += 1;
+        match a {
+            Loc::Const(addr) => {
+                // cache the stored value (dirty); the d-register is now the cache's
+                if let Some((old, _)) = self.fvcache.insert(addr, (d, true)) {
+                    if old != d {
+                        self.fused[old as usize] = false;
+                    }
+                }
+                self.m.fp_stores += 1;
+            }
+            _ => {
+                let g = self.to_reg(a);
+                self.out.push(fstr0(d, g));
+                self.freer(g);
+                self.fused[d as usize] = false;
+                self.m.fp_stores += 1;
+            }
+        }
+    }
+
+    /// At a barrier, flush every dirty cached fvariable to memory and free the
+    /// cache d-registers (FP pool registers don't survive a call).
+    fn spill_fvars(&mut self) {
+        if self.fvcache.is_empty() {
+            return;
+        }
+        let cached: Vec<(i64, (u32, bool))> = self.fvcache.drain().collect();
+        for (addr, (d, dirty)) in cached {
+            if dirty {
+                let g = self.gp_temp();
+                load_imm64(g, addr as u64, self.out);
+                self.out.push(fstr0(d, g));
+                self.used[g as usize] = false;
+                self.m.fp_spills += 1;
+            }
+            self.fused[d as usize] = false;
+        }
     }
     fn fstk(&mut self, s: Stk) {
         match s {
@@ -1076,6 +1156,7 @@ impl<'a> Low<'a> {
     /// Write the FP virtual stack back to canonical form (FTOS in d8, the rest in
     /// memory from FSP) and reset.
     fn fsettle(&mut self) {
+        self.spill_fvars(); // flush dirty fvariable stores to memory at the barrier
         if self.fvs.is_empty() {
             self.fensure(1);
         }
@@ -1220,6 +1301,19 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>, m: &mut Metrics) {
         }
     }
     low.hot_locals = counts.into_iter().filter(|&(_, c)| c >= 2).map(|(i, _)| i).collect();
+    // FP hotness: a const-address fvariable f@'d >=2 times in the run is worth a
+    // d-register (`zx f@` lowers to Lit(addr) FFetch, so count Lit-before-FFetch).
+    let mut fcounts: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+    let mut prev: Option<Tok> = None;
+    for &t in toks {
+        if matches!(t, Tok::FFetch) {
+            if let Some(Tok::Lit(addr)) = prev {
+                *fcounts.entry(addr).or_default() += 1;
+            }
+        }
+        prev = Some(t);
+    }
+    low.hot_fvars = fcounts.into_iter().filter(|&(_, c)| c >= 2).map(|(a, _)| a).collect();
     for &t in toks {
         match t {
             Tok::Lit(n) => low.lit(n),

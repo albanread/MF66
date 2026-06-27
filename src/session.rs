@@ -1609,8 +1609,13 @@ impl Mf66Session {
         );
         let _ = writeln!(
             s,
-            "  fp: f@ fused {}  f! fused {}  (no settle/call)  redundant f@-refetches {}  ← FP heat gap",
-            total.fp_fetches, total.fp_stores, total.redundant_ffetches
+            "  fp: f@ loads {}  register hits {} ({:.0}% resident)  f! fused {}  spills {}  uncached refetch {}",
+            total.fp_fetches,
+            total.fp_hits,
+            pct(total.fp_hits, total.fp_fetches + total.fp_hits),
+            total.fp_stores,
+            total.fp_spills,
+            total.redundant_ffetches
         );
         let _ = writeln!(
             s,
