@@ -17,6 +17,50 @@ proc(free_word)
     next()
 endp()
 
+; utime ( -- ud )   microseconds since epoch (low cell; high cell = 0)
+proc(utime_word)
+    str     TOS, [DSP, #-cell]      ; spill old TOS → [DSP-8]
+    add     x0, UP, #user_PAD
+    aapcs_call(rt_utime)            ; PAD = micros
+    ldr     x9, [UP, #user_PAD]
+    str     x9, [DSP, #-16]         ; lo = micros
+    mov     x0, #0                  ; hi = 0 (TOS)
+    stk(0, 2)
+    next()
+endp()
+
+; time&date ( -- sec min hour day month year )
+proc(time_date_word)
+    str     TOS, [DSP, #-cell]      ; spill old TOS → [DSP-8]
+    add     x0, UP, #user_PAD
+    aapcs_call(rt_time_date)        ; PAD[0..6] = sec min hour day month year
+    add     x10, UP, #user_PAD      ; PAD base
+    ldr     x9, [x10, #0]
+    str     x9, [DSP, #-16]         ; sec
+    ldr     x9, [x10, #8]
+    str     x9, [DSP, #-24]         ; min
+    ldr     x9, [x10, #16]
+    str     x9, [DSP, #-32]         ; hour
+    ldr     x9, [x10, #24]
+    str     x9, [DSP, #-40]         ; day
+    ldr     x9, [x10, #32]
+    str     x9, [DSP, #-48]         ; month
+    ldr     x0, [x10, #40]          ; year → TOS
+    stk(0, 6)
+    next()
+endp()
+
+; (parse-float) ( c-addr u -- bits flag )
+proc(parse_float_word)
+    mov     x1, x0                  ; len
+    ldr     x0, [DSP]               ; c-addr
+    add     x2, UP, #user_PAD       ; &out_bits
+    aapcs_call(rt_parse_float)      ; x0 = flag
+    ldr     x9, [UP, #user_PAD]
+    str     x9, [DSP]               ; NOS ← bits
+    next()                          ; TOS = flag (balanced)
+endp()
+
 ; ms ( u -- )   sleep u milliseconds (host)
 proc(ms_word)
     aapcs_call(rt_ms)               ; x0 = u; no return value

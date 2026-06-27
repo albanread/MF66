@@ -363,6 +363,53 @@ pub extern "C" fn rt_ud_mod(lo: u64, hi: u64, u: u64, qlo: *mut u64, qhi: *mut u
     (ud % d) as u64
 }
 
+/// utime ( -- ud ): microseconds since the Unix epoch, written to *out (low cell;
+/// the high cell is set to 0 by the kernel word).
+pub extern "C" fn rt_utime(out: *mut u64) {
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    unsafe { *out = micros };
+}
+
+/// time&date ( -- sec min hour day month year ): writes 6 cells to *out (local
+/// time, via libc localtime_r).
+pub extern "C" fn rt_time_date(out: *mut u64) {
+    let t = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    unsafe {
+        *out.add(0) = tm.tm_sec as u64;
+        *out.add(1) = tm.tm_min as u64;
+        *out.add(2) = tm.tm_hour as u64;
+        *out.add(3) = tm.tm_mday as u64;
+        *out.add(4) = (tm.tm_mon + 1) as u64;
+        *out.add(5) = (tm.tm_year + 1900) as u64;
+    }
+}
+
+/// (parse-float) ( c-addr u -- bits flag ): parse a string as f64. On success
+/// *out = the raw bits and the return is -1; on failure 0. Empty string → 0e, -1.
+pub extern "C" fn rt_parse_float(addr: u64, len: u64, out: *mut u64) -> u64 {
+    let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, len as usize) };
+    let s = match std::str::from_utf8(bytes) {
+        Ok(x) => x.trim(),
+        Err(_) => return 0,
+    };
+    if s.is_empty() {
+        unsafe { *out = 0.0f64.to_bits() };
+        return (-1i64) as u64;
+    }
+    match s.parse::<f64>() {
+        Ok(f) => {
+            unsafe { *out = f.to_bits() };
+            (-1i64) as u64
+        }
+        Err(_) => 0,
+    }
+}
+
 /// ms ( u -- ): sleep u milliseconds (Facility wordset).
 pub extern "C" fn rt_ms(u: u64) {
     if u > 0 {
@@ -429,5 +476,8 @@ pub fn externs() -> Vec<(&'static str, *const ())> {
         ("rt_resize", rt_resize as *const ()),
         ("rt_ud_mod", rt_ud_mod as *const ()),
         ("rt_ms", rt_ms as *const ()),
+        ("rt_utime", rt_utime as *const ()),
+        ("rt_time_date", rt_time_date as *const ()),
+        ("rt_parse_float", rt_parse_float as *const ()),
     ]
 }

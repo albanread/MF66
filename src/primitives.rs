@@ -201,6 +201,7 @@ pub const PRIMITIVES: &[(&str, &str, bool)] = &[
     ("fdrop", "fdrop", false),
     ("fswap", "fswap", false),
     ("fover", "fover", false),
+    ("flit", "flit", false),
     ("f@", "f_fetch", false),
     ("f!", "f_store", false),
     ("fdepth", "fdepth", false),
@@ -244,6 +245,9 @@ pub const PRIMITIVES: &[(&str, &str, bool)] = &[
     ("allocate", "allocate_word", false),
     ("free", "free_word", false),
     ("resize", "resize_word", false),
+    ("utime", "utime_word", false),
+    ("time&date", "time_date_word", false),
+    ("(parse-float)", "parse_float_word", false),
     ("number?", "number_q", false),
     ("execute", "execute", false),
     // Exceptions (MF66 exceptions.masm)

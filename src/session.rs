@@ -426,6 +426,11 @@ impl Mf66Session {
         // Facility terminal stubs (no cursor addressing in this host).
         self.eval(": at-xy 2drop ;")?;
         self.eval(": page ;")?;
+        // unused = data-space remaining; >float wraps the host float parser.
+        let var_limit = self.read_user(USER_VAR_LIMIT);
+        self.publish_constant("(var-limit)", var_limit as i64)?;
+        self.eval(": unused (var-limit) here - ;")?;
+        self.eval(": >float (parse-float) if flit true else drop false then ;")?;
         Ok(())
     }
 
