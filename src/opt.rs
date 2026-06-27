@@ -433,6 +433,10 @@ struct Low<'a> {
     // load on demand. hot_fvars is the f@-≥2 address set for this run.
     fvcache: std::collections::HashMap<i64, (u32, bool)>,
     hot_fvars: std::collections::HashSet<i64>,
+    // Float-local register cache (the FP analog of lcache): index → (d-register,
+    // dirty). A hot float local (read ≥2× in the run) stays in a d-register.
+    flcache: std::collections::HashMap<u32, (u32, bool)>,
+    hot_flocals: std::collections::HashSet<u32>,
     // Local register cache: index → (pool register holding the current value,
     // dirty = unspilled store). A stored local (dirty) or a HOT read local (≥2
     // reads in the run) is kept resident so subsequent reads are a `mov`, not a
@@ -466,6 +470,8 @@ impl<'a> Low<'a> {
             ffetched: Vec::new(),
             fvcache: std::collections::HashMap::new(),
             hot_fvars: std::collections::HashSet::new(),
+            flcache: std::collections::HashMap::new(),
+            hot_flocals: std::collections::HashSet::new(),
             lcache: std::collections::HashMap::new(),
             hot_locals: std::collections::HashSet::new(),
         }
@@ -929,28 +935,67 @@ impl<'a> Low<'a> {
         }
     }
 
-    /// Float local read: load `[LP+i*8]` into the FP virtual stack (`fldr`).
+    /// Float local read → FP stack. A hot/stored float local is reused from its
+    /// cache d-register (`fmov`); a cold single-read loads from the frame (`fldr`).
     fn local_ffetch(&mut self, i: u32) {
-        let d = self.falloc();
-        self.out.push(fldr_off(d, LP, i * 8));
-        self.fvs.push(d);
-        self.m.fp_fetches += 1;
+        if let Some(&(dc, _)) = self.flcache.get(&i) {
+            let d = self.falloc();
+            self.out.push(fmov_dd(d, dc));
+            self.fvs.push(d);
+            self.m.fp_hits += 1;
+        } else if self.hot_flocals.contains(&i) {
+            let dc = self.falloc();
+            self.out.push(fldr_off(dc, LP, i * 8));
+            self.flcache.insert(i, (dc, false)); // clean
+            let d = self.falloc();
+            self.out.push(fmov_dd(d, dc));
+            self.fvs.push(d);
+            self.m.fp_fetches += 1;
+        } else {
+            let d = self.falloc();
+            self.out.push(fldr_off(d, LP, i * 8));
+            self.fvs.push(d);
+            self.m.fp_fetches += 1;
+        }
     }
 
-    /// Float local store: pop FTOS into `[LP+i*8]` (`fstr`).
+    /// Float local store: cache the value (dirty); the `fstr` to `[LP+i*8]` is
+    /// deferred to the next barrier (spill_flocals).
     fn local_fstore(&mut self, i: u32) {
         self.fensure(1);
         let d = self.fvs.pop().unwrap();
-        self.out.push(fstr_off(d, LP, i * 8));
-        self.fused[d as usize] = false;
+        if let Some((old, _)) = self.flcache.insert(i, (d, true)) {
+            if old != d {
+                self.fused[old as usize] = false;
+            }
+        }
         self.m.fp_stores += 1;
+    }
+
+    /// At a barrier, flush dirty float locals to their frame slots and free the
+    /// cache d-registers.
+    fn spill_flocals(&mut self) {
+        if self.flcache.is_empty() {
+            return;
+        }
+        let cached: Vec<(u32, (u32, bool))> = self.flcache.drain().collect();
+        for (i, (d, dirty)) in cached {
+            if dirty {
+                self.out.push(fstr_off(d, LP, i * 8));
+                self.m.fp_spills += 1;
+            }
+            self.fused[d as usize] = false;
+        }
     }
 
     /// `CloseLocals` (inline IR): the locals are dead — drop the cache and pop the
     /// sub-frame off LP.
     fn close_locals(&mut self, total: u32) {
         for (_, (r, _)) in self.lcache.drain() {
-            self.used[r as usize] = false; // dead at frame close; no spill
+            self.used[r as usize] = false; // int locals dead at frame close; no spill
+        }
+        for (_, (d, _)) in self.flcache.drain() {
+            self.fused[d as usize] = false; // float locals dead; no spill
         }
         if total > 0 {
             self.out.push(add_imm(LP, LP, total * 8));
@@ -1182,6 +1227,7 @@ impl<'a> Low<'a> {
     /// memory from FSP) and reset.
     fn fsettle(&mut self) {
         self.spill_fvars(); // flush dirty fvariable stores to memory at the barrier
+        self.spill_flocals(); // flush dirty float-local stores to the frame
         if self.fvs.is_empty() {
             self.fensure(1);
         }
@@ -1339,6 +1385,14 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>, m: &mut Metrics) {
         prev = Some(t);
     }
     low.hot_fvars = fcounts.into_iter().filter(|&(_, c)| c >= 2).map(|(a, _)| a).collect();
+    // Float-local hotness: a float local read >=2× in the run is worth a d-reg.
+    let mut flcounts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for t in toks {
+        if let Tok::LocalFFetch(i) = t {
+            *flcounts.entry(*i).or_default() += 1;
+        }
+    }
+    low.hot_flocals = flcounts.into_iter().filter(|&(_, c)| c >= 2).map(|(i, _)| i).collect();
     for &t in toks {
         match t {
             Tok::Lit(n) => low.lit(n),
