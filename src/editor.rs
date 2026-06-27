@@ -328,6 +328,31 @@ impl Editor {
         self.sync_goal();
     }
 
+    /// Place the caret at `(row, col)` (clamped), clearing the selection. Used by
+    /// a mouse click and the `caret` verb.
+    pub fn set_caret_rowcol(&mut self, row: usize, col: usize) {
+        let row = row.min(self.rope.line_count().saturating_sub(1));
+        self.caret = self.rope.line_col_to_offset(row, col);
+        self.anchor = None;
+        self.last = Last::None;
+        self.sync_goal();
+    }
+    /// Extend the selection to `(row, col)` — the moving end of a drag.
+    pub fn extend_to_rowcol(&mut self, row: usize, col: usize) {
+        if self.anchor.is_none() {
+            self.anchor = Some(self.caret);
+        }
+        let row = row.min(self.rope.line_count().saturating_sub(1));
+        self.caret = self.rope.line_col_to_offset(row, col);
+        self.last = Last::None;
+        self.sync_goal();
+    }
+    /// Scroll the visible window by `delta` lines (mouse wheel).
+    pub fn scroll(&mut self, delta: i32) {
+        let max = self.rope.line_count().saturating_sub(1) as i32;
+        self.top = (self.top as i32 + delta).clamp(0, max) as usize;
+    }
+
     fn sync_goal(&mut self) {
         let (_, col) = self.cursor();
         self.goal_col = col;

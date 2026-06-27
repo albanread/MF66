@@ -32,9 +32,6 @@ fn main() -> Result<(), String> {
 
         loop {
             for we in mailbox::drain() {
-                if matches!(we.event, UiEvent::Mouse(_)) {
-                    continue;
-                }
                 match ws.on_event(&we.event) {
                     Reaction::Close => std::process::exit(0),
                     Reaction::Submit(line) | Reaction::EvalBuffer(line) => {

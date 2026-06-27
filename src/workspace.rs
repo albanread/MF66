@@ -7,7 +7,7 @@
 //! AppKit or the Forth session, so it is unit-tested without a display.
 
 use locus_ide_protocol::draw::{Color, DrawBatch, DrawCmd, Rect};
-use locus_ide_protocol::event::{KeyState, UiEvent};
+use locus_ide_protocol::event::{KeyState, MouseEvent, MouseOp, UiEvent};
 
 use crate::editor::Editor;
 use crate::fsyntax::{highlight, Tag};
@@ -111,6 +111,7 @@ pub struct Workspace {
     cmd_pos: usize,
     stack: Vec<i64>,
     compiling: bool,
+    dragging: bool,
     width: f32,
     height: f32,
     frame: u64,
@@ -127,6 +128,7 @@ impl Workspace {
             cmd_pos: 0,
             stack: Vec::new(),
             compiling: false,
+            dragging: false,
             width,
             height,
             frame: 0,
@@ -176,6 +178,7 @@ impl Workspace {
                 };
                 return Reaction::None;
             }
+            UiEvent::Mouse(m) => return self.mouse_event(m),
             _ => {}
         }
         match self.focus {
@@ -266,6 +269,60 @@ impl Workspace {
             }
             _ => Reaction::None,
         }
+    }
+
+    fn main_w(&self) -> f32 {
+        self.width - STACK_W
+    }
+    fn editor_bot(&self) -> f32 {
+        TITLE_H + (self.height - TITLE_H) * 0.56
+    }
+
+    /// Map a window point to an editor `(row, col)`, or `None` if outside the
+    /// editor pane.
+    pub fn editor_hit(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+        if y < TITLE_H || y >= self.editor_bot() || x >= self.main_w() {
+            return None;
+        }
+        let vis = ((y - TITLE_H) / LINE_H).floor().max(0.0) as usize;
+        let row = (self.editor.top + vis).min(self.editor.line_count().saturating_sub(1));
+        let col = if x < GUTTER { 0 } else { ((x - GUTTER) / CHAR_W + 0.5).floor() as usize };
+        Some((row, col))
+    }
+
+    fn mouse_event(&mut self, m: &MouseEvent) -> Reaction {
+        let (x, y) = (m.x as f32, m.y as f32);
+        let (main_w, ed_bot) = (self.main_w(), self.editor_bot());
+        match m.op {
+            MouseOp::Down => {
+                if let Some((row, col)) = self.editor_hit(x, y) {
+                    self.focus = Focus::Editor;
+                    let extend = m.modifiers & MOD_SHIFT != 0;
+                    if extend {
+                        self.editor.extend_to_rowcol(row, col);
+                    } else {
+                        self.editor.set_caret_rowcol(row, col);
+                    }
+                    self.dragging = true;
+                } else if y >= ed_bot && x < main_w {
+                    self.focus = Focus::Repl;
+                }
+            }
+            MouseOp::Move => {
+                if self.dragging {
+                    if let Some((row, col)) = self.editor_hit(x, y) {
+                        self.editor.extend_to_rowcol(row, col);
+                    }
+                }
+            }
+            MouseOp::Up => self.dragging = false,
+            MouseOp::Wheel => {
+                if y < ed_bot && x < main_w {
+                    self.editor.scroll(if m.wheel_delta > 0 { -3 } else { 3 });
+                }
+            }
+        }
+        Reaction::None
     }
 
     fn recall(&mut self, dir: i32) {

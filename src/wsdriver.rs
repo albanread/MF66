@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 
-use locus_ide_protocol::event::{KeyState, UiEvent};
+use locus_ide_protocol::event::{KeyState, MouseButton, MouseEvent, MouseOp, UiEvent};
 use macide::render::CgCanvas;
 use rust_tcl::error::Error as TclError;
 use rust_tcl::{Arity, Registry, Value};
@@ -75,6 +75,31 @@ fn stack_str(d: &Driver) -> String {
 
 fn char_ev(c: char) -> UiEvent {
     UiEvent::Char { codepoint: c as u32, modifiers: 0 }
+}
+fn mouse_ev(x: i32, y: i32, op: MouseOp) -> UiEvent {
+    UiEvent::Mouse(MouseEvent {
+        x,
+        y,
+        op,
+        button: MouseButton::Left,
+        wheel_delta: 0,
+        modifiers: 0,
+        time_ms: 0,
+    })
+}
+fn int(a: &[Value], i: usize) -> Result<i32, TclError> {
+    a[i]
+        .as_str()
+        .trim()
+        .parse()
+        .map_err(|_| TclError::runtime(format!("expected an integer, got `{}`", a[i].as_str())))
+}
+fn uint(a: &[Value], i: usize) -> Result<usize, TclError> {
+    a[i]
+        .as_str()
+        .trim()
+        .parse()
+        .map_err(|_| TclError::runtime(format!("expected a row/col index, got `{}`", a[i].as_str())))
 }
 fn key_ev(vk: u32, mods: u32) -> UiEvent {
     UiEvent::Key { state: KeyState::Down, virtual_key: vk, modifiers: mods }
@@ -247,6 +272,62 @@ fn registry() -> Registry {
     });
     r.register("editor-redo", Arity::exact(0), |_, _| {
         Ok(Value::new(with_driver(|d| if d.ws.editor.redo() { "1" } else { "0" }.to_string())))
+    });
+
+    // ── mouse (logical `caret`, or pixel `click`/`drag`) ──
+    r.register("caret", Arity::exact(2), |_, a| {
+        let (row, col) = (uint(a, 0)?, uint(a, 1)?);
+        with_driver(|d| {
+            d.ws.focus = Focus::Editor;
+            d.ws.editor.set_caret_rowcol(row, col);
+        });
+        Ok(Value::new(""))
+    });
+    r.register("click", Arity::exact(2), |_, a| {
+        let (x, y) = (int(a, 0)?, int(a, 1)?);
+        with_driver(|d| {
+            d.ws.on_event(&mouse_ev(x, y, MouseOp::Down));
+            d.ws.on_event(&mouse_ev(x, y, MouseOp::Up));
+        });
+        Ok(Value::new(""))
+    });
+    r.register("drag", Arity::exact(4), |_, a| {
+        let (x1, y1, x2, y2) = (int(a, 0)?, int(a, 1)?, int(a, 2)?, int(a, 3)?);
+        with_driver(|d| {
+            d.ws.on_event(&mouse_ev(x1, y1, MouseOp::Down));
+            d.ws.on_event(&mouse_ev(x2, y2, MouseOp::Move));
+            d.ws.on_event(&mouse_ev(x2, y2, MouseOp::Up));
+        });
+        Ok(Value::new(""))
+    });
+
+    // ── output (surface a value to stdout — how an agent reads a result) ──
+    let emit = |a: &[Value]| {
+        println!("{}", a.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(" "));
+    };
+    r.register("print", Arity::range(1, 64), move |_, a| {
+        emit(a);
+        Ok(Value::new(""))
+    });
+    r.register("puts", Arity::range(1, 64), move |_, a| {
+        emit(a);
+        Ok(Value::new(""))
+    });
+
+    // ── MF66 introspection ──
+    r.register("words", Arity::exact(0), |_, _| {
+        Ok(Value::new(with_driver(|d| d.session.word_names().join(" "))))
+    });
+    r.register("see", Arity::exact(1), |_, a| {
+        let name = a[0].as_str().to_string();
+        Ok(Value::new(with_driver(|d| {
+            d.session
+                .word_report(&name)
+                .unwrap_or_else(|| format!("{name}: not a user-defined word"))
+        })))
+    });
+    r.register("metrics", Arity::exact(0), |_, _| {
+        Ok(Value::new(with_driver(|d| d.session.optimizer_report())))
     });
 
     // ── read-back (for assertions / agent observation) ──

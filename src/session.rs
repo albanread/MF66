@@ -622,6 +622,29 @@ impl Mf66Session {
         self.last_body_words
     }
 
+    /// The user-defined (colon) words compiled this session, sorted. (Primitives
+    /// live in the kernel dictionary and are not listed.)
+    pub fn word_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.word_metrics.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// A one-line optimizer summary for a single word (`see`): size, token
+    /// reduction, calls/settles, register pressure, and residency.
+    pub fn word_report(&self, name: &str) -> Option<String> {
+        let m = self.word_metrics.get(name)?;
+        let resid = |hit: u32, load: u32| {
+            let t = hit + load;
+            if t == 0 { 0.0 } else { 100.0 * hit as f64 / t as f64 }
+        };
+        Some(format!(
+            "{name}: {} instrs · tokens {}→{} ({} rewrites) · {} calls · {} settles · peak GP {}/7 FP {}/7 · local {:.0}% fp {:.0}% resident",
+            m.instrs, m.toks_in, m.toks_out, m.rewrites(), m.calls, m.settles, m.peak_gp, m.peak_fp,
+            resid(m.local_hits, m.local_loads), resid(m.fp_hits, m.fp_fetches),
+        ))
+    }
+
     /// Invoke a primitive by its asm symbol through `forth_main`.
     pub fn call(&mut self, asm_sym: &str) -> Result<()> {
         let xt = self.xt_of(asm_sym)?;
