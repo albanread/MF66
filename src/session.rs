@@ -508,6 +508,9 @@ impl Mf66Session {
         self.publish_constant("(var-limit)", var_limit as i64)?;
         self.eval(": unused (var-limit) here - ;")?;
         self.eval(": >float (parse-float) if flit true else drop false then ;")?;
+        // `.s` — non-destructively print the data stack: depth, then items
+        // bottom → top. A local holds the depth so `pick` indices stay stable.
+        self.eval(": .s {: | n :} depth to n n . space n 0 ?do n 1- i - pick . loop ;")?;
         Ok(())
     }
 
@@ -577,6 +580,17 @@ impl Mf66Session {
 
     pub fn depth(&self) -> usize {
         ((self.dstack_top - self.current_dsp) / CELL as u64) as usize
+    }
+
+    /// True while a `:` definition is open (the REPL shows a continuation prompt
+    /// and withholds ` ok` until the definition is closed).
+    pub fn compiling(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// True once `bye` has been executed (the REPL should exit).
+    pub fn wants_bye(&self) -> bool {
+        self.bye
     }
 
     /// Pop and return the top data-stack cell (None if empty).
