@@ -1398,7 +1398,18 @@ impl Mf66Session {
 
     /// `to <local>` — compile a store into the named local.
     fn compile_to(&mut self, target: &str) -> Result<()> {
-        // `to <ivar>` inside a method, else `to <local>`, else `to <value>`.
+        // `to <local>` (shadows everything), else `to <ivar>`, else `to <value>`.
+        let def = self.pending.as_ref().unwrap();
+        if let Some(i) = def.locals.iter().position(|n| n.eq_ignore_ascii_case(target)) {
+            let is_f = def.local_floats.get(i).copied().unwrap_or(false);
+            let t = if is_f {
+                Tok::LocalFStore(i as u32)
+            } else {
+                Tok::LocalStore(i as u32)
+            };
+            self.pending.as_mut().unwrap().toks.push(t);
+            return Ok(());
+        }
         if let Some(off) = self.ivar_offset(target) {
             self.pending.as_mut().unwrap().toks.push(Tok::IvarStore(off));
             return Ok(());
@@ -1410,23 +1421,31 @@ impl Mf66Session {
             d.toks.push(Tok::Mem(crate::opt::Mem::Store));
             return Ok(());
         }
-        let def = self.pending.as_ref().unwrap();
-        match def.locals.iter().position(|n| n.eq_ignore_ascii_case(target)) {
-            Some(i) => {
-                let is_f = def.local_floats.get(i).copied().unwrap_or(false);
-                let t = if is_f {
-                    Tok::LocalFStore(i as u32)
-                } else {
-                    Tok::LocalStore(i as u32)
-                };
-                self.pending.as_mut().unwrap().toks.push(t);
-                Ok(())
-            }
-            None => anyhow::bail!("`to {target}` — not a local/ivar"),
-        }
+        anyhow::bail!("`to {target}` — not a local/ivar/value")
     }
 
     fn compile_token(&mut self, tok: &str) -> Result<()> {
+        // A bare local name compiles to a fetch from its frame slot (FP for a
+        // float local, data stack for an integer local). Checked FIRST so a local
+        // shadows a same-named variable/value/ivar (Forth scoping).
+        if let Some(i) = self
+            .pending
+            .as_ref()
+            .and_then(|d| d.locals.iter().position(|n| n.eq_ignore_ascii_case(tok)))
+        {
+            let is_f = self
+                .pending
+                .as_ref()
+                .and_then(|d| d.local_floats.get(i).copied())
+                .unwrap_or(false);
+            let t = if is_f {
+                Tok::LocalFFetch(i as u32)
+            } else {
+                Tok::LocalFetch(i as u32)
+            };
+            self.pending.as_mut().unwrap().toks.push(t);
+            return Ok(());
+        }
         // A variable/buffer name folds to its fixed address (a literal), so the
         // optimizer can keep it in a register and `@`/`!` become a plain ldr/str
         // with no veneer call.
@@ -1449,26 +1468,6 @@ impl Mf66Session {
         if tok.eq_ignore_ascii_case("super") {
             self.pending.as_mut().unwrap().toks.push(Tok::SelfPush);
             self.super_pending = true;
-            return Ok(());
-        }
-        // A bare local name compiles to a fetch from its frame slot (FP for a
-        // float local, data stack for an integer local).
-        if let Some(i) = self
-            .pending
-            .as_ref()
-            .and_then(|d| d.locals.iter().position(|n| n.eq_ignore_ascii_case(tok)))
-        {
-            let is_f = self
-                .pending
-                .as_ref()
-                .and_then(|d| d.local_floats.get(i).copied())
-                .unwrap_or(false);
-            let t = if is_f {
-                Tok::LocalFFetch(i as u32)
-            } else {
-                Tok::LocalFetch(i as u32)
-            };
-            self.pending.as_mut().unwrap().toks.push(t);
             return Ok(());
         }
         let lk = tok.to_ascii_lowercase();
