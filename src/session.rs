@@ -120,6 +120,8 @@ pub struct Mf66Session {
     instance_addrs: HashMap<String, u64>,
     /// `marker` name → the snapshot to roll the dictionary back to.
     markers: HashMap<String, Marker>,
+    /// Per-word optimizer metrics, keyed by definition name (for the report).
+    word_metrics: HashMap<String, crate::opt::Metrics>,
     /// CREATE/DOES> defining words → (build tokens incl. `create`, does-code xt
     /// or 0). Replayed in Rust at use time. See finish_defining/instantiate.
     defining_words: HashMap<String, (Vec<String>, u64)>,
@@ -176,6 +178,8 @@ struct ColonDef {
     raw: Vec<String>,
     /// Forward-branch indices from each `exit`, patched to the single epilogue.
     exits: Vec<usize>,
+    /// Optimizer metrics accumulated across this definition's runs.
+    metrics: crate::opt::Metrics,
 }
 
 /// A `marker` snapshot: the dictionary/data/code state to restore when the
@@ -270,6 +274,7 @@ impl Mf66Session {
             var_addrs: HashMap::new(),
             instance_addrs: HashMap::new(),
             markers: HashMap::new(),
+            word_metrics: HashMap::new(),
             last_receiver_class: None,
             dnu_xt: 0,
             send_xt: 0,
@@ -1163,6 +1168,7 @@ impl Mf66Session {
                     defining: false,
                     raw: Vec::new(),
                     exits: Vec::new(),
+                    metrics: Default::default(),
                 });
             } else if lk == "2constant" {
                 let name = scan_word(b, &mut pos)
@@ -1511,12 +1517,93 @@ impl Mf66Session {
         Ok(())
     }
 
+    /// A formatted optimizer-effectiveness report over every compiled word.
+    /// Frames the deferred-lowerer's behavior as: token reduction, register/stack
+    /// residency, and the heat-policy gap (hot values re-read from memory or
+    /// evicted by coarse spills — what a hotness-ranked allocator would capture).
+    pub fn optimizer_report(&self) -> String {
+        use core::fmt::Write as _;
+        let mut total = crate::opt::Metrics::default();
+        for m in self.word_metrics.values() {
+            total.merge(m); // counts sum; peaks take the max single-word pressure
+        }
+        let n = self.word_metrics.len();
+        let pct = |a: u32, b: u32| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+        let mut s = String::new();
+        let _ = writeln!(s, "═══ MF66 optimizer report — {n} words ═══");
+        let _ = writeln!(s, "\nToken reduction (reduce pass):");
+        let _ = writeln!(
+            s,
+            "  tokens {} → {}  ({:.0}% removed)",
+            total.toks_in,
+            total.toks_out,
+            pct(total.toks_in.saturating_sub(total.toks_out), total.toks_in)
+        );
+        let _ = writeln!(
+            s,
+            "  const-fold {}  imm-fold {}  imm-chain {}  dup-fuse {}  DCE {}  stk-cancel {}  cmp-neg {}  (total {} rewrites)",
+            total.const_folds, total.imm_folds, total.imm_chains, total.dup_fuses,
+            total.dce, total.stack_cancels, total.cmp_negates, total.rewrites()
+        );
+        let _ = writeln!(s, "\nRegisters & stack motion:");
+        let _ = writeln!(
+            s,
+            "  stack ops {}  free/no-code {}  ({:.0}% pure reindex)",
+            total.stack_ops,
+            total.stack_ops_free,
+            pct(total.stack_ops_free, total.stack_ops)
+        );
+        let _ = writeln!(
+            s,
+            "  GP allocs {}  peak GP {}/7  peak FP {}/7  reg-copies {}  const→reg {}",
+            total.gp_allocs, total.peak_gp, total.peak_fp, total.reg_copies, total.const_mat
+        );
+        let _ = writeln!(s, "  spills (pressure → full-window settle) {}", total.spills);
+        let _ = writeln!(s, "\nMemory traffic:");
+        let _ = writeln!(
+            s,
+            "  stack loads {}  stack stores {}  DSP adjusts {}  settles {}  calls {}",
+            total.stack_loads, total.stack_stores, total.dsp_adjusts, total.settles, total.calls
+        );
+        let _ = writeln!(s, "  data @ {}  ! {}", total.mem_fetches, total.mem_stores);
+        let _ = writeln!(
+            s,
+            "  redundant @-refetches {}  ← heat-policy gap (hot value re-read from memory, not kept in a reg)",
+            total.redundant_fetches
+        );
+        // The hot words: most heat-gap (redundant fetches + spills), then biggest.
+        let mut v: Vec<(&String, &crate::opt::Metrics)> = self.word_metrics.iter().collect();
+        v.sort_by(|a, b| {
+            let ga = a.1.redundant_fetches + a.1.spills;
+            let gb = b.1.redundant_fetches + b.1.spills;
+            gb.cmp(&ga).then(b.1.instrs.cmp(&a.1.instrs))
+        });
+        let _ = writeln!(s, "\nHeat-gap words (refetch+spill, then size):");
+        let _ = writeln!(
+            s,
+            "  {:<18} {:>5} {:>8} {:>6} {:>6} {:>5} {:>4}",
+            "word", "instrs", "refetch", "spills", "peakGP", "loads", "@"
+        );
+        for (name, m) in v.iter().take(14) {
+            if m.redundant_fetches + m.spills + m.mem_fetches == 0 && m.peak_gp <= 1 {
+                continue;
+            }
+            let _ = writeln!(
+                s,
+                "  {:<18} {:>5} {:>8} {:>6} {:>6} {:>5} {:>4}",
+                name, m.instrs, m.redundant_fetches, m.spills, m.peak_gp, m.stack_loads, m.mem_fetches
+            );
+        }
+        s
+    }
+
     /// Reduce + lower the accumulated token run into the body, then clear it.
+    /// Optimizer metrics accumulate into the pending definition.
     fn flush_toks(&mut self) {
         if let Some(def) = self.pending.as_mut() {
             if !def.toks.is_empty() {
-                let reduced = crate::opt::reduce(&def.toks);
-                crate::opt::lower(&reduced, &mut def.body);
+                let reduced = crate::opt::reduce(&def.toks, &mut def.metrics);
+                crate::opt::lower(&reduced, &mut def.body, &mut def.metrics);
                 def.toks.clear();
             }
         }
@@ -1764,6 +1851,12 @@ impl Mf66Session {
             crate::aenc::patch_b(&mut def.body, i, epilogue);
         }
         self.last_body_words = def.body.len();
+        // Finalize + record optimizer metrics for this definition (body words
+        // less the nest prologue + the single epilogue).
+        def.metrics.instrs = def.body.len().saturating_sub(2) as u32;
+        if !def.name.is_empty() {
+            self.word_metrics.insert(def.name.clone(), def.metrics.clone());
+        }
         self.code.commit(&def.body)
     }
 
@@ -1822,6 +1915,7 @@ impl Mf66Session {
             defining: false,
             raw: Vec::new(),
             exits: Vec::new(),
+            metrics: Default::default(),
         });
         for t in tokens {
             self.compile_token(t)?;
@@ -1988,6 +2082,7 @@ impl Mf66Session {
             defining: false,
             raw: Vec::new(),
             exits: Vec::new(),
+            metrics: Default::default(),
         });
         self.method_class = Some(class);
         Ok(())

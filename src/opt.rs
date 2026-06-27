@@ -204,10 +204,87 @@ impl Cmp {
     }
 }
 
+/// Per-word optimizer metrics, accumulated across a definition's straight-line
+/// runs (each control-flow boundary flushes a run through reduce + lower). The
+/// counters mirror the optimizer's levers, grouped into token reduction,
+/// register/stack handling, and memory traffic. See `Mf66Session::optimizer_report`.
+#[derive(Clone, Default, Debug)]
+pub struct Metrics {
+    // ── reduce: token-IR shrinkage ──────────────────────────────────────────
+    pub toks_in: u32,       // tokens captured (pre-reduce)
+    pub toks_out: u32,      // tokens after reduce
+    pub const_folds: u32,   // Lit Lit Bin → Lit (+ Cmp/Sel folds in the lowerer)
+    pub imm_folds: u32,     // Lit Bin → ImmBin
+    pub imm_chains: u32,    // ImmBin ImmBin → ImmBin (e.g. 1+ 1+ → +2)
+    pub dup_fuses: u32,     // Dup Bin → DupBin
+    pub dce: u32,           // Lit/Dup Drop removed
+    pub stack_cancels: u32, // swap swap / rot -rot annihilated
+    pub cmp_negates: u32,   // <cmp> 0= → inverse compare
+    // ── lower: registers & stack motion ─────────────────────────────────────
+    pub instrs: u32,        // final emitted body instructions (set at commit)
+    pub stack_ops: u32,     // stack-motion tokens lowered (dup/swap/rot/pick/…)
+    pub stack_ops_free: u32,// …of those, ones that emitted ZERO code (pure reindex)
+    pub const_mat: u32,     // constants forced into a register (load_imm64)
+    pub reg_copies: u32,    // mov for a dup/over of a register value
+    pub gp_allocs: u32,     // pool-register allocations
+    pub peak_gp: u32,       // peak live GP pool registers (of 7)
+    pub peak_fp: u32,       // peak live FP pool registers (of 7)
+    pub spills: u32,        // reserve()→settle forced by register pressure
+    // ── lower: memory traffic ───────────────────────────────────────────────
+    pub stack_loads: u32,   // ldr pulling an entry cell into the window (ensure)
+    pub stack_stores: u32,  // str spilling the window to canonical memory (settle)
+    pub mem_fetches: u32,   // @ / c@ (data-memory loads)
+    pub mem_stores: u32,    // ! / c! (data-memory stores)
+    pub redundant_fetches: u32, // @/c@ of a const address already fetched in the
+                            // window — a hot value re-read from memory instead of
+                            // kept in a register (the heat-policy gap / promote_hot_cells)
+    pub dsp_adjusts: u32,   // add/sub DSP at settle boundaries
+    pub calls: u32,         // Call tokens (non-inlined words → settle barriers)
+    pub settles: u32,       // settle() invocations
+}
+
+impl Metrics {
+    /// Fold another run's metrics into this one (peaks max, the rest sum).
+    pub fn merge(&mut self, o: &Metrics) {
+        self.toks_in += o.toks_in;
+        self.toks_out += o.toks_out;
+        self.const_folds += o.const_folds;
+        self.imm_folds += o.imm_folds;
+        self.imm_chains += o.imm_chains;
+        self.dup_fuses += o.dup_fuses;
+        self.dce += o.dce;
+        self.stack_cancels += o.stack_cancels;
+        self.cmp_negates += o.cmp_negates;
+        self.stack_ops += o.stack_ops;
+        self.stack_ops_free += o.stack_ops_free;
+        self.const_mat += o.const_mat;
+        self.reg_copies += o.reg_copies;
+        self.gp_allocs += o.gp_allocs;
+        self.peak_gp = self.peak_gp.max(o.peak_gp);
+        self.peak_fp = self.peak_fp.max(o.peak_fp);
+        self.spills += o.spills;
+        self.stack_loads += o.stack_loads;
+        self.stack_stores += o.stack_stores;
+        self.mem_fetches += o.mem_fetches;
+        self.mem_stores += o.mem_stores;
+        self.redundant_fetches += o.redundant_fetches;
+        self.dsp_adjusts += o.dsp_adjusts;
+        self.calls += o.calls;
+        self.settles += o.settles;
+    }
+    /// Total reduce-pass rewrites (a proxy for token-level effectiveness).
+    pub fn rewrites(&self) -> u32 {
+        self.const_folds + self.imm_folds + self.imm_chains + self.dup_fuses
+            + self.dce + self.stack_cancels + self.cmp_negates
+    }
+}
+
 /// Reduce a token run: const-fold `Lit Lit Bin`, immediate-fold `Lit Bin`,
 /// dup-fuse `Dup Bin`, and DCE `Lit Drop` / `Dup Drop`. A single forward pass
 /// with lookback on the output is a fixpoint for these linear stack rewrites.
-pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
+/// Accumulates token-level metrics into `m`.
+pub fn reduce(toks: &[Tok], m: &mut Metrics) -> Vec<Tok> {
+    m.toks_in += toks.len() as u32;
     let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
     for &t in toks {
         match t {
@@ -218,6 +295,7 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
                     if let (Tok::Lit(a), Tok::Lit(b)) = (out[n - 2], out[n - 1]) {
                         out.truncate(n - 2);
                         out.push(Tok::Lit(op.eval(a, b)));
+                        m.const_folds += 1;
                         continue;
                     }
                 }
@@ -235,16 +313,19 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
                             };
                             out.pop();
                             out.push(Tok::ImmBin(op, combined));
+                            m.imm_chains += 1;
                             continue;
                         }
                     }
                     out.push(Tok::ImmBin(op, k));
+                    m.imm_folds += 1;
                     continue;
                 }
                 // dup-fuse: ... Dup, Bin -> DupBin(op)
                 if let Some(Tok::Stk(Stk::Dup)) = out.last().copied() {
                     out.pop();
                     out.push(Tok::DupBin(op));
+                    m.dup_fuses += 1;
                     continue;
                 }
                 out.push(t);
@@ -253,6 +334,7 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
                 // DCE: a literal or a dup immediately dropped is dead
                 Some(Tok::Lit(_)) | Some(Tok::Stk(Stk::Dup)) => {
                     out.pop();
+                    m.dce += 1;
                 }
                 _ => out.push(t),
             },
@@ -262,6 +344,7 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
                 | (Some(Tok::Stk(Stk::Rot)), Stk::MinusRot)
                 | (Some(Tok::Stk(Stk::MinusRot)), Stk::Rot) => {
                     out.pop();
+                    m.stack_cancels += 1;
                 }
                 _ => out.push(t),
             },
@@ -271,12 +354,14 @@ pub fn reduce(toks: &[Tok]) -> Vec<Tok> {
                     let n = c.negate().unwrap();
                     out.pop();
                     out.push(Tok::Cmp(n));
+                    m.cmp_negates += 1;
                 }
                 _ => out.push(t),
             },
             _ => out.push(t),
         }
     }
+    m.toks_out += out.len() as u32;
     out
 }
 
@@ -312,6 +397,8 @@ struct Low<'a> {
     fvs: Vec<u32>,    // d-registers; fvs.last() = FTOS
     fused: [bool; 32],
     fconsumed: i64,
+    m: Metrics, // accumulated codegen metrics for this run
+    fetched: Vec<i64>, // const addresses @-fetched in the current window (heat probe)
 }
 
 const FTOS: u32 = 8; // d8 — canonical float top of stack at window boundaries
@@ -333,6 +420,20 @@ impl<'a> Low<'a> {
             fvs: vec![FTOS],
             fused,
             fconsumed: 0,
+            m: Metrics::default(),
+            fetched: Vec::new(),
+        }
+    }
+
+    /// Record an `@`/`c@` of address `a`; flag a redundant re-read (a hot value
+    /// pulled from memory again within the window instead of staying in a reg).
+    fn note_fetch(&mut self, a: Loc) {
+        if let Loc::Const(addr) = a {
+            if self.fetched.contains(&addr) {
+                self.m.redundant_fetches += 1;
+            } else {
+                self.fetched.push(addr);
+            }
         }
     }
 
@@ -343,6 +444,9 @@ impl<'a> Low<'a> {
     fn alloc(&mut self) -> u32 {
         let r = *POOL.iter().find(|&&r| !self.used[r as usize]).expect("alloc: no free reg");
         self.used[r as usize] = true;
+        self.m.gp_allocs += 1;
+        let live = POOL.iter().filter(|&&r| self.used[r as usize]).count() as u32;
+        self.m.peak_gp = self.m.peak_gp.max(live);
         r
     }
 
@@ -360,6 +464,7 @@ impl<'a> Low<'a> {
     /// at the START of an op (while `vs` is consistent) so later allocs never settle.
     fn reserve(&mut self, n: usize) {
         if self.nfree() < n {
+            self.m.spills += 1;
             self.settle_data();
         }
     }
@@ -369,6 +474,7 @@ impl<'a> Low<'a> {
         while self.vs.len() < n {
             let r = self.alloc();
             self.out.push(ldr_off(r, DSP, (self.consumed * 8) as u32));
+            self.m.stack_loads += 1;
             self.consumed += 1;
             self.vs.insert(0, Loc::Reg(r)); // deeper than the existing window
         }
@@ -381,6 +487,7 @@ impl<'a> Low<'a> {
             Loc::Const(n) => {
                 let r = self.alloc();
                 load_imm64(r, n as u64, self.out);
+                self.m.const_mat += 1;
                 r
             }
         }
@@ -393,6 +500,7 @@ impl<'a> Low<'a> {
             Loc::Reg(r) => {
                 let r2 = self.alloc();
                 self.out.push(mov_reg(r2, r));
+                self.m.reg_copies += 1;
                 Loc::Reg(r2)
             }
         }
@@ -660,15 +768,19 @@ impl<'a> Low<'a> {
             Mem::Fetch => {
                 self.ensure(1);
                 let a = self.vs.pop().unwrap();
+                self.note_fetch(a);
                 let r = self.to_reg(a);
                 self.out.push(ldr0(r, r));
+                self.m.mem_fetches += 1;
                 self.vs.push(Loc::Reg(r));
             }
             Mem::CFetch => {
                 self.ensure(1);
                 let a = self.vs.pop().unwrap();
+                self.note_fetch(a);
                 let r = self.to_reg(a);
                 self.out.push(ldrb0(r, r));
+                self.m.mem_fetches += 1;
                 self.vs.push(Loc::Reg(r));
             }
             Mem::Store => {
@@ -679,6 +791,7 @@ impl<'a> Low<'a> {
                 let raddr = self.to_reg(addr);
                 let rx = self.to_reg(x);
                 self.out.push(str_off(rx, raddr, 0));
+                self.m.mem_stores += 1;
                 self.freer(rx);
                 self.freer(raddr);
             }
@@ -689,6 +802,7 @@ impl<'a> Low<'a> {
                 let raddr = self.to_reg(addr);
                 let rx = self.to_reg(x);
                 self.out.push(strb0(rx, raddr));
+                self.m.mem_stores += 1;
                 self.freer(rx);
                 self.freer(raddr);
             }
@@ -748,6 +862,8 @@ impl<'a> Low<'a> {
         }
         let r = *FPOOL.iter().find(|&&r| !self.fused[r as usize]).expect("falloc");
         self.fused[r as usize] = true;
+        let live = FPOOL.iter().filter(|&&r| self.fused[r as usize]).count() as u32;
+        self.m.peak_fp = self.m.peak_fp.max(live);
         r
     }
     /// A free GP register for materializing a float constant (settling the data
@@ -861,6 +977,7 @@ impl<'a> Low<'a> {
     /// Settle both the data and FP windows to canonical form (before a Call and at
     /// the run's end).
     fn settle(&mut self) {
+        self.m.settles += 1;
         self.settle_data();
         self.fsettle();
     }
@@ -875,8 +992,10 @@ impl<'a> Low<'a> {
         let delta = self.consumed - (l as i64 - 1); // DSP change in cells
         if delta > 0 {
             self.out.push(add_imm(DSP, DSP, (delta * 8) as u32));
+            self.m.dsp_adjusts += 1;
         } else if delta < 0 {
             self.out.push(sub_imm(DSP, DSP, ((-delta) * 8) as u32));
+            self.m.dsp_adjusts += 1;
         }
         // Pass 1: store deep register entries (freeing their regs), reading x0
         // before it is overwritten by the new TOS.
@@ -884,6 +1003,7 @@ impl<'a> Low<'a> {
             if let Loc::Reg(r) = self.vs[i] {
                 let off = ((l - 2 - i) as u32) * 8;
                 self.out.push(str_off(r, DSP, off));
+                self.m.stack_stores += 1;
                 self.freer(r);
             }
         }
@@ -911,6 +1031,7 @@ impl<'a> Low<'a> {
         self.used = [false; 32];
         self.used[0] = true;
         self.consumed = 0;
+        self.fetched.clear(); // a settle ends the window; re-reads after it are fresh
     }
 }
 
@@ -957,7 +1078,7 @@ pub fn fused_cmp(c: Cmp, out: &mut Vec<u32>) -> u32 {
 /// model (appended to `out`). Constants and stack motion stay virtual; code is
 /// emitted only at consume/settle. Settles before each call and at the end so the
 /// canonical TOS=x0 / rest-in-memory form holds at every window boundary.
-pub fn lower(toks: &[Tok], out: &mut Vec<u32>) {
+pub fn lower(toks: &[Tok], out: &mut Vec<u32>, m: &mut Metrics) {
     let mut low = Low::new(out);
     for &t in toks {
         match t {
@@ -965,42 +1086,78 @@ pub fn lower(toks: &[Tok], out: &mut Vec<u32>) {
             Tok::Bin(op) => low.bin(op),
             Tok::ImmBin(op, k) => low.imm_bin(op, k),
             Tok::DupBin(op) => low.dup_bin(op),
-            Tok::Stk(s) => low.stk(s),
+            // Stack-motion tokens: count, and flag the ones that emit no code
+            // (the "everything is pick" payoff — pure virtual-stack reindexing).
+            Tok::Stk(s) => {
+                let before = low.out.len();
+                low.stk(s);
+                low.m.stack_ops += 1;
+                if low.out.len() == before {
+                    low.m.stack_ops_free += 1;
+                }
+            }
+            Tok::PickN(n) => {
+                let before = low.out.len();
+                low.pick_n(n);
+                low.m.stack_ops += 1;
+                if low.out.len() == before {
+                    low.m.stack_ops_free += 1;
+                }
+            }
+            Tok::RollN(n) => {
+                let before = low.out.len();
+                low.roll_n(n);
+                low.m.stack_ops += 1;
+                if low.out.len() == before {
+                    low.m.stack_ops_free += 1;
+                }
+            }
             Tok::Cmp(c) => low.cmp(c),
             Tok::Sel(s) => low.sel(s),
-            Tok::Mem(m) => low.mem(m),
+            Tok::Mem(mm) => low.mem(mm),
             Tok::LocalFetch(i) => low.local_fetch(i),
             Tok::LocalStore(i) => low.local_store(i),
             Tok::IvarFetch(off) => low.ivar_fetch(off),
             Tok::IvarStore(off) => low.ivar_store(off),
             Tok::SelfPush => low.self_push(),
-            Tok::PickN(n) => low.pick_n(n),
-            Tok::RollN(n) => low.roll_n(n),
             Tok::FLit(bits) => low.flit(bits),
             Tok::FBin(op) => low.fbin(op),
             Tok::FUn(op) => low.fun(op),
-            Tok::FStk(s) => low.fstk(s),
+            Tok::FStk(s) => {
+                let before = low.out.len();
+                low.fstk(s);
+                low.m.stack_ops += 1;
+                if low.out.len() == before {
+                    low.m.stack_ops_free += 1;
+                }
+            }
             Tok::Call(xt) => {
+                low.m.calls += 1;
                 low.settle();
                 emit_call(xt, low.out);
             }
         }
     }
     low.settle();
+    m.merge(&low.m);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn red(toks: &[Tok]) -> Vec<Tok> {
+        reduce(toks, &mut Metrics::default())
+    }
+
     #[test]
     fn const_fold() {
         // 2 3 + -> Lit 5
-        let r = reduce(&[Tok::Lit(2), Tok::Lit(3), Tok::Bin(Bin::Add)]);
+        let r = red(&[Tok::Lit(2), Tok::Lit(3), Tok::Bin(Bin::Add)]);
         assert_eq!(r.len(), 1);
         assert!(matches!(r[0], Tok::Lit(5)));
         // 2 3 + 4 * -> Lit 20
-        let r = reduce(&[
+        let r = red(&[
             Tok::Lit(2),
             Tok::Lit(3),
             Tok::Bin(Bin::Add),
@@ -1013,13 +1170,13 @@ mod tests {
     #[test]
     fn imm_and_dup_and_dce() {
         // x 5 + -> ImmBin(Add,5)
-        let r = reduce(&[Tok::Bin(Bin::Add), Tok::Lit(5), Tok::Bin(Bin::Add)]);
+        let r = red(&[Tok::Bin(Bin::Add), Tok::Lit(5), Tok::Bin(Bin::Add)]);
         assert!(matches!(r.last(), Some(Tok::ImmBin(Bin::Add, 5))));
         // dup + -> DupBin(Add)
-        let r = reduce(&[Tok::Stk(Stk::Dup), Tok::Bin(Bin::Add)]);
+        let r = red(&[Tok::Stk(Stk::Dup), Tok::Bin(Bin::Add)]);
         assert!(matches!(r[..], [Tok::DupBin(Bin::Add)]));
         // 7 drop -> nothing
-        let r = reduce(&[Tok::Lit(7), Tok::Stk(Stk::Drop)]);
+        let r = red(&[Tok::Lit(7), Tok::Stk(Stk::Drop)]);
         assert!(r.is_empty());
     }
 }
