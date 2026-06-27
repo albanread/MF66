@@ -519,18 +519,85 @@ impl Mf66Session {
     /// (a call per word, a literal per number) until `;`, which finishes the
     /// word. (Bring-up: tokenizing/number parsing + the `:`/`;` handling are
     /// Rust-side; the kernel parse + interpret loop and immediate words come next.)
+    /// Store raw bytes at HERE and bump HERE (cell-aligned). Returns (addr, len).
+    fn store_string(&mut self, bytes: &[u8]) -> (u64, u64) {
+        let addr = self.read_user(USER_VAR_HERE);
+        for (i, c) in bytes.iter().enumerate() {
+            self.write_u8(addr + i as u64, *c);
+        }
+        let len = bytes.len() as u64;
+        self.write_user(USER_VAR_HERE, (addr + len + 7) & !7);
+        (addr, len)
+    }
+
+    /// Store a counted string (length byte + bytes) at HERE. Returns its address.
+    fn store_counted(&mut self, bytes: &[u8]) -> u64 {
+        let addr = self.read_user(USER_VAR_HERE);
+        self.write_u8(addr, bytes.len() as u8);
+        for (i, c) in bytes.iter().enumerate() {
+            self.write_u8(addr + 1 + i as u64, *c);
+        }
+        let total = bytes.len() as u64 + 1;
+        self.write_user(USER_VAR_HERE, (addr + total + 7) & !7);
+        addr
+    }
+
+    /// Push (interpret) or compile (Lit) a single value.
+    fn push_or_compile_lit(&mut self, v: i64) {
+        if self.pending.is_some() {
+            self.pending.as_mut().unwrap().toks.push(Tok::Lit(v));
+        } else {
+            self.push(v);
+        }
+    }
+
+    /// Push (interpret) or compile a (c-addr u) pair.
+    fn push_or_compile_pair(&mut self, addr: u64, len: u64) {
+        if self.pending.is_some() {
+            let d = self.pending.as_mut().unwrap();
+            d.toks.push(Tok::Lit(addr as i64));
+            d.toks.push(Tok::Lit(len as i64));
+        } else {
+            self.push(addr as i64);
+            self.push(len as i64);
+        }
+    }
+
+    /// `." ` behaviour: type the string now (interpret) or compile a type call.
+    fn emit_type(&mut self, addr: u64, len: u64) -> Result<()> {
+        if self.pending.is_some() {
+            let xt = self.xt_of("type_word")?;
+            let d = self.pending.as_mut().unwrap();
+            d.toks.push(Tok::Lit(addr as i64));
+            d.toks.push(Tok::Lit(len as i64));
+            d.toks.push(Tok::Call(xt));
+        } else {
+            self.push(addr as i64);
+            self.push(len as i64);
+            self.call("type_word")?;
+        }
+        Ok(())
+    }
+
     pub fn eval(&mut self, text: &str) -> Result<()> {
-        let mut tokens = text.split_whitespace();
-        while let Some(tok) = tokens.next() {
-            // Comments: `\` to end of line, `( … )` inline.
+        // Cursor-based tokenizer (not split_whitespace) so string-parsing words
+        // can read exact spans with interior spacing preserved.
+        let b = text.as_bytes();
+        let mut pos = 0usize;
+        while let Some(tok) = scan_word(b, &mut pos) {
+            // Comments: `\` to end of line, `( … )` to the closing paren.
             if tok == "\\" {
-                break;
+                while pos < b.len() && b[pos] != b'\n' {
+                    pos += 1;
+                }
+                continue;
             }
             if tok == "(" {
-                for t in tokens.by_ref() {
-                    if t.ends_with(')') {
-                        break;
-                    }
+                while pos < b.len() && b[pos] != b')' {
+                    pos += 1;
+                }
+                if pos < b.len() {
+                    pos += 1; // skip the ')'
                 }
                 continue;
             }
@@ -563,8 +630,7 @@ impl Mf66Session {
             // A registered defining word: define the next name from its template.
             if self.pending.is_none() {
                 if let Some((build, does_xt)) = self.defining_words.get(&lk).cloned() {
-                    let target = tokens
-                        .next()
+                    let target = scan_word(b, &mut pos)
                         .ok_or_else(|| anyhow::anyhow!("`{tok}` needs a name"))?;
                     self.instantiate_defining(target, &build, does_xt)?;
                     continue;
@@ -576,7 +642,7 @@ impl Mf66Session {
                 if flag == 0 {
                     // skip the true-branch up to the matching [else] or [then]
                     let mut depth = 0;
-                    for t in tokens.by_ref() {
+                    while let Some(t) = scan_word(b, &mut pos) {
                         match t.to_ascii_lowercase().as_str() {
                             "[if]" => depth += 1,
                             "[else]" if depth == 0 => break,
@@ -595,7 +661,7 @@ impl Mf66Session {
             if lk == "[else]" {
                 // reached after a taken true-branch: skip to the matching [then]
                 let mut depth = 0;
-                for t in tokens.by_ref() {
+                while let Some(t) = scan_word(b, &mut pos) {
                     match t.to_ascii_lowercase().as_str() {
                         "[if]" => depth += 1,
                         "[then]" => {
@@ -630,8 +696,7 @@ impl Mf66Session {
             }
             // ' / ['] name — push (interpret) or compile (literal) the word's xt.
             if lk == "'" || lk == "[']" {
-                let name = tokens
-                    .next()
+                let name = scan_word(b, &mut pos)
                     .ok_or_else(|| anyhow::anyhow!("`{tok}` needs a name"))?;
                 let xt = self
                     .xt_of_forth_name(name)?
@@ -643,52 +708,45 @@ impl Mf66Session {
                 }
                 continue;
             }
-            // s" …" — compile/push a string literal (addr len). Stored in data
-            // space at compile time. (Whitespace-tokenized, so runs of spaces in
-            // the literal collapse to one — fine for the corpus's uses.)
-            if lk == "s\"" || lk == ".\"" {
-                let mut bytes: Vec<u8> = Vec::new();
-                loop {
-                    let t = tokens
-                        .next()
-                        .ok_or_else(|| anyhow::anyhow!("unterminated {tok}"))?;
-                    let done = t.ends_with('"');
-                    let piece = if done { &t[..t.len() - 1] } else { t };
-                    if !bytes.is_empty() {
-                        bytes.push(b' ');
-                    }
-                    bytes.extend_from_slice(piece.as_bytes());
-                    if done {
-                        break;
-                    }
-                }
-                let addr = self.read_user(USER_VAR_HERE);
-                for (i, b) in bytes.iter().enumerate() {
-                    self.write_u8(addr + i as u64, *b);
-                }
-                let len = bytes.len() as u64;
-                self.write_user(USER_VAR_HERE, (addr + len + 7) & !7); // align up
-                if lk == ".\"" {
-                    // ." …" — print immediately (interpret) or compile type
-                    if self.pending.is_some() {
-                        let d = self.pending.as_mut().unwrap();
-                        d.toks.push(Tok::Lit(addr as i64));
-                        d.toks.push(Tok::Lit(len as i64));
-                        let xt = self.xt_of("type_word")?;
-                        self.pending.as_mut().unwrap().toks.push(Tok::Call(xt));
-                    } else {
-                        self.push(addr as i64);
-                        self.push(len as i64);
-                        self.call("type_word")?;
-                    }
-                } else if self.pending.is_some() {
-                    let d = self.pending.as_mut().unwrap();
-                    d.toks.push(Tok::Lit(addr as i64));
-                    d.toks.push(Tok::Lit(len as i64));
+            // String-parsing words — read exact spans from the source (interior
+            // spacing preserved):
+            //   s" ccc"   ( -- c-addr u )   push/compile a string literal
+            //   ." ccc"   ( -- )            print (interpret) / compile `type`
+            //   c" ccc"   ( -- c-addr )     counted-string literal
+            //   s\" ccc"  ( -- c-addr u )   escaped string (\n \t \xHH …)
+            //   .( ccc)   ( -- )            print immediately
+            if lk == "s\"" || lk == ".\"" || lk == "c\"" {
+                let body = scan_span(b, &mut pos, b'"')
+                    .ok_or_else(|| anyhow::anyhow!("unterminated {tok}"))?;
+                let bytes = body.as_bytes().to_vec();
+                if lk == "c\"" {
+                    let addr = self.store_counted(&bytes);
+                    self.push_or_compile_lit(addr as i64);
                 } else {
-                    self.push(addr as i64);
-                    self.push(len as i64);
+                    let (addr, len) = self.store_string(&bytes);
+                    if lk == ".\"" {
+                        self.emit_type(addr, len)?;
+                    } else {
+                        self.push_or_compile_pair(addr, len);
+                    }
                 }
+                continue;
+            }
+            if lk == "s\\\"" {
+                let bytes = scan_escaped(b, &mut pos)
+                    .ok_or_else(|| anyhow::anyhow!("unterminated s\\\""))?;
+                let (addr, len) = self.store_string(&bytes);
+                self.push_or_compile_pair(addr, len);
+                continue;
+            }
+            if lk == ".(" {
+                let body = scan_span(b, &mut pos, b')')
+                    .ok_or_else(|| anyhow::anyhow!("unterminated .("))?;
+                let bytes = body.as_bytes().to_vec();
+                let (addr, len) = self.store_string(&bytes); // .( always prints now
+                self.push(addr as i64);
+                self.push(len as i64);
+                self.call("type_word")?;
                 continue;
             }
             // Receiver tracking for early binding: any token other than `->`
@@ -699,14 +757,14 @@ impl Mf66Session {
             // OOP method send — unless `->` has been defined as an ordinary word
             // (e.g. the ANS tester's result separator), which then takes priority.
             if lk == "->" && self.xt_of_forth_name("->")?.is_none() {
-                let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`->` needs a selector"))?;
+                let s = scan_word(b, &mut pos).ok_or_else(|| anyhow::anyhow!("`->` needs a selector"))?;
                 self.oop_send(s)?;
                 continue;
             }
             // ── OOP parsing words (valid in both interpret and compile state) ──
             match lk.as_str() {
                 ":m" => {
-                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`:m` needs a name"))?;
+                    let s = scan_word(b, &mut pos).ok_or_else(|| anyhow::anyhow!("`:m` needs a name"))?;
                     self.oop_begin_method(s)?;
                     continue;
                 }
@@ -715,7 +773,7 @@ impl Mf66Session {
                     continue;
                 }
                 "ivar:" => {
-                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`ivar:` needs a name"))?;
+                    let s = scan_word(b, &mut pos).ok_or_else(|| anyhow::anyhow!("`ivar:` needs a name"))?;
                     self.oop_ivar(s)?;
                     continue;
                 }
@@ -724,12 +782,12 @@ impl Mf66Session {
                     continue;
                 }
                 "class" => {
-                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`class` needs a name"))?;
+                    let s = scan_word(b, &mut pos).ok_or_else(|| anyhow::anyhow!("`class` needs a name"))?;
                     self.oop_start_class(s, "object")?;
                     continue;
                 }
                 "subclass" => {
-                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`subclass` needs a name"))?;
+                    let s = scan_word(b, &mut pos).ok_or_else(|| anyhow::anyhow!("`subclass` needs a name"))?;
                     let parent = self.pop_data().unwrap_or(0) as u64;
                     let pn = self
                         .class_name_by_struct(parent)
@@ -738,7 +796,7 @@ impl Mf66Session {
                     continue;
                 }
                 "new" => {
-                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`new` needs a name"))?;
+                    let s = scan_word(b, &mut pos).ok_or_else(|| anyhow::anyhow!("`new` needs a name"))?;
                     let cs = self.pop_data().unwrap_or(0) as u64;
                     let cn = self
                         .class_name_by_struct(cs)
@@ -747,14 +805,14 @@ impl Mf66Session {
                     continue;
                 }
                 "create" => {
-                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`create` needs a name"))?;
+                    let s = scan_word(b, &mut pos).ok_or_else(|| anyhow::anyhow!("`create` needs a name"))?;
                     let addr = self.read_user(USER_VAR_HERE);
                     self.publish_constant(s, addr as i64)?; // NAME pushes the data field addr
                     self.var_addrs.insert(s.to_string(), addr); // fold to a literal in code
                     continue;
                 }
                 "[defined]" => {
-                    let s = tokens.next().ok_or_else(|| anyhow::anyhow!("`[defined]` needs a name"))?;
+                    let s = scan_word(b, &mut pos).ok_or_else(|| anyhow::anyhow!("`[defined]` needs a name"))?;
                     self.oop_defined_q(s)?;
                     continue;
                 }
@@ -804,7 +862,7 @@ impl Mf66Session {
                     let mut names = Vec::new();
                     let mut inputs = 0usize;
                     let mut after_pipe = false;
-                    for t in tokens.by_ref() {
+                    while let Some(t) = scan_word(b, &mut pos) {
                         if t == ":}" {
                             break;
                         }
@@ -819,8 +877,7 @@ impl Mf66Session {
                     }
                     self.open_locals(names, inputs);
                 } else if lk == "to" {
-                    let target = tokens
-                        .next()
+                    let target = scan_word(b, &mut pos)
                         .ok_or_else(|| anyhow::anyhow!("`to` needs a name"))?;
                     self.compile_to(target)?;
                 } else {
@@ -830,8 +887,7 @@ impl Mf66Session {
                 self.bye = true;
                 break;
             } else if lk == "value" {
-                let name = tokens
-                    .next()
+                let name = scan_word(b, &mut pos)
                     .ok_or_else(|| anyhow::anyhow!("`value` needs a name"))?;
                 let v = self
                     .pop_data()
@@ -842,7 +898,7 @@ impl Mf66Session {
                 self.values.insert(name.to_string(), cell);
             } else if lk == "to" && self.pending.is_none() {
                 // interpret-mode `to NAME` — store TOS into a value's cell
-                let name = tokens.next().ok_or_else(|| anyhow::anyhow!("`to` needs a name"))?;
+                let name = scan_word(b, &mut pos).ok_or_else(|| anyhow::anyhow!("`to` needs a name"))?;
                 let cell = *self
                     .values
                     .get(name)
@@ -853,8 +909,7 @@ impl Mf66Session {
                 let name = if lk == ":noname" {
                     String::new()
                 } else {
-                    tokens
-                        .next()
+                    scan_word(b, &mut pos)
                         .ok_or_else(|| anyhow::anyhow!("`:` needs a name"))?
                         .to_string()
                 };
@@ -873,8 +928,7 @@ impl Mf66Session {
                     raw: Vec::new(),
                 });
             } else if lk == "2constant" {
-                let name = tokens
-                    .next()
+                let name = scan_word(b, &mut pos)
                     .ok_or_else(|| anyhow::anyhow!("`2constant` needs a name"))?;
                 let hi = self.pop_data().unwrap_or(0);
                 let lo = self.pop_data().unwrap_or(0);
@@ -1715,6 +1769,102 @@ impl Drop for Mf66Session {
 /// Locate `kernel/main.masm` relative to the crate root.
 fn kernel_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernel/main.masm")
+}
+
+/// Next whitespace-delimited word from `b` starting at `*pos`; advances `*pos`
+/// past it. `None` at end of input. (The cursor-based replacement for
+/// `split_whitespace`, so string-parsing words can read exact spans.)
+fn scan_word<'a>(b: &'a [u8], pos: &mut usize) -> Option<&'a str> {
+    while *pos < b.len() && b[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+    if *pos >= b.len() {
+        return None;
+    }
+    let start = *pos;
+    while *pos < b.len() && !b[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+    std::str::from_utf8(&b[start..*pos]).ok()
+}
+
+/// Parse a string body up to `delim`, preserving exact interior spacing. Consumes
+/// exactly one leading delimiter space if present (the space that ended the
+/// parsing word), then takes bytes verbatim to `delim`. Advances past `delim`.
+/// `None` if unterminated. Used by `s"`, `."`, `.(`, `c"`.
+fn scan_span<'a>(b: &'a [u8], pos: &mut usize, delim: u8) -> Option<&'a str> {
+    if *pos < b.len() && b[*pos] == b' ' {
+        *pos += 1;
+    }
+    let start = *pos;
+    while *pos < b.len() && b[*pos] != delim {
+        *pos += 1;
+    }
+    if *pos >= b.len() {
+        return None;
+    }
+    let s = std::str::from_utf8(&b[start..*pos]).ok();
+    *pos += 1; // skip the closing delimiter
+    s
+}
+
+/// Parse an `s\"` escaped string up to an unescaped `"`, decoding ANS 6.2.2266
+/// escapes (`\n \t \r \a \b \e \f \l \m \q \v \z \0 \" \\ \xHH`). Consumes one
+/// leading space; advances past the closing quote. `None` if unterminated.
+fn scan_escaped(b: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    if *pos < b.len() && b[*pos] == b' ' {
+        *pos += 1;
+    }
+    let hex = |d: u8| -> Option<u8> {
+        match d {
+            b'0'..=b'9' => Some(d - b'0'),
+            b'a'..=b'f' => Some(d - b'a' + 10),
+            b'A'..=b'F' => Some(d - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    while *pos < b.len() {
+        let c = b[*pos];
+        if c == b'"' {
+            *pos += 1;
+            return Some(out);
+        }
+        if c == b'\\' {
+            *pos += 1;
+            let e = *b.get(*pos)?;
+            match e {
+                b'a' => out.push(7),
+                b'b' => out.push(8),
+                b'e' => out.push(27),
+                b'f' => out.push(12),
+                b'l' => out.push(10),
+                b'm' => {
+                    out.push(13);
+                    out.push(10);
+                }
+                b'n' => out.push(10),
+                b'q' | b'"' => out.push(34),
+                b'r' => out.push(13),
+                b't' => out.push(9),
+                b'v' => out.push(11),
+                b'z' | b'0' => out.push(0),
+                b'\\' => out.push(92),
+                b'x' | b'X' => {
+                    let h1 = b.get(*pos + 1).copied().and_then(hex)?;
+                    let h2 = b.get(*pos + 2).copied().and_then(hex)?;
+                    out.push(h1 * 16 + h2);
+                    *pos += 2;
+                }
+                other => out.push(other), // unknown escape → literal char
+            }
+            *pos += 1;
+        } else {
+            out.push(c);
+            *pos += 1;
+        }
+    }
+    None
 }
 
 /// Parse a Forth floating-point literal (`1.5`, `1.5e0`, `-2.25`, `1e3`). Only a
