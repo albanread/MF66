@@ -33,8 +33,17 @@ const USER_LATEST: usize = 0x10;
 const USER_HERE: usize = 0x18;
 const USER_DICT_END: usize = 0x20;
 const USER_LATESTXT: usize = 0x78;
+const USER_CURRENT: usize = 0x1500; // wid receiving new defs (bucket array base)
+const USER_INDEX_HERE: usize = 0x1518; // overlay node arena (grows down)
+const USER_INDEX_LATEST: usize = 0x1520; // newest overlay node (creation chain)
 const USER_VAR_HERE: usize = 0x1820;
 const USER_VAR_LIMIT: usize = 0x1828;
+// Overlay (dn_) node field offsets + bucket mask, for marker/forget rollback.
+const DN_BUCKET_NEXT: u64 = 0;
+const DN_GLOBAL_PREV: u64 = 8;
+const DN_WID: u64 = 24;
+const DN_HASH: u64 = 32; // u32 in the low 4 bytes
+const WL_BUCKET_MASK: u64 = 511;
 const USER_HOST_RSP: usize = 0x58;
 const USER_DSP_SAVE: usize = 0x60;
 const USER_SP0: usize = 0x68;
@@ -105,6 +114,8 @@ pub struct Mf66Session {
     /// Every CREATE-instance's data-field address (incl. does>-having ones like
     /// `2value`/`defer`), so `is`/`2to`/`+to` can write into it.
     instance_addrs: HashMap<String, u64>,
+    /// `marker` name → the snapshot to roll the dictionary back to.
+    markers: HashMap<String, Marker>,
     /// CREATE/DOES> defining words → (build tokens incl. `create`, does-code xt
     /// or 0). Replayed in Rust at use time. See finish_defining/instantiate.
     defining_words: HashMap<String, (Vec<String>, u64)>,
@@ -161,6 +172,23 @@ struct ColonDef {
     raw: Vec<String>,
     /// Forward-branch indices from each `exit`, patched to the single epilogue.
     exits: Vec<usize>,
+}
+
+/// A `marker` snapshot: the dictionary/data/code state to restore when the
+/// marker word is executed (forgetting everything defined after it).
+struct Marker {
+    latest: u64,
+    here: u64,
+    var_here: u64,
+    index_here: u64,
+    index_latest: u64,
+    code_cursor: usize,
+    classes: HashMap<String, ClassInfo>,
+    objects: HashMap<String, (u64, String)>,
+    values: HashMap<String, u64>,
+    var_addrs: HashMap<String, u64>,
+    instance_addrs: HashMap<String, u64>,
+    defining_words: HashMap<String, (Vec<String>, u64)>,
 }
 
 /// A pending control-flow mark (compile time).
@@ -237,6 +265,7 @@ impl Mf66Session {
             defining_words: HashMap::new(),
             var_addrs: HashMap::new(),
             instance_addrs: HashMap::new(),
+            markers: HashMap::new(),
             last_receiver_class: None,
             dnu_xt: 0,
             send_xt: 0,
@@ -923,6 +952,18 @@ impl Mf66Session {
                 self.write_u8(header + DH_TFA, TFA_TCOL);
                 continue;
             }
+            // marker NAME — snapshot the dictionary, define NAME as a findable
+            // placeholder; executing NAME (intercepted in interpret_token) rolls
+            // the dictionary back to here, forgetting NAME and all later defs.
+            if lk == "marker" {
+                let name = scan_word(b, &mut pos)
+                    .ok_or_else(|| anyhow::anyhow!("`marker` needs a name"))?
+                    .to_ascii_lowercase();
+                let snap = self.snapshot();
+                self.publish_constant(&name, 0)?;
+                self.markers.insert(name, snap);
+                continue;
+            }
             // Receiver tracking for early binding: any token other than `->`
             // begins a fresh receiver context.
             if lk != "->" {
@@ -1124,8 +1165,68 @@ impl Mf66Session {
         Ok(())
     }
 
+    /// Capture the current dictionary/data/code state for a `marker`.
+    fn snapshot(&self) -> Marker {
+        Marker {
+            latest: self.read_user(USER_LATEST),
+            here: self.read_user(USER_HERE),
+            var_here: self.read_user(USER_VAR_HERE),
+            index_here: self.read_user(USER_INDEX_HERE),
+            index_latest: self.read_user(USER_INDEX_LATEST),
+            code_cursor: self.code.checkpoint(),
+            classes: self.classes.clone(),
+            objects: self.objects.clone(),
+            values: self.values.clone(),
+            var_addrs: self.var_addrs.clone(),
+            instance_addrs: self.instance_addrs.clone(),
+            defining_words: self.defining_words.clone(),
+        }
+    }
+
+    /// Peel every overlay node created after `threshold` (a marker's index_here)
+    /// out of its hash bucket, walking the global creation chain newest-first,
+    /// then restore the index pointers.
+    fn rollback_overlay(&mut self, threshold: u64, index_latest: u64) {
+        let mut node = self.read_user(USER_INDEX_LATEST);
+        while node != 0 && node < threshold {
+            let bucket_next = self.read_u64(node + DN_BUCKET_NEXT);
+            let hash = self.read_u64(node + DN_HASH) & 0xFFFF_FFFF;
+            let wid = self.read_u64(node + DN_WID);
+            let bucket = wid + ((hash & WL_BUCKET_MASK) << 3);
+            if self.read_u64(bucket) == node {
+                self.write_u64(bucket, bucket_next);
+            }
+            node = self.read_u64(node + DN_GLOBAL_PREV);
+        }
+        self.write_user(USER_INDEX_LATEST, index_latest);
+        self.write_user(USER_INDEX_HERE, threshold);
+    }
+
+    /// Execute a marker: restore the dictionary to its snapshot, forgetting every
+    /// definition (and any later markers) made after it.
+    fn run_marker(&mut self, m: Marker) {
+        self.rollback_overlay(m.index_here, m.index_latest);
+        self.write_user(USER_LATEST, m.latest);
+        self.write_user(USER_HERE, m.here);
+        self.write_user(USER_VAR_HERE, m.var_here);
+        self.code.reset_to(m.code_cursor);
+        self.classes = m.classes;
+        self.objects = m.objects;
+        self.values = m.values;
+        self.var_addrs = m.var_addrs;
+        self.instance_addrs = m.instance_addrs;
+        self.defining_words = m.defining_words;
+        let t = m.index_here;
+        self.markers.retain(|_, mk| mk.index_here > t); // drop markers made after
+    }
+
     /// Interpret one token: find+execute, else number→push, else error.
     fn interpret_token(&mut self, tok: &str) -> Result<()> {
+        let lk = tok.to_ascii_lowercase();
+        if let Some(m) = self.markers.remove(&lk) {
+            self.run_marker(m);
+            return Ok(());
+        }
         let base = self.read_user(UVAR_BASE) as u32;
         self.push_name(tok);
         self.call("find_name")?;

@@ -58,6 +58,16 @@ impl CodeArena {
         unsafe { self.region.add(start) as u64 }
     }
 
+    /// Current write cursor — a checkpoint for `marker`/`forget` rollback.
+    pub fn checkpoint(&self) -> usize {
+        self.cursor
+    }
+
+    /// Roll the write cursor back to a prior `checkpoint` (reclaims code space).
+    pub fn reset_to(&mut self, cursor: usize) {
+        self.cursor = cursor;
+    }
+
     /// Copy `words` in as executable code (16-byte aligned); return its address.
     pub fn commit(&mut self, words: &[u32]) -> Result<u64> {
         let start = (self.cursor + 15) & !15;
