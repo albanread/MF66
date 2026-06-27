@@ -48,6 +48,7 @@ const DN_SIZE: u64 = 40;
 const WL_BUCKET_MASK: u64 = 511;
 const DH_LINK: u64 = 0; // prev header in the LATEST chain
 const DH_NT: u64 = 47; // name-length byte; the name token nt = header + dh_nt
+const INLINE_MAX: usize = 16; // max reduced tokens for a word to be auto-inlined
 const USER_HOST_RSP: usize = 0x58;
 const USER_DSP_SAVE: usize = 0x60;
 const USER_SP0: usize = 0x68;
@@ -122,6 +123,12 @@ pub struct Mf66Session {
     markers: HashMap<String, Marker>,
     /// Per-word optimizer metrics, keyed by definition name (for the report).
     word_metrics: HashMap<String, crate::opt::Metrics>,
+    /// Small straight-line leaf words → their reduced token IR, spliced into
+    /// callers (like `vocab`, but for user words) so the call's settle barrier
+    /// is eliminated. Keyed by xt.
+    inline_words: HashMap<u64, Vec<Tok>>,
+    /// Count of call sites where an inline word was spliced (calls eliminated).
+    inline_splices: u32,
     /// CREATE/DOES> defining words → (build tokens incl. `create`, does-code xt
     /// or 0). Replayed in Rust at use time. See finish_defining/instantiate.
     defining_words: HashMap<String, (Vec<String>, u64)>,
@@ -180,6 +187,10 @@ struct ColonDef {
     exits: Vec<usize>,
     /// Optimizer metrics accumulated across this definition's runs.
     metrics: crate::opt::Metrics,
+    /// Accumulated reduced token IR while the word stays a straight-line leaf
+    /// (Some); set to None the moment control flow / locals / a method context
+    /// disqualifies it from being inlined into callers.
+    inline_toks: Option<Vec<Tok>>,
 }
 
 /// A `marker` snapshot: the dictionary/data/code state to restore when the
@@ -275,6 +286,8 @@ impl Mf66Session {
             instance_addrs: HashMap::new(),
             markers: HashMap::new(),
             word_metrics: HashMap::new(),
+            inline_words: HashMap::new(),
+            inline_splices: 0,
             last_receiver_class: None,
             dnu_xt: 0,
             send_xt: 0,
@@ -1169,6 +1182,7 @@ impl Mf66Session {
                     raw: Vec::new(),
                     exits: Vec::new(),
                     metrics: Default::default(),
+                    inline_toks: Some(Vec::new()),
                 });
             } else if lk == "2constant" {
                 let name = scan_word(b, &mut pos)
@@ -1350,6 +1364,7 @@ impl Mf66Session {
     fn open_locals(&mut self, names: Vec<String>, inputs: usize) {
         use crate::aenc::{ldr_post, str_off, sub_imm};
         self.flush_toks();
+        self.disable_inline(); // a locals frame → not inlinable (yet)
         let count = names.len();
         let def = self.pending.as_mut().unwrap();
         if count > 0 {
@@ -1452,6 +1467,7 @@ impl Mf66Session {
         //   of ≡ `over = if drop`,  endof ≡ `else`,  endcase ≡ `drop` + close
         //   every open `then` back to the CASE marker.
         if lk == "case" {
+            self.disable_inline();
             self.pending.as_mut().unwrap().cf.push(Cf::Case);
             return Ok(());
         }
@@ -1501,7 +1517,16 @@ impl Mf66Session {
         let base = self.read_user(UVAR_BASE) as u32;
         match self.xt_of_forth_name(tok)? {
             Some(xt) => {
-                let toks = self.vocab.get(&xt).cloned().unwrap_or_else(|| vec![Tok::Call(xt)]);
+                // Splice the inline tokens of a primitive (vocab) or a small
+                // straight-line leaf word (inline_words); else emit a call.
+                let toks = if let Some(v) = self.vocab.get(&xt) {
+                    v.clone()
+                } else if let Some(iw) = self.inline_words.get(&xt) {
+                    self.inline_splices += 1;
+                    iw.clone()
+                } else {
+                    vec![Tok::Call(xt)]
+                };
                 self.pending.as_mut().unwrap().toks.extend(toks);
             }
             None => match parse_forth_int(tok, base) {
@@ -1559,6 +1584,13 @@ impl Mf66Session {
             total.gp_allocs, total.peak_gp, total.peak_fp, total.reg_copies, total.const_mat
         );
         let _ = writeln!(s, "  spills (pressure → full-window settle) {}", total.spills);
+        let _ = writeln!(s, "\nInlining (leaf-word splicing):");
+        let _ = writeln!(
+            s,
+            "  inline leaf words captured {}  call sites inlined {}  (settle barriers eliminated)",
+            self.inline_words.len(),
+            self.inline_splices
+        );
         let _ = writeln!(s, "\nMemory traffic:");
         let _ = writeln!(
             s,
@@ -1603,9 +1635,21 @@ impl Mf66Session {
         if let Some(def) = self.pending.as_mut() {
             if !def.toks.is_empty() {
                 let reduced = crate::opt::reduce(&def.toks, &mut def.metrics);
+                // Collect the reduced run for potential inlining (straight-line only).
+                if let Some(acc) = def.inline_toks.as_mut() {
+                    acc.extend_from_slice(&reduced);
+                }
                 crate::opt::lower(&reduced, &mut def.body, &mut def.metrics);
                 def.toks.clear();
             }
+        }
+    }
+
+    /// Disqualify the pending definition from being inlined into callers (called
+    /// when control flow, locals, or other non-straight-line constructs appear).
+    fn disable_inline(&mut self) {
+        if let Some(def) = self.pending.as_mut() {
+            def.inline_toks = None;
         }
     }
 
@@ -1685,6 +1729,7 @@ impl Mf66Session {
     /// word-relative. `if`/`while` consume the TOS flag (false → branch).
     fn compile_control(&mut self, tok: &str) -> Result<()> {
         use crate::aenc::{b, emit_flag_test_cbz, patch_b, patch_bcond, patch_cbz};
+        self.disable_inline(); // control flow → not a straight-line inline leaf
         let def = self.pending.as_mut().expect("control word outside a definition");
         match tok {
             "if" => {
@@ -1804,6 +1849,7 @@ impl Mf66Session {
     /// branch is taken when the Forth test is false — no `-1/0` flag in between.
     fn compile_control_fused(&mut self, tok: &str, c: crate::opt::Cmp) -> Result<()> {
         use crate::aenc::{bcond, patch_bcond};
+        self.disable_inline();
         let ctrue = {
             let def = self.pending.as_mut().unwrap();
             crate::opt::fused_cmp(c, &mut def.body)
@@ -1857,7 +1903,53 @@ impl Mf66Session {
         if !def.name.is_empty() {
             self.word_metrics.insert(def.name.clone(), def.metrics.clone());
         }
-        self.code.commit(&def.body)
+        let inline_toks = def.inline_toks.take();
+        let named = !def.name.is_empty();
+        let xt = self.code.commit(&def.body)?;
+        // Record a small straight-line leaf word for inlining into callers.
+        if named && self.method_class.is_none() {
+            if let Some(toks) = inline_toks {
+                if toks.len() <= INLINE_MAX && Self::inlinable_toks(&toks) {
+                    let expanded = self.expand_inline(&toks);
+                    if expanded.len() <= INLINE_MAX {
+                        self.inline_words.insert(xt, expanded);
+                    }
+                }
+            }
+        }
+        Ok(xt)
+    }
+
+    /// True if every token is context-free (safe to splice into any caller).
+    /// Locals/ivars/SELF references are frame/receiver-relative, so reject them.
+    fn inlinable_toks(toks: &[Tok]) -> bool {
+        toks.iter().all(|t| {
+            !matches!(
+                t,
+                Tok::LocalFetch(_)
+                    | Tok::LocalStore(_)
+                    | Tok::IvarFetch(_)
+                    | Tok::IvarStore(_)
+                    | Tok::SelfPush
+            )
+        })
+    }
+
+    /// Expand any `Call(xt)` to an already-inlined word into its tokens, so an
+    /// inline word that calls another inlines transitively (deps are defined
+    /// earlier, hence already expanded).
+    fn expand_inline(&self, toks: &[Tok]) -> Vec<Tok> {
+        let mut out = Vec::with_capacity(toks.len());
+        for t in toks {
+            if let Tok::Call(xt) = t {
+                if let Some(inner) = self.inline_words.get(xt) {
+                    out.extend_from_slice(inner);
+                    continue;
+                }
+            }
+            out.push(*t);
+        }
+        out
     }
 
     fn finish_colon(&mut self) -> Result<()> {
@@ -1916,6 +2008,7 @@ impl Mf66Session {
             raw: Vec::new(),
             exits: Vec::new(),
             metrics: Default::default(),
+            inline_toks: Some(Vec::new()),
         });
         for t in tokens {
             self.compile_token(t)?;
@@ -2083,6 +2176,7 @@ impl Mf66Session {
             raw: Vec::new(),
             exits: Vec::new(),
             metrics: Default::default(),
+            inline_toks: Some(Vec::new()),
         });
         self.method_class = Some(class);
         Ok(())
