@@ -1,0 +1,45 @@
+[package]
+name = "macide"
+version = "0.0.0"
+edition = "2021"
+description = "The Locus macOS IDE — an AppKit + Core Graphics / Core Text shell over the UI-neutral locus-ide-protocol."
+publish = false
+
+# Standalone (own [workspace]) like the ports/ sidecars, so early macOS IDE work
+# does not disturb the Windows root workspace.
+[workspace]
+
+[features]
+# The headless renderer (render.rs) and event translation (events.rs) are ALWAYS
+# compiled and unit-tested without a display — only the AppKit window shell needs
+# `mac-gui`, mirroring MacNCL's split (default build links no AppKit).
+default = []
+mac-gui = [
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
+    "dep:objc2-core-graphics",
+    "dep:block2",
+    "dep:foreign-types",
+]
+
+[dependencies]
+# The UI-neutral host/worker contract: DrawCmd/DrawBatch (what we rasterise) and
+# UiEvent (what AppKit events translate into). No HWND/Direct2D types.
+locus-ide-protocol = { path = "../locus-ide-protocol" }
+
+# Always-compiled headless rasteriser stack (the servo/cocoa ecosystem crates),
+# same versions MacNCL's proven igui_mac renderer uses.
+core-foundation = "0.10.1"
+core-graphics = "0.25.0"
+core-text = "22.0.0"
+
+# AppKit window shell — only pulled in under `mac-gui`.
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSGeometry", "NSThread", "NSString", "NSTimer", "NSDate", "NSURL", "NSArray", "NSObject", "NSEnumerator"] }
+objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSWindow", "NSView", "NSEvent", "NSResponder", "NSGraphics", "NSRunningApplication", "NSImage", "NSImageView", "NSControl", "NSPanel", "NSSavePanel", "NSOpenPanel"] }
+# The CGImage type the renderer's snapshot is handed to NSImageView as.
+objc2-core-graphics = { version = "0.3", optional = true }
+# `ForeignType::as_ptr()` on the core-graphics CGImage (bridge to objc2's CGImage).
+foreign-types = { version = "0.5", optional = true }
+block2 = { version = "0.6", optional = true }

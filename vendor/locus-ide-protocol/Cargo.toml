@@ -1,0 +1,11 @@
+[package]
+name = "locus-ide-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "UI-neutral host/worker protocol types for the Locus IDE process split."
+publish = false
+
+[dependencies]
+locus-analysis-model = { path = "../locus-analysis-model" }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
