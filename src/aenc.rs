@@ -215,6 +215,53 @@ pub fn lsl_imm(rd: u32, rn: u32, sh: u32) -> u32 {
     let imms = 63 - sh;
     0xD340_0000 | (immr << 16) | (imms << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
 }
+/// `lsr Xd, Xn, #sh` (0..=63) — the `UBFM Xd,Xn,#sh,#63` alias.
+pub fn lsr_imm(rd: u32, rn: u32, sh: u32) -> u32 {
+    0xD340_0000 | ((sh & 63) << 16) | (63 << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `asr Xd, Xn, #sh` (0..=63) — the `SBFM Xd,Xn,#sh,#63` alias.
+pub fn asr_imm(rd: u32, rn: u32, sh: u32) -> u32 {
+    0x9340_0000 | ((sh & 63) << 16) | (63 << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `lslv Xd, Xn, Xm` — variable left shift (count masked by hardware).
+pub fn lsl_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x9AC0_2000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `lsrv Xd, Xn, Xm` — variable logical right shift.
+pub fn lsr_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x9AC0_2400 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `asrv Xd, Xn, Xm` — variable arithmetic right shift.
+pub fn asr_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x9AC0_2800 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+fn shifted(base: u32, rd: u32, rn: u32, rm: u32, shift: u32, amount: u32) -> u32 {
+    base | ((shift & 3) << 22)
+        | ((rm & 0x1F) << 16)
+        | ((amount & 0x3F) << 10)
+        | ((rn & 0x1F) << 5)
+        | (rd & 0x1F)
+}
+/// `add Xd, Xn, Xm, <shift> #amount`.
+pub fn add_shift(rd: u32, rn: u32, rm: u32, shift: u32, amount: u32) -> u32 {
+    shifted(0x8B00_0000, rd, rn, rm, shift, amount)
+}
+/// `sub Xd, Xn, Xm, <shift> #amount`.
+pub fn sub_shift(rd: u32, rn: u32, rm: u32, shift: u32, amount: u32) -> u32 {
+    shifted(0xCB00_0000, rd, rn, rm, shift, amount)
+}
+/// `and Xd, Xn, Xm, <shift> #amount`.
+pub fn and_shift(rd: u32, rn: u32, rm: u32, shift: u32, amount: u32) -> u32 {
+    shifted(0x8A00_0000, rd, rn, rm, shift, amount)
+}
+/// `orr Xd, Xn, Xm, <shift> #amount`.
+pub fn orr_shift(rd: u32, rn: u32, rm: u32, shift: u32, amount: u32) -> u32 {
+    shifted(0xAA00_0000, rd, rn, rm, shift, amount)
+}
+/// `eor Xd, Xn, Xm, <shift> #amount`.
+pub fn eor_shift(rd: u32, rn: u32, rm: u32, shift: u32, amount: u32) -> u32 {
+    shifted(0xCA00_0000, rd, rn, rm, shift, amount)
+}
 /// `and Xd, Xn, Xm`.
 pub fn and_reg(rd: u32, rn: u32, rm: u32) -> u32 {
     0x8A00_0000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
@@ -388,7 +435,10 @@ mod cf_tests {
     use super::*;
     fn asm(text: &str) -> Vec<u32> {
         let m = wfasm::a64::assemble(text).unwrap_or_else(|e| panic!("assemble {text:?}: {e}"));
-        m.code.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        m.code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
     #[test]
     fn cf_encoders_match_assembler() {
@@ -436,6 +486,23 @@ mod cf_tests {
         assert_eq!(vec![lsl_imm(9, 10, 3)], asm("lsl x9, x10, #3"));
         assert_eq!(vec![lsl_imm(0, 0, 10)], asm("lsl x0, x0, #10"));
         assert_eq!(vec![lsl_imm(15, 15, 63)], asm("lsl x15, x15, #63"));
+        assert_eq!(vec![lsr_imm(9, 10, 7)], asm("lsr x9, x10, #7"));
+        assert_eq!(vec![asr_imm(9, 10, 1)], asm("asr x9, x10, #1"));
+        assert_eq!(vec![lsl_reg(9, 10, 11)], asm("lsl x9, x10, x11"));
+        assert_eq!(vec![lsr_reg(9, 10, 11)], asm("lsr x9, x10, x11"));
+        assert_eq!(vec![asr_reg(9, 10, 11)], asm("asr x9, x10, x11"));
+        assert_eq!(
+            vec![eor_shift(9, 9, 9, 0, 13)],
+            asm("eor x9, x9, x9, lsl #13")
+        );
+        assert_eq!(
+            vec![eor_shift(9, 9, 9, 1, 7)],
+            asm("eor x9, x9, x9, lsr #7")
+        );
+        assert_eq!(
+            vec![add_shift(9, 9, 9, 0, 2)],
+            asm("add x9, x9, x9, lsl #2")
+        );
     }
 
     #[test]
@@ -473,13 +540,19 @@ mod tests {
 
     fn asm(text: &str) -> Vec<u32> {
         let m = wfasm::a64::assemble(text).unwrap_or_else(|e| panic!("assemble {text:?}: {e}"));
-        m.code.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        m.code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 
     #[test]
     fn encoders_match_assembler() {
         assert_eq!(vec![movz(0, 0x1234, 0)], asm("movz x0, #0x1234"));
-        assert_eq!(vec![movz(16, 0xABCD, 16)], asm("movz x16, #0xABCD, lsl #16"));
+        assert_eq!(
+            vec![movz(16, 0xABCD, 16)],
+            asm("movz x16, #0xABCD, lsl #16")
+        );
         assert_eq!(vec![movk(0, 0xFFFF, 32)], asm("movk x0, #0xFFFF, lsl #32"));
         assert_eq!(vec![movk(16, 0x1, 48)], asm("movk x16, #0x1, lsl #48"));
         assert_eq!(vec![blr(16)], asm("blr x16"));

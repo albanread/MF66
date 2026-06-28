@@ -1653,7 +1653,7 @@ impl Mf66Session {
     fn pin_safety(lk: &str, def: &ColonDef) -> PinSafety {
         const SAFE: &[&str] = &[
             "+", "-", "*", "and", "or", "xor", "invert", "negate", "1+", "1-", "2+",
-            "2-", "2*", "cell+", "cells", "char+", "dup", "drop", "swap", "over",
+            "2-", "2*", "2/", "u2/", "lshift", "rshift", "arshift", "cell+", "cells", "char+", "dup", "drop", "swap", "over",
             "nip", "rot", "-rot", "tuck", "?dup", "=", "<>", "<", ">", "<=", ">=",
             "u<", "u>", "0=", "0<>", "0<", "0>", "min", "max", "umin", "umax", "@",
             "!", "c@", "c!", "f+", "f-", "f*", "f/", "fnegate", "fsqrt", "fabs",
@@ -2018,7 +2018,7 @@ impl Mf66Session {
 
     /// Build the optimizer vocabulary: primitive asm symbol → inline token(s).
     fn build_vocab(&mut self) -> Result<()> {
-        use crate::opt::{Bin::*, Cmp::*, Mem::*, Stk::*};
+        use crate::opt::{Bin::*, Cmp::*, Mem::*, Sh::*, Stk::*};
         let table: &[(&str, &[Tok])] = &[
             ("plus", &[Tok::Bin(Add)]),
             ("minus", &[Tok::Bin(Sub)]),
@@ -2026,6 +2026,9 @@ impl Mf66Session {
             ("and_", &[Tok::Bin(And)]),
             ("or_", &[Tok::Bin(Or)]),
             ("xor_", &[Tok::Bin(Xor)]),
+            ("lshift", &[Tok::Shift(Lsl)]),
+            ("rshift", &[Tok::Shift(Lsr)]),
+            ("arshift", &[Tok::Shift(Asr)]),
             ("dup_", &[Tok::Stk(Dup)]),
             ("drop_", &[Tok::Stk(Drop)]),
             ("swap_", &[Tok::Stk(Swap)]),
@@ -2085,6 +2088,8 @@ impl Mf66Session {
             ("two_plus", &[Tok::Lit(2), Tok::Bin(Add)]),
             ("two_minus", &[Tok::Lit(2), Tok::Bin(Sub)]),
             ("two_times", &[Tok::Lit(2), Tok::Bin(Mul)]),
+            ("two_slash", &[Tok::Lit(1), Tok::Shift(Asr)]),
+            ("u2slash", &[Tok::Lit(1), Tok::Shift(Lsr)]),
             ("cell_plus", &[Tok::Lit(8), Tok::Bin(Add)]),
             ("cells", &[Tok::Lit(8), Tok::Bin(Mul)]),
             ("char_plus", &[Tok::Lit(1), Tok::Bin(Add)]),

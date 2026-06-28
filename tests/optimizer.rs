@@ -73,3 +73,19 @@ fn dup_fuse_and_strength_reduce_correct() {
     s.eval(": cells8 cells ;").unwrap(); // cells → *8
     assert_eq!(s.eval_out("3 cells8 .").unwrap(), "24 ");
 }
+
+#[test]
+fn shifts_inline_and_fuse() {
+    let mut s = Mf66Session::new().unwrap();
+    s.eval(": sh 13 lshift ;").unwrap();
+    assert_eq!(s.eval_out("1 sh .").unwrap(), "8192 ");
+    assert!(s.last_body_words() <= 8, "constant lshift should inline, got {}", s.last_body_words());
+
+    s.eval(": ar 2/ ;").unwrap();
+    assert_eq!(s.eval_out("-7 ar . 8 ar .").unwrap(), "-4 4 ");
+
+    // xorshift idiom: no shift calls/settles, and `dup k shift xor` lowers to one shifted EOR.
+    s.eval(": xs1 dup 13 lshift xor ;").unwrap();
+    assert_eq!(s.eval_out("1 xs1 .").unwrap(), "8193 ");
+    assert!(s.last_body_words() <= 5, "dup/shift/xor should fuse tightly, got {}", s.last_body_words());
+}

@@ -1,7 +1,7 @@
-//! The CODE escape hatch, measured: a hot integer kernel (xorshift64) where the
-//! optimizer is hamstrung — `lshift`/`rshift` are settle-barrier Calls — written
+//! The CODE escape hatch, measured: a hot integer kernel (xorshift64) written
 //! three ways: a normal colon definition (optimizer), a hand-written CODE word
-//! (assembly), and clang -O2 C, plus CPython. Shows the CODE word reaching C.
+//! (assembly), and clang -O2 C, plus CPython. Shift words now inline/fuse, so the
+//! colon version is close to C; CODE still shows the ceiling for a hand-shaped loop.
 //!   cargo test --test codebench -- --ignored --nocapture
 #![cfg(target_os = "macos")]
 use mf66::Mf66Session;
@@ -11,7 +11,7 @@ use std::time::Instant;
 const N: u64 = 5_000_000;
 const MASK: u64 = 0x0FFF_FFFF; // 28 bits → positive, identical across impls
 
-// Forth colon version: lshift/rshift are Calls → 3 settles per iteration.
+// Forth colon version: shifts inline/fuse, but locals and DO-loop control remain.
 const XS_FS: &str = ": xs-fs {: | x :} 1 to x 5000000 0 do \
     x x 13 lshift xor to x x x 7 rshift xor to x x x 17 lshift xor to x \
     loop x 268435455 and ;";

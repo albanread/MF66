@@ -50,6 +50,12 @@ pub enum Mem {
     CFetch,
     CStore,
 }
+#[derive(Clone, Copy, PartialEq)]
+pub enum Sh {
+    Lsl,
+    Lsr,
+    Asr,
+}
 /// Floating-point binary ops modeled in the optimizer's FP virtual stack.
 #[derive(Clone, Copy, PartialEq)]
 pub enum FBin {
@@ -123,6 +129,9 @@ pub enum Tok {
     Bin(Bin),
     ImmBin(Bin, i64), // reduced: TOS op= k
     DupBin(Bin),      // reduced: dup then op (op TOS with itself)
+    Shift(Sh),        // ( x count -- x' ) lshift/rshift/arshift
+    ImmShift(Sh, u32), // reduced: shift TOS by a constant count
+    DupShiftBin(Bin, Sh, u32), // reduced: dup imm-shift then op (e.g. x x<<13 xor)
     Stk(Stk),
     Cmp(Cmp),
     Sel(Sel),
@@ -165,6 +174,28 @@ impl Bin {
             Bin::And => a & b,
             Bin::Or => a | b,
             Bin::Xor => a ^ b,
+        }
+    }
+}
+
+impl Sh {
+    /// AArch64/x86-compatible shifts mask the variable count mod 64.
+    fn eval(self, a: i64, b: i64) -> i64 {
+        let sh = (b as u32) & 63;
+        match self {
+            Sh::Lsl => (a as u64).wrapping_shl(sh) as i64,
+            Sh::Lsr => ((a as u64) >> sh) as i64,
+            Sh::Asr => a >> sh,
+        }
+    }
+    fn eval_imm(self, a: i64, sh: u32) -> i64 {
+        self.eval(a, sh as i64)
+    }
+    fn code(self) -> u32 {
+        match self {
+            Sh::Lsl => 0,
+            Sh::Lsr => 1,
+            Sh::Asr => 2,
         }
     }
 }
@@ -351,6 +382,18 @@ pub fn reduce(toks: &[Tok], m: &mut Metrics) -> Vec<Tok> {
                         continue;
                     }
                 }
+                // shifted-ALU fuse: `dup k lshift xor` → one `eor x,x,x,lsl #k`
+                // (and the same shape for + - and/or with lsr/asr).
+                if n >= 2 {
+                    if let (Tok::Stk(Stk::Dup), Tok::ImmShift(sh, k)) = (out[n - 2], out[n - 1]) {
+                        if !matches!(op, Bin::Mul) {
+                            out.truncate(n - 2);
+                            out.push(Tok::DupShiftBin(op, sh, k));
+                            m.dup_fuses += 1;
+                            continue;
+                        }
+                    }
+                }
                 // immediate-fold: ... Lit k, Bin -> ImmBin(op, k)
                 if let Some(Tok::Lit(k)) = out.last().copied() {
                     out.pop();
@@ -416,6 +459,32 @@ pub fn reduce(toks: &[Tok], m: &mut Metrics) -> Vec<Tok> {
                     }
                     out.push(Tok::DupBin(op));
                     m.dup_fuses += 1;
+                    continue;
+                }
+                out.push(t);
+            }
+            Tok::Shift(sh) => {
+                let n = out.len();
+                // const-fold: ... Lit a, Lit count, Shift -> Lit (a shifted count)
+                if n >= 2 {
+                    if let (Tok::Lit(a), Tok::Lit(b)) = (out[n - 2], out[n - 1]) {
+                        out.truncate(n - 2);
+                        out.push(Tok::Lit(sh.eval(a, b)));
+                        m.const_folds += 1;
+                        continue;
+                    }
+                }
+                // immediate-fold: ... Lit count, Shift -> ImmShift(count & 63)
+                if let Some(Tok::Lit(k)) = out.last().copied() {
+                    out.pop();
+                    let k = (k as u32) & 63;
+                    if k == 0 {
+                        // `x 0 lshift`/`rshift`/`arshift` consumes the count and is identity.
+                        m.identities += 1;
+                    } else {
+                        out.push(Tok::ImmShift(sh, k));
+                        m.imm_folds += 1;
+                    }
                     continue;
                 }
                 out.push(t);
@@ -799,6 +868,89 @@ impl<'a> Low<'a> {
             Bin::Xor => eor_reg(r, r, t),
         });
         self.freer(t);
+        self.vs.push(Loc::Reg(r));
+    }
+
+    fn emit_shift_imm(&mut self, r: u32, sh: Sh, k: u32) {
+        self.out.push(match sh {
+            Sh::Lsl => lsl_imm(r, r, k),
+            Sh::Lsr => lsr_imm(r, r, k),
+            Sh::Asr => asr_imm(r, r, k),
+        });
+    }
+
+    fn shift(&mut self, sh: Sh) {
+        self.reserve(3);
+        self.ensure(2);
+        let count = self.vs.pop().unwrap();
+        let value = self.vs.pop().unwrap();
+        if let (Loc::Const(a), Loc::Const(b)) = (value, count) {
+            self.vs.push(Loc::Const(sh.eval(a, b)));
+            return;
+        }
+        if let Loc::Const(k) = count {
+            let k = (k as u32) & 63;
+            if k == 0 {
+                self.vs.push(value);
+                return;
+            }
+            if let Loc::Const(x) = value {
+                self.vs.push(Loc::Const(sh.eval_imm(x, k)));
+                return;
+            }
+            let r = self.to_reg(value);
+            self.emit_shift_imm(r, sh, k);
+            self.vs.push(Loc::Reg(r));
+            return;
+        }
+        let rv = self.to_reg(value);
+        let rc = self.to_reg(count);
+        self.out.push(match sh {
+            Sh::Lsl => lsl_reg(rv, rv, rc),
+            Sh::Lsr => lsr_reg(rv, rv, rc),
+            Sh::Asr => asr_reg(rv, rv, rc),
+        });
+        self.freer(rc);
+        self.vs.push(Loc::Reg(rv));
+    }
+
+    fn imm_shift(&mut self, sh: Sh, k: u32) {
+        self.reserve(1);
+        self.ensure(1);
+        let a = self.vs.pop().unwrap();
+        if k == 0 {
+            self.vs.push(a);
+            return;
+        }
+        if let Loc::Const(x) = a {
+            self.vs.push(Loc::Const(sh.eval_imm(x, k)));
+            return;
+        }
+        let r = self.to_reg(a);
+        self.emit_shift_imm(r, sh, k);
+        self.vs.push(Loc::Reg(r));
+    }
+
+    /// `dup` then an immediate shift then `op` — e.g. xorshift's
+    /// `dup 13 lshift xor` → `eor x, x, x, lsl #13`.
+    fn dup_shift_bin(&mut self, op: Bin, sh: Sh, k: u32) {
+        self.reserve(1);
+        self.ensure(1);
+        let a = self.vs.pop().unwrap();
+        if let Loc::Const(x) = a {
+            self.vs.push(Loc::Const(op.eval(x, sh.eval_imm(x, k))));
+            return;
+        }
+        let r = self.to_reg(a);
+        let sc = sh.code();
+        self.out.push(match op {
+            Bin::Add => add_shift(r, r, r, sc, k),
+            Bin::Sub => sub_shift(r, r, r, sc, k),
+            Bin::And => and_shift(r, r, r, sc, k),
+            Bin::Or => orr_shift(r, r, r, sc, k),
+            Bin::Xor => eor_shift(r, r, r, sc, k),
+            Bin::Mul => unreachable!("mul has no shifted-register form"),
+        });
         self.vs.push(Loc::Reg(r));
     }
 
@@ -1585,6 +1737,9 @@ pub fn lower(
             Tok::Bin(op) => low.bin(op),
             Tok::ImmBin(op, k) => low.imm_bin(op, k),
             Tok::DupBin(op) => low.dup_bin(op),
+            Tok::Shift(sh) => low.shift(sh),
+            Tok::ImmShift(sh, k) => low.imm_shift(sh, k),
+            Tok::DupShiftBin(op, sh, k) => low.dup_shift_bin(op, sh, k),
             // Stack-motion tokens: count, and flag the ones that emit no code
             // (the "everything is pick" payoff — pure virtual-stack reindexing).
             Tok::Stk(s) => {
