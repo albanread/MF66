@@ -123,6 +123,8 @@ pub struct Mf66Session {
     markers: HashMap<String, Marker>,
     /// Per-word optimizer metrics, keyed by definition name (for the report).
     word_metrics: HashMap<String, crate::opt::Metrics>,
+    /// Per-word optimizer trace: one entry per flushed straight-line run.
+    word_traces: HashMap<String, String>,
     /// Small straight-line leaf words → their reduced token IR, spliced into
     /// callers (like `vocab`, but for user words) so the call's settle barrier
     /// is eliminated. Keyed by xt.
@@ -205,6 +207,8 @@ struct ColonDef {
     /// (Some); set to None the moment control flow / locals / a method context
     /// disqualifies it from being inlined into callers.
     inline_toks: Option<Vec<Tok>>,
+    /// Human-readable optimizer trace, one entry per flushed straight-line run.
+    opt_trace: Vec<String>,
 }
 
 /// A `marker` snapshot: the dictionary/data/code state to restore when the
@@ -307,6 +311,7 @@ impl Mf66Session {
             instance_addrs: HashMap::new(),
             markers: HashMap::new(),
             word_metrics: HashMap::new(),
+            word_traces: HashMap::new(),
             inline_words: HashMap::new(),
             inline_splices: 0,
             active_fpins: HashMap::new(),
@@ -685,6 +690,19 @@ impl Mf66Session {
             m.instrs, m.toks_in, m.toks_out, m.rewrites(), m.calls, m.settles, m.peak_gp, m.peak_fp,
             resid(m.local_hits, m.local_loads), resid(m.fp_hits, m.fp_fetches),
         ))
+    }
+
+    /// Multi-line optimizer trace for a single compiled word: token runs before /
+    /// after reduce plus the per-run lowerer deltas that explain code shape.
+    pub fn word_opt_trace(&self, name: &str) -> Option<String> {
+        let mut s = self.word_report(name)?;
+        if let Some(t) = self.word_traces.get(name) {
+            if !t.is_empty() {
+                s.push('\n');
+                s.push_str(t);
+            }
+        }
+        Some(s)
     }
 
     /// Invoke a primitive by its asm symbol through `forth_main`. A non-zero
@@ -1402,6 +1420,7 @@ impl Mf66Session {
                     exits: Vec::new(),
                     metrics: Default::default(),
                     inline_toks: Some(Vec::new()),
+                    opt_trace: Vec::new(),
                 });
             } else if lk == "2constant" {
                 let name = scan_word(b, &mut pos)
@@ -1997,12 +2016,31 @@ impl Mf66Session {
         let ipins = self.active_ipins.clone();
         if let Some(def) = self.pending.as_mut() {
             if !def.toks.is_empty() {
+                let run = def.opt_trace.len();
+                let body0 = def.body.len();
+                let before = def.metrics.clone();
+                let input = crate::opt::format_toks(&def.toks);
                 let reduced = crate::opt::reduce(&def.toks, &mut def.metrics);
+                let output = crate::opt::format_toks(&reduced);
                 // Collect the reduced run for potential inlining (straight-line only).
                 if let Some(acc) = def.inline_toks.as_mut() {
                     acc.extend_from_slice(&reduced);
                 }
                 crate::opt::lower(&reduced, &mut def.body, &mut def.metrics, fpins, ipins);
+                let after = &def.metrics;
+                let d = |a: u32, b: u32| a.saturating_sub(b);
+                def.opt_trace.push(format!(
+                    "run {run}: body[{body0}..{}] instrs {}  toks {}→{}  rewrites {}  calls {} settles {} spills {}\n  in : {}\n  out: {}\n  lower: stack ld/st {}/{}  mem @/! {}/{}  locals ld/hit/spill {}/{}/{}  fp ld/hit/spill {}/{}/{}  reg copies {} const→reg {} gp allocs {} dsp adj {} redundant @ {} f@ {}",
+                    def.body.len(), def.body.len().saturating_sub(body0), def.toks.len(), reduced.len(),
+                    d(after.rewrites(), before.rewrites()), d(after.calls, before.calls), d(after.settles, before.settles), d(after.spills, before.spills),
+                    input, output,
+                    d(after.stack_loads, before.stack_loads), d(after.stack_stores, before.stack_stores),
+                    d(after.mem_fetches, before.mem_fetches), d(after.mem_stores, before.mem_stores),
+                    d(after.local_loads, before.local_loads), d(after.local_hits, before.local_hits), d(after.local_spills, before.local_spills),
+                    d(after.fp_fetches, before.fp_fetches), d(after.fp_hits, before.fp_hits), d(after.fp_spills, before.fp_spills),
+                    d(after.reg_copies, before.reg_copies), d(after.const_mat, before.const_mat), d(after.gp_allocs, before.gp_allocs), d(after.dsp_adjusts, before.dsp_adjusts),
+                    d(after.redundant_fetches, before.redundant_fetches), d(after.redundant_ffetches, before.redundant_ffetches),
+                ));
                 def.toks.clear();
             }
         }
@@ -2359,6 +2397,7 @@ impl Mf66Session {
         def.metrics.instrs = def.body.len().saturating_sub(2) as u32;
         if !def.name.is_empty() {
             self.word_metrics.insert(def.name.clone(), def.metrics.clone());
+            self.word_traces.insert(def.name.clone(), def.opt_trace.join("\n"));
         }
         let mut inline_toks = def.inline_toks.take();
         // The inline IR closes its own frame (the standalone body uses the
@@ -2470,6 +2509,7 @@ impl Mf66Session {
             exits: Vec::new(),
             metrics: Default::default(),
             inline_toks: Some(Vec::new()),
+            opt_trace: Vec::new(),
         });
         for t in tokens {
             self.compile_token(t)?;
@@ -2639,6 +2679,7 @@ impl Mf66Session {
             exits: Vec::new(),
             metrics: Default::default(),
             inline_toks: Some(Vec::new()),
+            opt_trace: Vec::new(),
         });
         self.method_class = Some(class);
         Ok(())

@@ -392,6 +392,14 @@ fn registry() -> Registry {
     r.register("metrics", Arity::exact(0), |_, _| {
         Ok(Value::new(with_driver(|d| d.session.optimizer_report())))
     });
+    r.register("opttrace", Arity::exact(1), |_, a| {
+        let name = a[0].as_str().to_string();
+        Ok(Value::new(with_driver(|d| {
+            d.session
+                .word_opt_trace(&name)
+                .unwrap_or_else(|| format!("{name}: not a user-defined word"))
+        })))
+    });
 
     // ── read-back (for assertions / agent observation) ──
     r.register("stack", Arity::exact(0), |_, _| {

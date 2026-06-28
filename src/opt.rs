@@ -164,6 +164,153 @@ pub enum Tok {
     Call(u64),
 }
 
+fn cond_name(c: u32) -> &'static str {
+    match c {
+        EQ => "eq",
+        NE => "ne",
+        LO => "lo",
+        HI => "hi",
+        LT => "lt",
+        GT => "gt",
+        LE => "le",
+        GE => "ge",
+        MI => "mi",
+        AL => "al",
+        _ => "cond",
+    }
+}
+
+fn bin_name(op: Bin) -> &'static str {
+    match op {
+        Bin::Add => "+",
+        Bin::Sub => "-",
+        Bin::Mul => "*",
+        Bin::And => "and",
+        Bin::Or => "or",
+        Bin::Xor => "xor",
+    }
+}
+
+fn sh_name(sh: Sh) -> &'static str {
+    match sh {
+        Sh::Lsl => "lshift",
+        Sh::Lsr => "rshift",
+        Sh::Asr => "arshift",
+    }
+}
+
+fn stk_name(s: Stk) -> &'static str {
+    match s {
+        Stk::Dup => "dup",
+        Stk::Drop => "drop",
+        Stk::Swap => "swap",
+        Stk::Over => "over",
+        Stk::Nip => "nip",
+        Stk::Rot => "rot",
+        Stk::MinusRot => "-rot",
+        Stk::Tuck => "tuck",
+    }
+}
+
+fn cmp_name(c: Cmp) -> &'static str {
+    match c {
+        Cmp::Eq => "=",
+        Cmp::Ne => "<>",
+        Cmp::Lt => "<",
+        Cmp::Gt => ">",
+        Cmp::Le => "<=",
+        Cmp::Ge => ">=",
+        Cmp::ULt => "u<",
+        Cmp::UGt => "u>",
+        Cmp::ZEq => "0=",
+        Cmp::ZNe => "0<>",
+        Cmp::ZLt => "0<",
+        Cmp::ZGt => "0>",
+    }
+}
+
+fn mem_name(m: Mem) -> &'static str {
+    match m {
+        Mem::Fetch => "@",
+        Mem::Store => "!",
+        Mem::CFetch => "c@",
+        Mem::CStore => "c!",
+    }
+}
+
+fn sel_name(s: Sel) -> &'static str {
+    match s {
+        Sel::Min => "min",
+        Sel::Max => "max",
+        Sel::UMin => "umin",
+        Sel::UMax => "umax",
+    }
+}
+
+fn fbin_name(op: FBin) -> &'static str {
+    match op {
+        FBin::Add => "f+",
+        FBin::Sub => "f-",
+        FBin::Mul => "f*",
+        FBin::Div => "f/",
+    }
+}
+
+fn fun_name(op: FUn) -> &'static str {
+    match op {
+        FUn::Neg => "fnegate",
+        FUn::Sqrt => "fsqrt",
+        FUn::Abs => "fabs",
+        FUn::Floor => "floor",
+        FUn::Round => "fround",
+        FUn::Trunc => "ftrunc",
+    }
+}
+
+fn tok_name(t: Tok) -> String {
+    match t {
+        Tok::Lit(n) => format!("lit({n})"),
+        Tok::Bin(op) => bin_name(op).to_string(),
+        Tok::ImmBin(op, k) => format!("{}#({k})", bin_name(op)),
+        Tok::DupBin(op) => format!("dup-{}", bin_name(op)),
+        Tok::Shift(sh) => sh_name(sh).to_string(),
+        Tok::ImmShift(sh, k) => format!("{}#({k})", sh_name(sh)),
+        Tok::DupShiftBin(op, sh, k) => format!("dup-{}#({k})-{}", sh_name(sh), bin_name(op)),
+        Tok::Stk(s) => stk_name(s).to_string(),
+        Tok::Cmp(c) => cmp_name(c).to_string(),
+        Tok::Sel(s) => sel_name(s).to_string(),
+        Tok::Mem(m) => mem_name(m).to_string(),
+        Tok::LocalFetch(i) => format!("local@({i})"),
+        Tok::LocalStore(i) => format!("local!({i})"),
+        Tok::LocalFFetch(i) => format!("flocal@({i})"),
+        Tok::LocalFStore(i) => format!("flocal!({i})"),
+        Tok::OpenLocals { total, inputs, float_mask } => format!("open-locals(total={total},inputs={inputs},fmask={float_mask:#x})"),
+        Tok::CloseLocals { total } => format!("close-locals({total})"),
+        Tok::IvarFetch(off) => format!("ivar@({off})"),
+        Tok::IvarStore(off) => format!("ivar!({off})"),
+        Tok::SelfPush => "self".to_string(),
+        Tok::PickN(n) => format!("pick#{n}"),
+        Tok::RollN(n) => format!("roll#{n}"),
+        Tok::FLit(bits) => format!("flit({bits:#x})"),
+        Tok::FBin(op) => fbin_name(op).to_string(),
+        Tok::FUn(op) => fun_name(op).to_string(),
+        Tok::FStk(s) => format!("f{}", stk_name(s)),
+        Tok::FFetch => "f@".to_string(),
+        Tok::FStore => "f!".to_string(),
+        Tok::FCmp(FCmp::Bin(c)) => format!("fcmp({})", cond_name(c)),
+        Tok::FCmp(FCmp::Zero(c)) => format!("f0cmp({})", cond_name(c)),
+        Tok::LoopIdx(off) => format!("loop-idx({off})"),
+        Tok::Call(xt) => format!("call({xt:#x})"),
+    }
+}
+
+pub fn format_toks(toks: &[Tok]) -> String {
+    if toks.is_empty() {
+        return "∅".to_string();
+    }
+    toks.iter().map(|&t| tok_name(t)).collect::<Vec<_>>().join(" ")
+}
+
 impl Bin {
     /// `a op b` where a = NOS (deeper), b = TOS.
     fn eval(self, a: i64, b: i64) -> i64 {
@@ -564,6 +711,8 @@ struct Low<'a> {
     fconsumed: i64,
     m: Metrics, // accumulated codegen metrics for this run
     fetched: Vec<i64>, // const addresses @-fetched in the current window (heat probe)
+    cell_cache: std::collections::HashMap<i64, u32>, // hot const-address @ values
+    hot_cells: std::collections::HashSet<i64>, // const-address @ read >=2× in this run
     ffetched: Vec<i64>, // const addresses f@-fetched in the current FP window (cold probe)
     // FP-variable register cache: const address → (d-register holding the current
     // value, dirty = unspilled f!). A HOT fvariable (f@'d ≥2× in the run) is kept
@@ -625,6 +774,8 @@ impl<'a> Low<'a> {
             fconsumed: 0,
             m: Metrics::default(),
             fetched: Vec::new(),
+            cell_cache: std::collections::HashMap::new(),
+            hot_cells: std::collections::HashSet::new(),
             ffetched: Vec::new(),
             fvcache: std::collections::HashMap::new(),
             hot_fvars: std::collections::HashSet::new(),
@@ -646,6 +797,12 @@ impl<'a> Low<'a> {
             } else {
                 self.fetched.push(addr);
             }
+        }
+    }
+
+    fn clear_cell_cache(&mut self) {
+        for (_, r) in self.cell_cache.drain() {
+            self.used[r as usize] = false;
         }
     }
 
@@ -1071,6 +1228,23 @@ impl<'a> Low<'a> {
             Mem::Fetch => {
                 self.ensure(1);
                 let a = self.vs.pop().unwrap();
+                if let Loc::Const(addr) = a {
+                    if let Some(&rc) = self.cell_cache.get(&addr) {
+                        let c = self.copy_of(Loc::Reg(rc));
+                        self.vs.push(c);
+                        return;
+                    }
+                    if self.hot_cells.contains(&addr) {
+                        let rc = self.alloc();
+                        load_imm64(rc, addr as u64, self.out);
+                        self.out.push(ldr0(rc, rc));
+                        self.m.mem_fetches += 1;
+                        self.cell_cache.insert(addr, rc);
+                        let c = self.copy_of(Loc::Reg(rc));
+                        self.vs.push(c);
+                        return;
+                    }
+                }
                 self.note_fetch(a);
                 let r = self.to_reg(a);
                 self.out.push(ldr0(r, r));
@@ -1088,6 +1262,7 @@ impl<'a> Low<'a> {
             }
             Mem::Store => {
                 // ( x addr -- )
+                self.clear_cell_cache(); // conservative: any cell store may alias cached @ values
                 self.ensure(2);
                 let addr = self.vs.pop().unwrap();
                 let x = self.vs.pop().unwrap();
@@ -1099,6 +1274,7 @@ impl<'a> Low<'a> {
                 self.freer(raddr);
             }
             Mem::CStore => {
+                self.clear_cell_cache(); // byte stores may alias cached cell values
                 self.ensure(2);
                 let addr = self.vs.pop().unwrap();
                 let x = self.vs.pop().unwrap();
@@ -1596,6 +1772,7 @@ impl<'a> Low<'a> {
     /// Write the data virtual stack back to the canonical form (TOS in x0, the rest
     /// in memory from DSP) and reset.
     fn settle_data(&mut self) {
+        self.clear_cell_cache(); // cache registers do not survive a barrier/window reset
         self.spill_locals(); // a barrier flushes deferred local stores to the frame
         if self.vs.is_empty() {
             self.ensure(1); // materialize a TOS from entry memory
@@ -1710,6 +1887,19 @@ pub fn lower(
         }
     }
     low.hot_locals = counts.into_iter().filter(|&(_, c)| c >= 2).map(|(i, _)| i).collect();
+    // Integer cell hotness: a const-address @ read >=2× in one run is worth a
+    // cache register. Stores clear the cache conservatively to avoid alias bugs.
+    let mut ccounts: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+    let mut prev: Option<Tok> = None;
+    for &t in toks {
+        if matches!(t, Tok::Mem(Mem::Fetch)) {
+            if let Some(Tok::Lit(addr)) = prev {
+                *ccounts.entry(addr).or_default() += 1;
+            }
+        }
+        prev = Some(t);
+    }
+    low.hot_cells = ccounts.into_iter().filter(|&(_, c)| c >= 2).map(|(a, _)| a).collect();
     // FP hotness: a const-address fvariable f@'d >=2 times in the run is worth a
     // d-register (`zx f@` lowers to Lit(addr) FFetch, so count Lit-before-FFetch).
     let mut fcounts: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
