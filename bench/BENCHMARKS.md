@@ -10,6 +10,8 @@ cross-language ports passed an **adversarial fairness audit**: C loops verified
 Python is pure-stdlib (no numpy / C-extension / closed form), and the timed region
 matches the Forth in every case.
 
+![MF66 Forth vs C vs CPython — compute time, log scale](benchmarks.svg)
+
 | benchmark | MF66 Forth | C `-O2` | CPython 3.14 | MF66 vs C | MF66 vs Python |
 |---|--:|--:|--:|--:|--:|
 | `fib(34)` recursive       | 19.5 ms | 8.6 ms  | 385 ms  | 2.25× slower | **19.8× faster** |

@@ -70,3 +70,29 @@ up a live REPL + the eval corpus.
 
 Next: Phase 2 — boot the kernel headless (the boot-critical primitive subset +
 dictionary + interpreter). See the design doc §8.
+
+## Performance
+
+MF66 holds up against optimized native code. On Apple Silicon, across a suite of
+integer / memory workloads (recursive `fib`, Collatz step-sum, Sieve of Eratosthenes,
+a 64-bit LCG), the JIT runs **~2.6× slower than `clang -O2`** and **~22× faster than
+CPython 3.14** (geometric mean) — and on the tight 64-bit LCG inner loop it *matches*
+C (1.02×).
+
+![MF66 Forth vs C (−O2) vs CPython 3.14 — compute time per benchmark, log scale](bench/benchmarks.svg)
+
+| benchmark | MF66 Forth | C `-O2` | CPython 3.14 | MF66 vs C | MF66 vs Python |
+|---|--:|--:|--:|--:|--:|
+| `fib(34)` recursive       | 19.5 ms | 8.6 ms  | 385 ms  | 2.25× slower | 19.8× faster |
+| `collatz` Σ steps 1..10⁶  | 357 ms  | 93 ms   | 5366 ms | 3.83× slower | 15.0× faster |
+| `sieve` < 10⁶ (π = 78498) | 4.5 ms  | 0.9 ms  | 58 ms   | 5.0× slower  | 12.8× faster |
+| `lcg` ×10⁸ (64-bit)       | 100 ms  | 98 ms   | 6205 ms | **1.02× ≈ C** | 61.8× faster |
+
+The terminal **tail-call** optimization runs a 10⁸-deep tail-recursive LCG (`tlcg`)
+in O(1) return-stack space at 1.49× a `DO`/`LOOP` — bit-identical result, 41× faster
+than Python's loop, where without it the return stack would overflow outright.
+
+Methodology, the full write-up, and a one-command reproducer (`bench/run.sh`) are in
+**[bench/BENCHMARKS.md](bench/BENCHMARKS.md)**: best-of-5, each language timed with its
+own compute-only monotonic clock, identical results across all three, and the C/Python
+ports passed an adversarial fairness audit (`cc -O2 -S` confirms the loops aren't folded).

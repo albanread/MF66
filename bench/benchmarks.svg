@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" role="img" aria-label="Bar chart, log scale, of compute time in milliseconds for MF66 Forth, C compiled with -O2, and CPython 3.14 across fib, collatz, sieve, and LCG. MF66 sits between C and Python on every benchmark.">
+<rect x="0.5" y="0.5" width="759" height="399" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+<text x="24" y="34" font-size="17" font-weight="600" fill="#1f2328">MF66 Forth vs C (−O2) vs CPython 3.14</text>
+<text x="24" y="54" font-size="12.5" fill="#656d76">compute time per benchmark · milliseconds · log scale · lower is faster</text>
+<rect x="520" y="30" width="11" height="11" rx="2" fill="#2a78d6"/>
+<text x="536" y="40" font-size="12" fill="#1f2328">MF66 Forth</text>
+<rect x="610" y="30" width="11" height="11" rx="2" fill="#1baf7a"/>
+<text x="626" y="40" font-size="12" fill="#1f2328">C −O2</text>
+<rect x="688" y="30" width="11" height="11" rx="2" fill="#eda100"/>
+<text x="704" y="40" font-size="12" fill="#1f2328">CPython</text>
+<line x1="64" y1="308.9" x2="736" y2="308.9" stroke="#eaeef2"/>
+<text x="56" y="312.9" font-size="11" fill="#8c959f" text-anchor="end">1 ms</text>
+<line x1="64" y1="252.0" x2="736" y2="252.0" stroke="#eaeef2"/>
+<text x="56" y="256.0" font-size="11" fill="#8c959f" text-anchor="end">10 ms</text>
+<line x1="64" y1="195.1" x2="736" y2="195.1" stroke="#eaeef2"/>
+<text x="56" y="199.1" font-size="11" fill="#8c959f" text-anchor="end">100 ms</text>
+<line x1="64" y1="138.3" x2="736" y2="138.3" stroke="#eaeef2"/>
+<text x="56" y="142.3" font-size="11" fill="#8c959f" text-anchor="end">1000 ms</text>
+<line x1="64" y1="326" x2="736" y2="326" stroke="#d0d7de"/>
+<rect x="99.0" y="235.5" width="30" height="90.5" rx="3" fill="#2a78d6"/>
+<text x="114.0" y="230.5" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">20</text>
+<rect x="133.0" y="255.7" width="30" height="70.3" rx="3" fill="#1baf7a"/>
+<text x="148.0" y="250.7" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">8.6</text>
+<rect x="167.0" y="161.8" width="30" height="164.2" rx="3" fill="#eda100"/>
+<text x="182.0" y="156.8" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">385</text>
+<text x="148.0" y="346" font-size="12.5" fill="#1f2328" text-anchor="middle">fib(34)</text>
+<rect x="267.0" y="163.7" width="30" height="162.3" rx="3" fill="#2a78d6"/>
+<text x="282.0" y="158.7" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">357</text>
+<rect x="301.0" y="196.9" width="30" height="129.1" rx="3" fill="#1baf7a"/>
+<text x="316.0" y="191.9" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">93</text>
+<rect x="335.0" y="96.8" width="30" height="229.2" rx="3" fill="#eda100"/>
+<text x="350.0" y="91.8" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">5366</text>
+<text x="316.0" y="346" font-size="12.5" fill="#1f2328" text-anchor="middle">collatz</text>
+<rect x="435.0" y="271.7" width="30" height="54.3" rx="3" fill="#2a78d6"/>
+<text x="450.0" y="266.7" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">4.5</text>
+<rect x="469.0" y="311.5" width="30" height="14.5" rx="3" fill="#1baf7a"/>
+<text x="484.0" y="306.5" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">0.9</text>
+<rect x="503.0" y="208.6" width="30" height="117.4" rx="3" fill="#eda100"/>
+<text x="518.0" y="203.6" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">58</text>
+<text x="484.0" y="346" font-size="12.5" fill="#1f2328" text-anchor="middle">sieve</text>
+<rect x="603.0" y="195.1" width="30" height="130.9" rx="3" fill="#2a78d6"/>
+<text x="618.0" y="190.1" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">100</text>
+<rect x="637.0" y="195.6" width="30" height="130.4" rx="3" fill="#1baf7a"/>
+<text x="652.0" y="190.6" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">98</text>
+<rect x="671.0" y="93.2" width="30" height="232.8" rx="3" fill="#eda100"/>
+<text x="686.0" y="88.2" font-size="10.5" font-weight="600" fill="#1f2328" text-anchor="middle">6205</text>
+<text x="652.0" y="346" font-size="12.5" fill="#1f2328" text-anchor="middle">LCG x1e8</text>
+<text x="24" y="384" font-size="11.5" fill="#656d76">geomean: MF66 ~2.6x slower than C, ~22x faster than Python · LCG: JIT matches C (1.02x)</text>
+</svg>
