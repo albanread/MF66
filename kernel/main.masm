@@ -71,8 +71,25 @@ proc(forth_main)
     mov     DSP, x1                         ; DSP = logical_dsp_in
     ldr     LP, [UP, #user_LP0]             ; LP = locals top
     ldr     RP, [UP, #user_RSP_CURRENT]     ; Forth return-stack pointer (x28)
+    ldr     x10, [UP, #user_HANDLER]        ; previous handler (restored on the way out)
     ; sp is left as the (16-aligned) host C stack — bl/blr stay legal, and the
     ; Forth return stack lives in RP, so no sp switch is needed.
+
+    ; Install a ROOT catch handler so an UNCAUGHT throw unwinds back here (code in
+    ; TOS) instead of dereferencing a null HANDLER. The synthetic 3-cell frame lives
+    ; in the USER AREA (user_ROOT_HANDLER) — NOT on the return stack — so it can't
+    ; disturb >r/r@/r> values, which persist on RP across the per-word forth_main
+    ; calls. The throw-resume PC is captured in x30 by `bl` over the resume stub.
+    bl      .install
+    mov     x12, TOS                        ; <- a THROW returns here: x12 = throw code
+    ldr     RP, [UP, #user_RSP_CURRENT]     ; throw_word left RP pointing into the user area; reset it
+    b       .epi
+.install:
+    add     x11, UP, #user_ROOT_HANDLER     ; x11 = &root frame (user area)
+    str     DSP, [x11]                      ; frame[0] = saved (wire-form) DSP
+    str     x10, [x11, #8]                  ; frame[1] = previous handler
+    str     x30, [x11, #16]                 ; frame[2] = resume (the `mov x12,TOS` above)
+    str     x11, [UP, #user_HANDLER]        ; HANDLER = &root frame
 
     ; Prologue: memory wire-format → internal cached-TOS form.
     ldr     TOS, [DSP]
@@ -83,10 +100,17 @@ proc(forth_main)
 
     blr     x9                              ; call target_xt
 
+    ; Normal return: restore HANDLER to the previous handler, throw code = 0.
+    add     x11, UP, #user_ROOT_HANDLER
+    ldr     x10, [x11, #8]                  ; previous handler
+    str     x10, [UP, #user_HANDLER]
+    mov     x12, #0                         ; throw code = 0 (ok)
+
     ; Epilogue: internal cached-TOS form → memory wire-format; publish DSP.
     sub     DSP, DSP, #cell
     str     TOS, [DSP]
-    str     DSP, [UP, #user_DSP_SAVE]
+.epi:
+    str     DSP, [UP, #user_DSP_SAVE]       ; publish DSP (the reset DSP on a throw)
 
     str     FTOS, [UP, #user_FTOS_SAVE]     ; park FP top-of-stack
     str     FSP, [UP, #user_FSP]            ; persist float-stack pointer
@@ -102,6 +126,6 @@ proc(forth_main)
     ldp     d12, d13, [sp, #128]
     ldp     d14, d15, [sp, #144]
     ldp     x29, x30, [sp], #160
-    mov     x0, #0                          ; forth_main returns 0
+    mov     x0, x12                         ; forth_main returns the throw code (0 = ok)
     ret
 endp()

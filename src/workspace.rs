@@ -26,14 +26,16 @@ const VK_DELETE: u32 = 0x2E;
 const MOD_SHIFT: u32 = 1;
 const MOD_COMMAND: u32 = 8;
 
-const STACK_W: f32 = 230.0;
-const TITLE_H: f32 = 32.0;
-const INPUT_H: f32 = 28.0;
+const STACK_W: f32 = 210.0; // right inspector width
+const TITLE_H: f32 = 28.0;
+const STATUS_H: f32 = 22.0;  // bottom status strip
+const INPUT_H: f32 = 26.0;   // REPL input line
 const LINE_H: f32 = 18.0;
 const FONT: f32 = 13.0;
 const CHAR_W: f32 = 7.8; // Menlo 13pt monospace advance
-const GUTTER: f32 = 46.0;
+const GUTTER: f32 = 44.0;
 const PAD: f32 = 10.0;
+const EDITOR_FRAC: f32 = 0.62; // editor share of the left column height
 
 fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: 1.0 }
@@ -55,6 +57,7 @@ fn c_accent() -> Color { rgb(120, 170, 255) }
 fn c_focus() -> Color { rgb(86, 156, 214) }
 fn c_caret() -> Color { rgb(220, 230, 255) }
 fn c_sel() -> Color { rgb(48, 66, 104) }
+fn c_fp() -> Color { rgb(130, 205, 200) }
 
 // syntax tag → colour
 fn tag_color(t: Tag) -> Color {
@@ -114,6 +117,7 @@ pub struct Workspace {
     cmds: Vec<String>,
     cmd_pos: usize,
     stack: Vec<i64>,
+    fstack: Vec<f64>,
     compiling: bool,
     dragging: bool,
     width: f32,
@@ -131,6 +135,7 @@ impl Workspace {
             cmds: Vec::new(),
             cmd_pos: 0,
             stack: Vec::new(),
+            fstack: Vec::new(),
             compiling: false,
             dragging: false,
             width,
@@ -282,7 +287,7 @@ impl Workspace {
         self.width - STACK_W
     }
     fn editor_bot(&self) -> f32 {
-        TITLE_H + (self.height - TITLE_H) * 0.56
+        TITLE_H + (self.height - STATUS_H - TITLE_H) * EDITOR_FRAC
     }
 
     /// Map a window point to an editor `(row, col)`, or `None` if outside the
@@ -351,7 +356,14 @@ impl Workspace {
 
     /// Record an evaluation (REPL line or editor buffer) into the output log +
     /// stack view.
-    pub fn record(&mut self, line: String, result: Result<String, String>, stack: Vec<i64>, compiling: bool) {
+    pub fn record(
+        &mut self,
+        line: String,
+        result: Result<String, String>,
+        stack: Vec<i64>,
+        fstack: Vec<f64>,
+        compiling: bool,
+    ) {
         let prompt = if self.compiling { "  … " } else { "ok> " };
         for (i, l) in line.split('\n').enumerate() {
             let p = if i == 0 { prompt } else { "  … " };
@@ -371,6 +383,7 @@ impl Workspace {
             Err(e) => self.log.push(Line { text: format!("\u{2717} {e}"), kind: Kind::Err }),
         }
         self.stack = stack;
+        self.fstack = fstack;
         self.compiling = compiling;
         if self.log.len() > 2000 {
             self.log.drain(0..self.log.len() - 2000);
@@ -381,7 +394,8 @@ impl Workspace {
         self.frame += 1;
         let (w, h) = (self.width, self.height);
         let main_w = w - STACK_W;
-        let editor_bot = TITLE_H + (h - TITLE_H) * 0.56;
+        let content_bot = h - STATUS_H; // panes sit above the status strip
+        let editor_bot = TITLE_H + (content_bot - TITLE_H) * EDITOR_FRAC;
         let mut cmds: Vec<DrawCmd> = Vec::with_capacity(256);
         let text = |s: &str, x: f32, y: f32, c: Color| DrawCmd::DrawText { text: s.to_string(), x, y, size: FONT, color: c };
         let fill = |l: f32, t: f32, r: f32, b: f32, c: Color| DrawCmd::FillRect { rect: Rect { left: l, top: t, right: r, bottom: b }, color: c };
@@ -390,9 +404,8 @@ impl Workspace {
 
         // ── title strip ──
         cmds.push(fill(0.0, 0.0, w, TITLE_H, c_strip()));
-        cmds.push(text("MF66", PAD, 21.0, c_accent()));
-        cmds.push(text(&self.editor.file_label(), PAD + 46.0, 21.0, c_dim()));
-        cmds.push(text(&format!("depth {}", self.stack.len()), main_w - 86.0, 21.0, c_dim()));
+        cmds.push(text("MF66 Workspace", PAD, 19.0, c_accent()));
+        cmds.push(text(&self.editor.file_label(), PAD + 124.0, 19.0, c_dim()));
 
         // ── editor pane (upper-left) ──
         let ed_focus = self.focus == Focus::Editor;
@@ -412,15 +425,10 @@ impl Workspace {
             }
             let y = TITLE_H + vis as f32 * LINE_H + FONT;
             let row_top = TITLE_H + vis as f32 * LINE_H;
-            // selection background for this row
             if let Some(((sr, sc), (er, ec))) = sel {
                 if row >= sr && row <= er {
                     let from = if row == sr { sc } else { 0 };
-                    let to = if row == er {
-                        ec
-                    } else {
-                        self.editor.line(row).chars().count() + 1 // include the newline
-                    };
+                    let to = if row == er { ec } else { self.editor.line(row).chars().count() + 1 };
                     let x0 = GUTTER + from as f32 * CHAR_W;
                     let x1 = (GUTTER + to as f32 * CHAR_W).min(main_w);
                     if x1 > x0 {
@@ -439,18 +447,18 @@ impl Workspace {
             if row == crow {
                 let cx = GUTTER + ccol as f32 * CHAR_W;
                 let caret = if ed_focus { c_caret() } else { c_dim() };
-                cmds.push(fill(cx, TITLE_H + vis as f32 * LINE_H + 2.0, cx + 1.5, TITLE_H + vis as f32 * LINE_H + LINE_H, caret));
+                cmds.push(fill(cx, row_top + 2.0, cx + 1.5, row_top + LINE_H, caret));
             }
         }
 
         // ── REPL pane (lower-left) ──
-        cmds.push(fill(0.0, editor_bot, main_w, h, c_bg()));
+        cmds.push(fill(0.0, editor_bot, main_w, content_bot, c_bg()));
         cmds.push(fill(0.0, editor_bot, main_w, editor_bot + 1.0, c_dim())); // divider
+        let input_top = content_bot - INPUT_H;
         let log_top = editor_bot + 4.0;
-        let log_bot = h - INPUT_H - 2.0;
-        let lrows = ((log_bot - log_top) / LINE_H).floor().max(0.0) as usize;
+        let lrows = ((input_top - 2.0 - log_top) / LINE_H).floor().max(0.0) as usize;
         let start = self.log.len().saturating_sub(lrows);
-        let mut ly = log_bot - LINE_H + FONT * 0.8;
+        let mut ly = input_top - LINE_H + FONT * 0.6;
         for line in self.log[start..].iter().rev() {
             let c = match line.kind {
                 Kind::Input => c_input(),
@@ -463,31 +471,77 @@ impl Workspace {
             ly -= LINE_H;
         }
         // input line
-        cmds.push(fill(0.0, h - INPUT_H, main_w, h, c_strip()));
+        cmds.push(fill(0.0, input_top, main_w, content_bot, c_strip()));
         let prompt = if self.compiling { "  … " } else { "ok> " };
         let repl_focus = self.focus == Focus::Repl;
         let cur = if repl_focus { "_" } else { "" };
-        cmds.push(text(&format!("{prompt}{}{cur}", self.input), PAD, h - INPUT_H + 19.0, c_input()));
+        cmds.push(text(&format!("{prompt}{}{cur}", self.input), PAD, input_top + 18.0, c_input()));
 
-        // ── stack pane (right) ──
-        cmds.push(fill(main_w, TITLE_H, w, h, c_pane()));
-        cmds.push(text("data stack", main_w + PAD, TITLE_H + 20.0, c_dim()));
-        let mut sy = TITLE_H + 20.0 + LINE_H;
-        for (i, v) in self.stack.iter().enumerate() {
-            if sy > h - LINE_H {
-                cmds.push(text("…", main_w + PAD, sy, c_dim()));
-                break;
+        // ── right inspector: data stack / fp stack / locals ──
+        cmds.push(fill(main_w, TITLE_H, w, content_bot, c_pane()));
+        cmds.push(fill(main_w, TITLE_H, main_w + 1.0, content_bot, c_dim())); // divider
+        let ix = main_w + PAD;
+        let mut iy = TITLE_H + 6.0;
+        let section = |cmds: &mut Vec<DrawCmd>, iy: &mut f32, title: &str, cap: usize, count: usize, mut item: Box<dyn FnMut(usize) -> (String, Color) + '_>| {
+            cmds.push(text(&format!("{title}  ({count})"), ix, *iy + FONT, c_dim()));
+            *iy += LINE_H + 2.0;
+            if count == 0 {
+                cmds.push(text("(empty)", ix + 6.0, *iy + FONT, c_gutter()));
+                *iy += LINE_H;
             }
-            let tag = if i == 0 { " ← top" } else { "" };
-            cmds.push(text(&format!("{v}{tag}"), main_w + PAD, sy, c_stack()));
-            sy += LINE_H;
-        }
+            for i in 0..count.min(cap) {
+                if *iy + LINE_H > content_bot { break; }
+                let (s, c) = item(i);
+                cmds.push(text(&s, ix + 6.0, *iy + FONT, c));
+                *iy += LINE_H;
+            }
+            if count > cap {
+                cmds.push(text("…", ix + 6.0, *iy + FONT, c_dim()));
+                *iy += LINE_H;
+            }
+            *iy += 8.0;
+        };
+        let dn = self.stack.len();
+        let ds = self.stack.clone();
+        section(&mut cmds, &mut iy, "data stack", 9, dn, Box::new(move |i| {
+            (format!("{}{}", ds[i], if i == 0 { " ←" } else { "" }), c_stack())
+        }));
+        let fn_ = self.fstack.len();
+        let fs = self.fstack.clone();
+        section(&mut cmds, &mut iy, "fp stack", 6, fn_, Box::new(move |i| {
+            (format!("{}{}", fmt_f(fs[i]), if i == 0 { " ←" } else { "" }), c_fp())
+        }));
+        section(&mut cmds, &mut iy, "locals", 8, 0, Box::new(|_| (String::new(), c_text())));
+
+        // ── status bar ──
+        cmds.push(fill(0.0, content_bot, w, h, c_strip()));
+        cmds.push(fill(0.0, content_bot, w, content_bot + 1.0, c_dim()));
+        let focus = if ed_focus { "editor" } else { "repl" };
+        let status = format!(
+            "Ln {}, Col {}      {}      data {}  ·  fp {}      [{}]",
+            crow + 1, ccol + 1, self.editor.file_label(), self.stack.len(), self.fstack.len(), focus
+        );
+        cmds.push(text(&status, PAD, content_bot + 15.0, c_dim()));
 
         // ── focus outline ──
-        let outline = if ed_focus { Rect { left: 0.0, top: TITLE_H, right: main_w, bottom: editor_bot } } else { Rect { left: 0.0, top: h - INPUT_H, right: main_w, bottom: h } };
+        let outline = if ed_focus {
+            Rect { left: 0.0, top: TITLE_H, right: main_w, bottom: editor_bot }
+        } else {
+            Rect { left: 0.0, top: input_top, right: main_w, bottom: content_bot }
+        };
         cmds.push(DrawCmd::StrokeRect { rect: outline, color: c_focus(), thickness: 1.5 });
 
         DrawBatch { frame_id: self.frame, commands: cmds }
+    }
+}
+
+/// Format an FP value compactly (drop the trailing `.0` for whole numbers).
+fn fmt_f(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        let s = format!("{v:.6}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
@@ -543,12 +597,12 @@ mod tests {
     #[test]
     fn record_renders_output_stack_and_ok() {
         let mut w = Workspace::new(900.0, 600.0);
-        w.record("2 3 + .".into(), Ok("5 ".into()), vec![], false);
+        w.record("2 3 + .".into(), Ok("5 ".into()), vec![], vec![], false);
         let t = texts(&w.render());
         assert!(t.iter().any(|s| s.contains("2 3 + .")));
         assert!(t.iter().any(|s| s == "5 "));
         assert!(t.iter().any(|s| s == "ok"));
-        w.record("7 11".into(), Ok(String::new()), vec![11, 7], false);
+        w.record("7 11".into(), Ok(String::new()), vec![11, 7], vec![1.5], false);
         let t = texts(&w.render());
         assert!(t.iter().any(|s| s == "11 ← top"));
     }

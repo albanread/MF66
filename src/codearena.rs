@@ -58,6 +58,14 @@ impl CodeArena {
         unsafe { self.region.add(start) as u64 }
     }
 
+    /// Is `addr` a body committed to this arena? Distinguishes a colon/CODE word
+    /// (which nests/unnests cleanly) from a kernel primitive — used to gate the
+    /// tail-call optimization, which is only sound for the former.
+    pub fn contains(&self, addr: u64) -> bool {
+        let base = self.region as u64;
+        addr >= base && addr < base + self.cap as u64
+    }
+
     /// Current write cursor — a checkpoint for `marker`/`forget` rollback.
     pub fn checkpoint(&self) -> usize {
         self.cursor

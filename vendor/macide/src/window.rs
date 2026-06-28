@@ -32,7 +32,7 @@ use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSTimer};
 
 use locus_ide_protocol::draw::DrawBatch;
-use locus_ide_protocol::event::{MouseButton, MouseOp};
+use locus_ide_protocol::event::{MouseButton, MouseOp, UiEvent};
 
 use crate::events as ev;
 use crate::mailbox;
@@ -223,6 +223,33 @@ impl WindowManager {
         self.wins.get(&id).map(|e| e.h).unwrap_or(0.0)
     }
 
+    /// Poll each window's live content-view size (points). When it differs from
+    /// the cached `w/h` — at first layout, or whenever the user resizes — update
+    /// the cache, mark the window dirty, and post a `Resize` so the worker
+    /// reflows its `DrawBatch` to the real drawable. Without this the worker
+    /// draws at the open-time size and the content is clipped/letterboxed.
+    fn poll_resizes(&mut self) {
+        for (id, entry) in self.wins.iter_mut() {
+            let b = entry.view.bounds();
+            let (cw, ch) = (b.size.width, b.size.height);
+            if cw >= 1.0 && ch >= 1.0 && ((cw - entry.w).abs() > 0.5 || (ch - entry.h).abs() > 0.5) {
+                entry.w = cw;
+                entry.h = ch;
+                let scale = entry
+                    .view
+                    .window()
+                    .map(|win| win.backingScaleFactor())
+                    .filter(|s| *s >= 1.0)
+                    .unwrap_or(2.0);
+                mailbox::push(
+                    *id,
+                    UiEvent::Resize { width: cw as u32, height: ch as u32, dpi: (scale * 72.0) as u32 },
+                );
+                dirty().lock().unwrap_or_else(|e| e.into_inner()).insert(*id);
+            }
+        }
+    }
+
     fn repaint(&self, id: u64) {
         let Some(entry) = self.wins.get(&id) else { return };
         let Some(batch) = take_batch(id) else { return };
@@ -364,6 +391,7 @@ where
     let app_t = app.clone();
     let had_t = Rc::clone(&had_window);
     let tick = RcBlock::new(move |_t: NonNull<NSTimer>| {
+        mgr_t.borrow_mut().poll_resizes();
         mgr_t.borrow_mut().drain_commands();
         if quit_on_last_close {
             let empty = mgr_t.borrow().wins.is_empty();

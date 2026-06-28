@@ -578,6 +578,48 @@ impl Mf66Session {
             .collect()
     }
 
+    /// The return stack, top-first (from the saved RSP up to the top). Empty at
+    /// the REPL boundary; meaningful mid-execution (e.g. a future debugger pause).
+    pub fn rstack(&self) -> Vec<i64> {
+        let cur = self.read_user(USER_RSP_CURRENT);
+        if cur == 0 || cur >= self.rstack_top {
+            return Vec::new();
+        }
+        let depth = ((self.rstack_top - cur) / CELL as u64) as usize;
+        (0..depth)
+            .map(|i| unsafe { ((cur + i as u64 * CELL as u64) as *const u64).read() as i64 })
+            .collect()
+    }
+
+    /// The current numeric base (the `base` user variable; 10/16/…).
+    pub fn num_base(&self) -> u64 {
+        self.read_user(UVAR_BASE)
+    }
+
+    /// The dictionary `HERE` pointer (code/header heap).
+    pub fn here(&self) -> u64 {
+        self.read_user(USER_HERE)
+    }
+
+    /// The floating-point stack, top-first. The top is the cached FTOS (saved in
+    /// the user area between calls); the rest live in memory from FSP upward.
+    /// `fdepth = (FP0 - FSP)/8` (matching the kernel `fdepth`).
+    pub fn fstack(&self) -> Vec<f64> {
+        let fp0 = self.read_user(USER_FP0);
+        let fsp = self.read_user(USER_FSP);
+        if fp0 <= fsp {
+            return Vec::new();
+        }
+        let fdepth = ((fp0 - fsp) / CELL as u64) as usize;
+        let mut v = Vec::with_capacity(fdepth);
+        v.push(f64::from_bits(self.read_user(USER_FTOS_SAVE))); // top = FTOS
+        for i in 0..fdepth.saturating_sub(1) {
+            let bits = unsafe { ((fsp + i as u64 * CELL as u64) as *const u64).read() };
+            v.push(f64::from_bits(bits));
+        }
+        v
+    }
+
     pub fn depth(&self) -> usize {
         ((self.dstack_top - self.current_dsp) / CELL as u64) as usize
     }
@@ -645,11 +687,27 @@ impl Mf66Session {
         ))
     }
 
-    /// Invoke a primitive by its asm symbol through `forth_main`.
+    /// Invoke a primitive by its asm symbol through `forth_main`. A non-zero
+    /// return is the code of an *uncaught* `THROW` that unwound to the root
+    /// handler (a `catch` would have absorbed it, returning the code on the
+    /// stack, so this stays 0). On a throw we apply ABORT semantics — clear both
+    /// stacks — and report.
     pub fn call(&mut self, asm_sym: &str) -> Result<()> {
         let xt = self.xt_of(asm_sym)?;
-        (self.forth_main)(xt, self.current_dsp, self.rstack_top, self.user_base);
+        let code = (self.forth_main)(xt, self.current_dsp, self.rstack_top, self.user_base) as i64;
         self.current_dsp = self.read_user(USER_DSP_SAVE);
+        if code != 0 {
+            self.current_dsp = self.dstack_top; // clear the data stack
+            let fp0 = self.read_user(USER_FP0);
+            self.write_user(USER_FSP, fp0); // clear the float stack
+            self.write_user(USER_FTOS_SAVE, 0);
+            match code {
+                -1 | -2 => anyhow::bail!("aborted"),
+                -10 => anyhow::bail!("division by zero"),
+                -11 => anyhow::bail!("result out of range"),
+                n => anyhow::bail!("exception {n}"),
+            }
+        }
         Ok(())
     }
 
@@ -2240,21 +2298,55 @@ impl Mf66Session {
     /// Finish the pending body (flush, free locals, unnest+ret) and commit it to
     /// the code arena, returning its xt. Does NOT publish a header.
     fn commit_body(&mut self) -> Result<u64> {
-        self.flush_toks(); // lower the final straight-line run
+        // Tail call: a Call in the body's tail position becomes a jump — the
+        // callee's ret returns to OUR caller, eliding the extra ret and making
+        // self-recursion (incl. the `if … exit then … self ;` idiom) an O(1)
+        // return-stack loop (the per-iteration nest/unnest cancel). Pop it before
+        // lowering so flush_toks doesn't emit it as a `bl`.
+        //
+        // Only colon/CODE words (arena bodies) are eligible: they nest/unnest
+        // cleanly, so `unnest; br` restores our caller's return correctly. A
+        // primitive must NOT be tail-jumped — e.g. `: stash >r r> ;` ends in the
+        // RP-popping `r>`, where the extra unnest would consume the wrong cell.
+        let tail = match self.pending.as_ref().unwrap().toks.last() {
+            Some(Tok::Call(xt)) if self.code.contains(*xt) => Some(*xt),
+            _ => None,
+        };
+        if tail.is_some() {
+            self.pending.as_mut().unwrap().toks.pop();
+        }
+        self.flush_toks(); // lower the final straight-line run (settles the stack)
         let mut def = self.pending.take().expect("commit_body with no pending def");
         if !def.cf.is_empty() {
             anyhow::bail!("unbalanced control flow in `{}`", def.name);
         }
-        // The single epilogue: every `exit` branches here so the locals teardown
-        // and unnest+ret exist once, not inlined at each early return.
-        let epilogue = def.body.len();
-        if !def.locals.is_empty() {
-            def.body.push(crate::aenc::add_imm(21, 21, (def.locals.len() * 8) as u32));
+        // When this word is itself inlined the tail call is no longer in tail
+        // position, so keep the inline IR complete by re-appending it as a call.
+        if let (Some(xt), Some(toks)) = (tail, def.inline_toks.as_mut()) {
+            toks.push(Tok::Call(xt));
         }
-        crate::aenc::emit_unnest_ret(&mut def.body);
         let exits = std::mem::take(&mut def.exits);
-        for i in exits {
-            crate::aenc::patch_b(&mut def.body, i, epilogue);
+        let need_epilogue = tail.is_none() || !exits.is_empty();
+        // Tail path (fall-through end of the straight-line code): teardown locals,
+        // restore the caller's return, jump to the callee.
+        if let Some(xt) = tail {
+            if !def.locals.is_empty() {
+                def.body.push(crate::aenc::add_imm(21, 21, (def.locals.len() * 8) as u32));
+            }
+            crate::aenc::emit_unnest(&mut def.body);
+            crate::aenc::emit_tail_call(xt, &mut def.body);
+        }
+        // The shared epilogue (teardown + unnest + ret): the target of every `exit`,
+        // and the body's own end when there's no tail call.
+        if need_epilogue {
+            let epilogue = def.body.len();
+            if !def.locals.is_empty() {
+                def.body.push(crate::aenc::add_imm(21, 21, (def.locals.len() * 8) as u32));
+            }
+            crate::aenc::emit_unnest_ret(&mut def.body);
+            for i in exits {
+                crate::aenc::patch_b(&mut def.body, i, epilogue);
+            }
         }
         self.last_body_words = def.body.len();
         // Finalize + record optimizer metrics for this definition (body words

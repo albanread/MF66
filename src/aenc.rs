@@ -53,8 +53,14 @@ pub fn emit_nest(out: &mut Vec<u32>) {
     out.push(str_pre(LR, RP, -CELL)); // str x30, [x28, #-8]!
 }
 /// Colon-word epilogue (unnest + return).
+/// Restore the caller's return address from the Forth return stack (`ldr x30,
+/// [x28], #8`) — the unnest half of `emit_unnest_ret`. A tail call does this then
+/// `br`s the callee (whose own ret then returns to *our* caller).
+pub fn emit_unnest(out: &mut Vec<u32>) {
+    out.push(ldr_post(LR, RP, CELL));
+}
 pub fn emit_unnest_ret(out: &mut Vec<u32>) {
-    out.push(ldr_post(LR, RP, CELL)); // ldr x30, [x28], #8
+    emit_unnest(out);
     out.push(ret());
 }
 /// Compile a call to `xt` (veneer: works regardless of distance — `bl` range is
@@ -201,6 +207,13 @@ pub fn emit_unloop(out: &mut Vec<u32>) {
 /// `mul Xd, Xn, Xm`.
 pub fn mul(rd: u32, rn: u32, rm: u32) -> u32 {
     0x9B00_7C00 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+/// `lsl Xd, Xn, #sh` (1..=63) — the `UBFM Xd,Xn,#(-sh%64),#(63-sh)` alias.
+/// Used for `* 2^k` strength reduction.
+pub fn lsl_imm(rd: u32, rn: u32, sh: u32) -> u32 {
+    let immr = (64 - sh) & 63;
+    let imms = 63 - sh;
+    0xD340_0000 | (immr << 16) | (imms << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
 }
 /// `and Xd, Xn, Xm`.
 pub fn and_reg(rd: u32, rn: u32, rm: u32) -> u32 {
@@ -419,6 +432,10 @@ mod cf_tests {
         assert_eq!(vec![neg(0, 0)], asm("neg x0, x0"));
         assert_eq!(vec![mvn(0, 0)], asm("mvn x0, x0"));
         assert_eq!(vec![ldr_post(9, 19, 8)], asm("ldr x9, [x19], #8"));
+        assert_eq!(vec![lsl_imm(0, 0, 1)], asm("lsl x0, x0, #1"));
+        assert_eq!(vec![lsl_imm(9, 10, 3)], asm("lsl x9, x10, #3"));
+        assert_eq!(vec![lsl_imm(0, 0, 10)], asm("lsl x0, x0, #10"));
+        assert_eq!(vec![lsl_imm(15, 15, 63)], asm("lsl x15, x15, #63"));
     }
 
     #[test]

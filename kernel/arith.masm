@@ -262,6 +262,7 @@ endp()
 proc(fm_slash_mod)
     ldr     x10, [DSP]              ; x10 = high (dividend top, for sign-test)
     ldr     x9,  [DSP, #cell]       ; x9  = low  (dividend, the 64-bit value)
+    guard_div_full()               ; ÷0 → THROW -10, INT_MIN/-1 → THROW -11
     sdiv    x11, x9, TOS            ; x11 = quot = low / n  (symmetric, truncates)
     msub    x12, x11, TOS, x9       ; x12 = rem  = low - quot*n  (sign of dividend)
 
@@ -299,6 +300,7 @@ endp()
 ;     Asm sym `mod_` — `mod` is a JASM/MASM reserved-keyword family.
 proc(mod_)
     ldr     x9, [DSP]              ; x9 = NOS = n1 (dividend)
+    guard_div_full()              ; ÷0 → THROW -10, INT_MIN/-1 → THROW -11
     sdiv    x10, x9, TOS          ; x10 = n1 / n2 (truncating quotient)
     msub    TOS, x10, TOS, x9     ; TOS = n1 - (n1/n2)*n2 = rem (sign of n1)
     stk(2, 1)
@@ -372,6 +374,7 @@ endp()
 ;     x86 idiv's symmetric semantics, so a single sdiv suffices.
 proc(slash)
     ldr     x9, [DSP]              ; x9 = NOS (n1, dividend)
+    guard_div_full()              ; ÷0 → THROW -10, INT_MIN/-1 → THROW -11
     sdiv    TOS, x9, TOS          ; TOS = n1 / n2  (NOS / TOS), trunc toward 0
     stk(2, 1)
     next()
@@ -383,6 +386,7 @@ endp()
 ;     NOS = rem. Balanced 2->2 (cells written in place).
 proc(slash_mod)
     ldr     x9,  [DSP]              ; x9 = NOS = dividend n1
+    guard_div_full()               ; ÷0 → THROW -10, INT_MIN/-1 → THROW -11
     sdiv    x10, x9, TOS           ; x10 = quot = n1 / n2 (toward zero)
     msub    x11, x10, TOS, x9      ; x11 = rem = n1 - quot*n2
     str     x11, [DSP]             ; NOS <- rem
@@ -401,6 +405,7 @@ endp()
 ;     rem -1 quot -3 (rem takes the sign of the dividend).
 proc(sm_slash_rem)
     ldr     x9,  [DSP, #cell]      ; x9  = low(d)  (dividend, the live 64 bits)
+    guard_div_full()               ; ÷0 → THROW -10, INT_MIN/-1 → THROW -11
     sdiv    x10, x9, TOS           ; x10 = quot = dividend / n  (trunc toward 0)
     msub    x11, x10, TOS, x9      ; x11 = rem  = dividend - quot*n  (sign of dividend)
     str     x11, [DSP, #cell]      ; store rem under the (to-be) quotient
@@ -416,6 +421,7 @@ endp()
 ;     cell, which the contract's cases require) and `sdiv` (signed, truncates
 ;     toward zero, matching x86 idiv's symmetric rounding).
 proc(times_slash)
+    guard_div_zero()               ; n3 = 0 → THROW -10
     mov     x9,  TOS                ; x9  = n3 (divisor), free TOS
     ldr     x10, [DSP]              ; x10 = n2  (NOS)
     ldr     x11, [DSP, #cell]       ; x11 = n1  (NNOS)
@@ -427,6 +433,7 @@ endp()
 
 ; */mod  ( n1 n2 n3 -- rem (n1*n2)/n3 )   signed scale-then-divide, keep remainder
 proc(times_slash_mod)
+    guard_div_zero()               ; n3 = 0 → THROW -10
     ldr     x9,  [DSP]              ; x9 = n2  (NOS)
     ldr     x10, [DSP, #cell]       ; x10 = n1 (NNOS)
     mul     x9,  x9,  x10           ; x9 = n1*n2 (low 64 of product)
@@ -460,6 +467,7 @@ endp()
 ;     `cinc ..., hs`); dropping it corrupts large-divisor results.
 ;     Branch via cinc+cbz (the front-end mangles `b.<cond>`; see stack.masm).
 proc(um_slash_mod)
+    guard_div_zero()               ; ÷0 → THROW -10 (else the bit-loop yields 2^64-1 garbage)
     mov     x9,  TOS                ; x9  = divisor (u)
     ldr     x10, [DSP]              ; x10 = high (dividend top half)
     ldr     x11, [DSP, #cell]       ; x11 = low  (dividend bottom half)

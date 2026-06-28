@@ -11,6 +11,17 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `--serve [dir]` — run the persistent file-mailbox server (the IDE bridge).
+    if args.first().map(String::as_str) == Some("--serve") {
+        let dir = args.get(1).cloned().unwrap_or_else(|| "/tmp/mf66bridge".to_string());
+        if let Err(e) = mf66::wsdriver::serve_mailbox(&dir) {
+            eprintln!("mf66-tcl: serve: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let src = match args.split_first() {
         Some((flag, rest)) if flag == "-e" || flag == "--exec" => rest.join(" "),
         Some((path, _)) => match std::fs::read_to_string(path) {

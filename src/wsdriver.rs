@@ -43,10 +43,10 @@ fn do_eval(d: &mut Driver, line: &str) -> String {
     let result = d.session.eval_out(line).map_err(|e| e.to_string());
     let out = match &result {
         Ok(o) => o.clone(),
-        Err(e) => format!("\u{2717} {e}"),
+        Err(e) => format!("\u{2717} {e:#}"),
     };
     d.ws
-        .record(line.to_string(), result, d.session.stack(), d.session.compiling());
+        .record(line.to_string(), result, d.session.stack(), d.session.fstack(), d.session.compiling());
     d.last = out.clone();
     out
 }
@@ -73,6 +73,67 @@ fn stack_str(d: &Driver) -> String {
     let mut s = d.session.stack(); // top-first
     s.reverse();
     s.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// The live-state dashboard — the `stat` verb, polled by the IDE's STAT tab.
+/// Four stack columns (data / return / float / local), top-first with the top
+/// marked, then a states block. Return + local are empty at the REPL boundary
+/// (live only mid-execution); data + float are always current.
+fn stat_text(d: &Driver) -> String {
+    let fmt_f = |v: f64| {
+        if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", v as i64) } else { format!("{v}") }
+    };
+    let data: Vec<String> = d.session.stack().iter().map(|v| v.to_string()).collect();
+    let ret: Vec<String> = d.session.rstack().iter().map(|v| format!("{:#x}", *v as u64)).collect();
+    let flt: Vec<String> = d.session.fstack().iter().map(|v| fmt_f(*v)).collect();
+    let loc: Vec<String> = Vec::new(); // locals live only inside a running word
+
+    let cols: [(&str, &Vec<String>); 4] =
+        [("DATA", &data), ("RETURN", &ret), ("FLOAT", &flt), ("LOCAL", &loc)];
+    let cw = 18usize;
+    let mut s = String::new();
+    for (name, col) in &cols {
+        s.push_str(&format!("{:<cw$}", format!("{} ({})", name, col.len())));
+    }
+    s.push('\n');
+    let rows = cols.iter().map(|(_, c)| c.len()).max().unwrap_or(0).max(1);
+    for r in 0..rows {
+        for (_, col) in &cols {
+            let cell = if r < col.len() {
+                format!("{}{}", col[r], if r == 0 { "  <" } else { "" })
+            } else if col.is_empty() && r == 0 {
+                "—".to_string()
+            } else {
+                String::new()
+            };
+            s.push_str(&format!("{:<cw$}", cell));
+        }
+        s.push('\n');
+    }
+
+    s.push('\n');
+    s.push_str(&"─".repeat(72));
+    s.push('\n');
+    let base = d.session.num_base();
+    let basename = match base { 2 => "binary", 8 => "octal", 10 => "decimal", 16 => "hex", _ => "" };
+    s.push_str(&format!("state:  {}\n", if d.session.compiling() { "compiling  :" } else { "interpreting" }));
+    s.push_str(&format!(
+        "depths: data {}   return {}   float {}   local 0\n",
+        data.len(), ret.len(), flt.len()
+    ));
+    s.push_str(&format!("base:   {base} {basename}     words: {} defined\n", d.session.word_names().len()));
+    s.push_str(&format!("HERE:   {:#x}\n", d.session.here()));
+    s
+}
+
+/// The float stack as a space-separated string, bottom → top.
+fn fstack_str(d: &Driver) -> String {
+    let mut s = d.session.fstack(); // top-first
+    s.reverse();
+    s.iter()
+        .map(|v| if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", *v as i64) } else { format!("{v}") })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn char_ev(c: char) -> UiEvent {
@@ -339,6 +400,15 @@ fn registry() -> Registry {
     r.register("depth", Arity::exact(0), |_, _| {
         Ok(Value::new(with_driver(|d| d.session.depth().to_string())))
     });
+    r.register("fstack", Arity::exact(0), |_, _| {
+        Ok(Value::new(with_driver(|d| fstack_str(d))))
+    });
+    r.register("fdepth", Arity::exact(0), |_, _| {
+        Ok(Value::new(with_driver(|d| d.session.fstack().len().to_string())))
+    });
+    r.register("stat", Arity::exact(0), |_, _| {
+        Ok(Value::new(with_driver(|d| stat_text(d))))
+    });
     r.register("output", Arity::exact(0), |_, _| Ok(Value::new(with_driver(|d| d.last.clone()))));
     r.register("input", Arity::exact(0), |_, _| {
         Ok(Value::new(with_driver(|d| d.ws.input_text())))
@@ -393,6 +463,63 @@ pub fn run_script(tcl: &str) -> anyhow::Result<()> {
     let result = rust_tcl::eval(tcl, &reg).map_err(|e| anyhow::anyhow!("tcl: {e}"));
     DRIVER.with(|d| *d.borrow_mut() = None);
     result.map(|_| ())
+}
+
+/// Run a persistent **file-mailbox** server: hold one live session for the whole
+/// process (the persistent Forth image), watch `<dir>/req` (`<seq>\n<tcl>`), run
+/// each *new* command (seq strictly increasing) through the verb registry, and
+/// write `<dir>/resp` (`<seq>\n<result>`, or `<seq>\nERR <msg>`) atomically via a
+/// temp + rename. This is the bridge the Cocoa IDE drives — the Modula-2 side has
+/// only batch process + file I/O (no persistent pipe), so a long-lived engine is
+/// reached through request/response files instead of stdin/stdout.
+pub fn serve_mailbox(dir: &str) -> anyhow::Result<()> {
+    let session = Mf66Session::new()?;
+    let ws = Workspace::new(W as f32, H as f32);
+    DRIVER.with(|d| *d.borrow_mut() = Some(Driver { session, ws, last: String::new() }));
+    let reg = registry();
+
+    let base = std::path::Path::new(dir);
+    std::fs::create_dir_all(base)?;
+    let req_path = base.join("req");
+    let resp_path = base.join("resp");
+    let resp_tmp = base.join("resp.tmp");
+    let ready_path = base.join("ready");
+    let _ = std::fs::remove_file(&req_path);
+    let _ = std::fs::remove_file(&resp_path);
+    // a readiness marker the client can poll before sending
+    let _ = std::fs::write(&ready_path, "1");
+    eprintln!("mf66-tcl: serving mailbox at {dir}");
+
+    let mut last_seq: u64 = 0;
+    loop {
+        if let Ok(content) = std::fs::read_to_string(&req_path) {
+            if let Some((seq_line, cmd)) = content.split_once('\n') {
+                if let Ok(seq) = seq_line.trim().parse::<u64>() {
+                    if seq > last_seq {
+                        last_seq = seq;
+                        let result = match rust_tcl::eval(cmd, &reg) {
+                            Ok(rr) => {
+                                let v = rr.value.as_str();
+                                if rr.output.is_empty() {
+                                    v.to_string()
+                                } else if v.is_empty() {
+                                    rr.output
+                                } else {
+                                    format!("{}{v}", rr.output)
+                                }
+                            }
+                            Err(e) => format!("ERR {e}"),
+                        };
+                        let body = format!("{seq}\n{result}");
+                        if std::fs::write(&resp_tmp, body.as_bytes()).is_ok() {
+                            let _ = std::fs::rename(&resp_tmp, &resp_path);
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
 }
 
 #[cfg(test)]

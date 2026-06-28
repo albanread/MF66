@@ -254,6 +254,7 @@ pub struct Metrics {
     pub dce: u32,           // Lit/Dup Drop removed
     pub stack_cancels: u32, // swap swap / rot -rot annihilated
     pub cmp_negates: u32,   // <cmp> 0= → inverse compare
+    pub identities: u32,    // algebraic identities collapsed (0 +, 1 *, dup xor, …)
     // ── lower: registers & stack motion ─────────────────────────────────────
     pub instrs: u32,        // final emitted body instructions (set at commit)
     pub stack_ops: u32,     // stack-motion tokens lowered (dup/swap/rot/pick/…)
@@ -297,6 +298,7 @@ impl Metrics {
         self.dce += o.dce;
         self.stack_cancels += o.stack_cancels;
         self.cmp_negates += o.cmp_negates;
+        self.identities += o.identities;
         self.stack_ops += o.stack_ops;
         self.stack_ops_free += o.stack_ops_free;
         self.const_mat += o.const_mat;
@@ -325,7 +327,7 @@ impl Metrics {
     /// Total reduce-pass rewrites (a proxy for token-level effectiveness).
     pub fn rewrites(&self) -> u32 {
         self.const_folds + self.imm_folds + self.imm_chains + self.dup_fuses
-            + self.dce + self.stack_cancels + self.cmp_negates
+            + self.dce + self.stack_cancels + self.cmp_negates + self.identities
     }
 }
 
@@ -352,6 +354,25 @@ pub fn reduce(toks: &[Tok], m: &mut Metrics) -> Vec<Tok> {
                 // immediate-fold: ... Lit k, Bin -> ImmBin(op, k)
                 if let Some(Tok::Lit(k)) = out.last().copied() {
                     out.pop();
+                    // algebraic identity — `x op identity` = x → both tokens vanish.
+                    // (These rarely fire on hand-written source, but post-inline
+                    // const-prop turns a runtime operand into a literal 0/1/-1.)
+                    if matches!(
+                        (op, k),
+                        (Bin::Add, 0) | (Bin::Sub, 0) | (Bin::Or, 0) | (Bin::Xor, 0)
+                            | (Bin::Mul, 1) | (Bin::And, -1)
+                    ) {
+                        m.identities += 1;
+                        continue;
+                    }
+                    // absorbing — `x op k` = k, consuming x → Drop, Lit(k). (x is not a
+                    // literal here; that case already const-folded above.)
+                    if matches!((op, k), (Bin::Mul, 0) | (Bin::And, 0) | (Bin::Or, -1)) {
+                        out.push(Tok::Stk(Stk::Drop));
+                        out.push(Tok::Lit(k));
+                        m.identities += 1;
+                        continue;
+                    }
                     // immediate-immediate chaining: a preceding same-op immediate
                     // absorbs this one. `(x op k1) op k2 = x op (k1∘k2)`; for + and
                     // - the magnitudes add (x-k1-k2 = x-(k1+k2)), the rest use op.
@@ -374,6 +395,25 @@ pub fn reduce(toks: &[Tok], m: &mut Metrics) -> Vec<Tok> {
                 // dup-fuse: ... Dup, Bin -> DupBin(op)
                 if let Some(Tok::Stk(Stk::Dup)) = out.last().copied() {
                     out.pop();
+                    // dup-then-op identities: `dup and`/`dup or` = the value (no-op);
+                    // `dup -`/`dup xor` = 0 (consume the value, push 0).
+                    match op {
+                        Bin::And | Bin::Or => {
+                            m.identities += 1;
+                            continue;
+                        }
+                        Bin::Sub | Bin::Xor => {
+                            if matches!(out.last(), Some(Tok::Lit(_))) {
+                                out.pop(); // `lit dup -` = 0 — the literal is dead
+                            } else {
+                                out.push(Tok::Stk(Stk::Drop));
+                            }
+                            out.push(Tok::Lit(0));
+                            m.identities += 1;
+                            continue;
+                        }
+                        _ => {}
+                    }
                     out.push(Tok::DupBin(op));
                     m.dup_fuses += 1;
                     continue;
@@ -674,6 +714,14 @@ impl<'a> Low<'a> {
 
     /// `add_imm`/`sub_imm` of a single operand by constant `k` (Add/Sub only).
     fn imm_bin_to(&mut self, operand: Loc, op: Bin, k: i64) -> Option<u32> {
+        // strength reduction: x * 2^k → x << k. (x*1 / x*0 are removed by the
+        // identity table, so k here is a positive power of two ≥ 2.)
+        if op == Bin::Mul && k > 1 && (k as u64).is_power_of_two() {
+            let sh = (k as u64).trailing_zeros();
+            let r = self.to_reg(operand);
+            self.out.push(lsl_imm(r, r, sh));
+            return Some(r);
+        }
         let (add, imm) = match op {
             Bin::Add if (0..=4095).contains(&k) => (true, k as u32),
             Bin::Add if (-4095..0).contains(&k) => (false, (-k) as u32),

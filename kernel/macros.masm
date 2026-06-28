@@ -155,3 +155,33 @@
     bl      &target
     ldr     x30, [sp], #16          ; restore LR
 @endmacro
+
+; ── division guards ─────────────────────────────────────────────────────
+; AArch64 `sdiv`/`udiv` do NOT trap: x/0 → 0 and INT_MIN/-1 → INT_MIN, both
+; silently. WF66's x86 `idiv` raised #DE on exactly those. Match the intent with a
+; recoverable Forth THROW: ÷0 → -10 (division by zero), signed INT_MIN/-1 → -11
+; (result out of range). Expand ONCE per proc (the .local labels mangle per scope).
+;   guard_div_full : x9 = dividend, TOS = divisor — guards ÷0 AND INT_MIN/-1.
+;   guard_div_zero : TOS = divisor — guards ÷0 only (double-dividend / unsigned).
+@macro guard_div_full()
+    cbz     TOS, .div_zero
+    cmn     TOS, #1                ; divisor == -1 ?
+    b.ne    .div_ok
+    mov     x14, #1
+    lsl     x14, x14, #63          ; x14 = INT_MIN (0x8000…0)
+    cmp     x9, x14
+    b.ne    .div_ok
+    mov     TOS, #-11              ; INT_MIN / -1 overflows → out of range
+    b       throw_word
+.div_zero:
+    mov     TOS, #-10              ; division by zero
+    b       throw_word
+.div_ok:
+@endmacro
+
+@macro guard_div_zero()
+    cbnz    TOS, .div_ok           ; divisor != 0 → proceed
+    mov     TOS, #-10
+    b       throw_word
+.div_ok:
+@endmacro

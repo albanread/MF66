@@ -27,12 +27,13 @@ fn main() {
     // Load any files given on the command line (whole-file, so multi-line
     // definitions work), before dropping into the REPL.
     let mut exit_after = false;
+    let mut had_error = false;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
             "-e" | "--eval" => {
                 let src = args.next().unwrap_or_default();
-                feed(&mut s, &src, "-e");
+                had_error |= !feed(&mut s, &src, "-e");
                 exit_after = true;
             }
             "-h" | "--help" => {
@@ -40,13 +41,20 @@ fn main() {
                 return;
             }
             path => match std::fs::read_to_string(path) {
-                Ok(src) => feed(&mut s, &src, path),
-                Err(e) => eprintln!("mf66: cannot read {path}: {e}"),
+                Ok(src) => had_error |= !feed(&mut s, &src, path),
+                Err(e) => {
+                    println!("{path}:1: error: cannot read file: {e}");
+                    had_error = true;
+                }
             },
         }
         if s.wants_bye() {
             return;
         }
+    }
+    if had_error {
+        io::stdout().flush().ok();
+        std::process::exit(1); // failed build → IDE jumps to the first error
     }
     if exit_after {
         return;
@@ -80,7 +88,7 @@ fn main() {
                 }
             }
             Err(e) => {
-                println!(" ✗ {e}");
+                println!(" ✗ {e:#}"); // {:#} flattens the cause chain (e.g. "execute /: division by zero")
                 s.reset_input(); // recover: drop any half-built definition
             }
         }
@@ -93,16 +101,29 @@ fn main() {
     }
 }
 
-/// Feed a whole source string (a loaded file or `-e` argument) to the session,
-/// reporting any error without aborting.
-fn feed(s: &mut Mf66Session, src: &str, what: &str) {
-    match s.eval_out(src) {
-        Ok(out) => print!("{out}"),
-        Err(e) => {
-            eprintln!("mf66: {what}: {e}");
-            s.reset_input();
+/// Feed a source string (a loaded file or `-e` argument) to the session, one line
+/// at a time so an error can be pinned to its line. The first error is reported in
+/// the `name:LINE: error: msg` form the IDE's error-marker parses (it jumps to and
+/// reddens that line), then feeding stops — like a file loader aborting.
+/// Line-by-line matches how the interactive REPL feeds input (multi-line `:`
+/// definitions still work: compile state persists across lines).
+/// Returns `false` if a line errored (the caller exits non-zero so the IDE treats
+/// it as a failed build, jumps to the first error, and reddens the line).
+fn feed(s: &mut Mf66Session, src: &str, what: &str) -> bool {
+    for (i, line) in src.lines().enumerate() {
+        match s.eval_out(line) {
+            Ok(out) => print!("{out}"),
+            Err(e) => {
+                println!("{what}:{}: error: {e:#}", i + 1);
+                s.reset_input();
+                return false;
+            }
+        }
+        if s.wants_bye() {
+            return true;
         }
     }
+    true
 }
 
 fn is_tty() -> bool {

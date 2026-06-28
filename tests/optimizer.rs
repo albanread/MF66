@@ -39,6 +39,31 @@ fn optimized_arithmetic_is_correct() {
 }
 
 #[test]
+fn algebraic_identities_collapse() {
+    let mut s = Mf66Session::new().unwrap();
+    assert_eq!(s.eval_out(": a 0 + ; 5 a .").unwrap(), "5 "); // x + 0 = x
+    assert_eq!(s.eval_out(": b 1 * ; 5 b .").unwrap(), "5 "); // x * 1 = x
+    assert_eq!(s.eval_out(": c 0 * ; 9 c .").unwrap(), "0 "); // x * 0 = 0
+    assert_eq!(s.eval_out(": d -1 and ; 7 d .").unwrap(), "7 "); // x and -1 = x
+    assert_eq!(s.eval_out(": e dup xor ; 6 e .").unwrap(), "0 "); // x xor x = 0
+    assert_eq!(s.eval_out(": g dup and ; 6 g .").unwrap(), "6 "); // x and x = x
+    // `0 +` collapses to nothing — the body is empty (just the colon frame).
+    s.eval(": id 0 + 0 + ;").unwrap();
+    assert!(s.last_body_words() <= 4, "0 + 0 + should vanish");
+}
+
+#[test]
+fn multiply_by_power_of_two_is_a_shift() {
+    let mut s = Mf66Session::new().unwrap();
+    assert_eq!(s.eval_out(": x8 8 * ; 5 x8 .").unwrap(), "40 ");
+    assert_eq!(s.eval_out(": k 1024 * ; 3 k .").unwrap(), "3072 ");
+    assert_eq!(s.eval_out("-5 4 * .").unwrap(), "-20 "); // signed shift
+    // x * 16 should lower to a single lsl, not movz-16 + mul
+    s.eval(": m 16 * ;").unwrap();
+    assert!(s.last_body_words() <= 10, "x*16 should be one lsl, got {}", s.last_body_words());
+}
+
+#[test]
 fn dup_fuse_and_strength_reduce_correct() {
     let mut s = Mf66Session::new().unwrap();
     s.eval(": sq dup * ;").unwrap(); // dup * → mul x0,x0,x0
