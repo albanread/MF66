@@ -1,5 +1,16 @@
 # MF66 — Apple Silicon token-IR optimizing Forth
 
+I always liked the WF32 STC, and this is based on that original code, although it
+has gone through a series of transformations on the way here — notably starting with
+the Windows 64-bit port. For a while WF64 was embedded inside an LLVM macro assembler,
+which carries a huge overhead; eventually we broke free of LLVM, and now we use our own
+macro-assembler. This is still a Forth inside a macro assembler — if you look at the
+macros you will see that traditional Forth. Over time a simple tokenizing optimizer was
+added, and eventually that became the Forth compiler rather than remaining a phase over
+the traditional Forth compiler. Since we still only optimize small straight-line code,
+this does not compare to a real optimizing compiler; it is faster than my previous Forth
+implementations while remaining simple — a really natural evolution from WF32.
+
 MF66 is an **Apple Silicon (macOS arm64)** re-implementation of
 [WF66](https://github.com/albanread/WF66), a token-IR optimizing
 subroutine-threaded Forth. It is JIT-compiled through the **LLVM-free JASM
