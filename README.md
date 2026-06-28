@@ -17,7 +17,7 @@ Silicon:
 |---|---|---|
 | AArch64 encoder + `MAP_JIT` loader | JASM (`a64` + `native_macos`) | ✅ done |
 | GC (`newgc-core`) | MacNCL | reuse |
-| REPL / IDE | MacNCL | reuse |
+| Native Cocoa IDE (`mf66ide`) | `macos_panes_ide` fork | ✅ built |
 | Forth front-end + token-IR reducer | WF66 (`src/wf66`) | reuse |
 
 New work: the AArch64 lowering/`render()` leg of the back-end, the STC kernel
@@ -39,24 +39,37 @@ must survive a settle-barrier `rt_*` call is callee-saved. `x16`/`x17`/`x18` are
 forbidden in any pool (`MacJit` veneers own x16; x18 is Darwin-reserved). Source
 of truth: [`src/abi.rs`](src/abi.rs).
 
-## Status — Phase 2 (boot headless) — in progress
+## Status — a booting optimizing Forth
 
-```
-$ cargo test          # abi / kernel_lint / phase0 / phase1 / corpus
-```
+MF66 boots headless and runs a live REPL — `cargo run --release --bin mf66`, or the
+bundled `MF66.app` IDE. `cargo test` is green: **169 tests across 58 suites**.
 
-The **differential corpus** (`tests/data/direct/`, 150 `.t` files imported from
-WF66 — the day-one oracle) drives a workflow-based per-primitive port: translate
-the WF66 x86 proc → AArch64, adversarially verify it, then the word's `.t` flips
-NYIMP → PASS (PASS = matches WF66's observed behavior). See
-[docs/porting-guide.md](docs/porting-guide.md).
+What works today:
 
-**The full integer / memory / string / number primitive layer is ported and
-differentially verified — corpus 147/150 PASS, 0 FAIL** (161 kernel primitives
-across arith/compare/logic/stack/memory/strings/number/dict). The remaining 3
-need subsystems not yet built: `float_subset`+`fractal_iter` (FP → Phase 4) and
-`self` (oop). Next: the dict/find/number/parse/interpreter substrate that lights
-up a live REPL + the eval corpus.
+- **Interpreter + colon compiler.** Dictionary, number parsing, the full control-flow
+  set (`if/else/then`, `do/loop/+loop`, `begin/until/while/repeat`), `RECURSE`, and a
+  locals frame — all JIT-compiled through the LLVM-free JASM AArch64 backend.
+- **The optimizer.** A token-IR reduce pass (constant + immediate folding, immediate
+  chaining, `dup`-fuse, DCE, stack-op cancellation, an algebraic-identity table, and
+  power-of-two strength reduction → `lsl`), a deferred virtual-stack lowerer with
+  register pinning, and a **terminal tail-call** that turns self-recursion into an
+  O(1)-return-stack loop. See [compiler.md](compiler.md).
+- **Memory + I/O.** `variable`/`create`/`allot`, `@ ! c@ c!`, cell arrays, `. emit ."`.
+- **Floating point.** An FP stack with float literals and `f+ f- f* f/ f** fsqrt fabs f< f.`.
+- **Exceptions.** `catch`/`throw` with a top-level handler, plus recoverable
+  division-by-zero / overflow traps (`THROW -10 / -11`) — see
+  [kernel/exceptions.masm](kernel/exceptions.masm).
+- **Tooling.** Three binaries — `mf66` (REPL), `mf66-tcl` (engine bridge), `mf66-ui` —
+  and a native Cocoa IDE (`mf66ide`) packaged as a self-contained `MF66.app`.
+
+The kernel was ported from WF66's x86 procs primitive-by-primitive against a 150-file
+**differential corpus** (`tests/data/direct/`, the day-one oracle): translate the x86
+proc → AArch64, adversarially verify it, then the word's `.t` flips NYIMP → PASS
+(PASS = matches WF66's observed behavior). The integer / memory / string / number /
+floating-point layers are ported and verified; object dispatch (`self`) is the
+remaining frontier. See [docs/porting-guide.md](docs/porting-guide.md).
+
+Boot milestones — the substrate underneath:
 
 - **Phase 0** — a hand-written AArch64 word assembles through JASM, loads into
   `MAP_JIT` memory, flips W^X, and executes, incl. an AAPCS64 host callback via a
@@ -64,20 +77,19 @@ up a live REPL + the eval corpus.
 - **Phase 1** — the kernel macro library (`kernel/macros.masm`: register homes,
   `proc`/`endp`/`next`, the AArch64 `stk` macro, `aapcs_call`) and `forth_main`
   (callee-saved save/restore, `sp`↔return-stack switch, the wire-format
-  prologue/epilogue) drive real `proc(…)…endp()` primitives — `dup drop swap + 1+`
-  and a host-call word — through `Mf66Session::{push,call,stack}`. A grep gate
-  enforces the x18 / q8–q15 ban.
-
-Next: Phase 2 — boot the kernel headless (the boot-critical primitive subset +
-dictionary + interpreter). See the design doc §8.
+  prologue/epilogue) drive real `proc(…)…endp()` primitives through
+  `Mf66Session::{push,call,stack}`. A grep gate enforces the x18 / q8–q15 ban.
 
 ## Performance
 
-MF66 holds up against optimized native code. On Apple Silicon, across a suite of
-integer / memory workloads (recursive `fib`, Collatz step-sum, Sieve of Eratosthenes,
-a 64-bit LCG), the JIT runs **~2.6× slower than `clang -O2`** and **~22× faster than
-CPython 3.14** (geometric mean) — and on the tight 64-bit LCG inner loop it *matches*
-C (1.02×).
+What makes the numbers interesting is what's *not* underneath them: **no LLVM**.
+`clang` stands on LLVM's decades of optimization passes and register allocation; MF66
+compiles through its own hand-written AArch64 encoder (the JASM `a64` backend) with a
+single token-IR reduce pass and a deferred stack lowerer. Even so, on Apple Silicon
+across a suite of integer / memory workloads (recursive `fib`, Collatz step-sum, Sieve
+of Eratosthenes, a 64-bit LCG), the JIT runs **~2.6× slower than `clang -O2`** and
+**~22× faster than CPython 3.14** (geometric mean) — and on the tight 64-bit LCG inner
+loop it *matches* C (1.02×).
 
 ![MF66 Forth vs C (−O2) vs CPython 3.14 — compute time per benchmark, log scale](bench/benchmarks.svg)
 
