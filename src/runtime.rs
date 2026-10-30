@@ -11,6 +11,16 @@ thread_local! {
     static CAPTURE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Output: to the host's writer when one is set (the BOX prints as it goes),
+/// else to the capture buffer.
+pub fn out(bytes: &[u8]) {
+    if let Some(w) = crate::host::hooks().and_then(|h| h.write) {
+        w(bytes.as_ptr(), bytes.len());
+    } else {
+        CAPTURE.with(|b| b.borrow_mut().extend_from_slice(bytes));
+    }
+}
+
 /// Clear the capture buffer (before an `eval`).
 pub fn capture_clear() {
     CAPTURE.with(|b| b.borrow_mut().clear());
@@ -18,7 +28,7 @@ pub fn capture_clear() {
 
 /// Append a host string to the capture buffer (e.g. the REPL's ` ok`).
 pub fn capture_str(s: &str) {
-    CAPTURE.with(|b| b.borrow_mut().extend_from_slice(s.as_bytes()));
+    out(s.as_bytes());
 }
 
 /// Take the captured output as a string (after an `eval`).
@@ -31,7 +41,7 @@ pub fn capture_take() -> String {
 
 /// `emit ( c -- )` host side: append one byte.
 pub extern "C" fn rt_emit(ch: u64) -> u64 {
-    CAPTURE.with(|b| b.borrow_mut().push(ch as u8));
+    out(&[ch as u8]);
     0
 }
 
@@ -39,7 +49,7 @@ pub extern "C" fn rt_emit(ch: u64) -> u64 {
 pub extern "C" fn rt_type(addr: u64, len: u64) -> u64 {
     if addr != 0 && len > 0 {
         let slice = unsafe { std::slice::from_raw_parts(addr as *const u8, len as usize) };
-        CAPTURE.with(|b| b.borrow_mut().extend_from_slice(slice));
+        out(slice);
     }
     0
 }
@@ -77,7 +87,7 @@ pub extern "C" fn rt_print_int(n: u64, base: u64) -> u64 {
         out.push(' ');
         out
     };
-    CAPTURE.with(|b| b.borrow_mut().extend_from_slice(out.as_bytes()));
+    self::out(out.as_bytes());
     0
 }
 
@@ -438,6 +448,68 @@ pub extern "C" fn rt_resize(addr: u64, u: u64, addr_out: *mut u64) -> u64 {
     }
 }
 
+// ── Keyboard input and system calls (kernel/host.masm) ───────────────────
+// Through the host's hooks (src/host.rs); on the Mac, stdin, and no SWIs.
+
+/// key ( -- c ): one character, -1 at the end of input.
+pub extern "C" fn rt_key() -> u64 {
+    if let Some(k) = crate::host::hooks().and_then(|h| h.key) {
+        return k() as u64;
+    }
+    let mut b = [0u8; 1];
+    match std::io::stdin().read(&mut b) {
+        Ok(1) => b[0] as u64,
+        _ => u64::MAX,
+    }
+}
+
+/// key? ( -- flag )
+pub extern "C" fn rt_key_ready() -> u64 {
+    match crate::host::hooks().and_then(|h| h.key_ready) {
+        Some(k) if k() != 0 => u64::MAX,
+        _ => 0,
+    }
+}
+
+/// accept ( c-addr +n1 -- +n2 ): a line without its terminator.
+pub extern "C" fn rt_accept(addr: u64, max: u64) -> u64 {
+    if addr == 0 || max == 0 || max as i64 <= 0 {
+        return 0;
+    }
+    if let Some(r) = crate::host::hooks().and_then(|h| h.read_line) {
+        let n = r(addr as *mut u8, max as usize);
+        return if n < 0 { 0 } else { n as u64 };
+    }
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return 0;
+    }
+    let bytes = line.trim_end_matches(['\n', '\r']).as_bytes();
+    let n = bytes.len().min(max as usize);
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, n) };
+    n as u64
+}
+
+/// (swi) ( regs n -- err ): regs[0..9] are R0..R9 in and out, regs[10] the
+/// flags out. Without a host: no system calls, an "error" of -1.
+pub extern "C" fn rt_swi(regs: u64, n: u64) -> u64 {
+    match crate::host::hooks().and_then(|h| h.swi) {
+        Some(s) if regs != 0 => {
+            let r = regs as *mut u64;
+            s(n, r, unsafe { r.add(10) })
+        }
+        _ => u64::MAX,
+    }
+}
+
+/// (swi#) ( c-addr u -- n ): -1 if there is no such call.
+pub extern "C" fn rt_swi_number(addr: u64, len: u64) -> u64 {
+    match crate::host::hooks().and_then(|h| h.swi_number) {
+        Some(f) if addr != 0 => f(addr as *const u8, len as usize) as u64,
+        _ => u64::MAX,
+    }
+}
+
 /// The built-in runtime externs every session binds before assembling the
 /// kernel. Names must match the `bl`/`aapcs_call` targets in the kernel.
 pub fn externs() -> Vec<(&'static str, *const ())> {
@@ -479,5 +551,10 @@ pub fn externs() -> Vec<(&'static str, *const ())> {
         ("rt_utime", rt_utime as *const ()),
         ("rt_time_date", rt_time_date as *const ()),
         ("rt_parse_float", rt_parse_float as *const ()),
+        ("rt_key", rt_key as *const ()),
+        ("rt_key_ready", rt_key_ready as *const ()),
+        ("rt_accept", rt_accept as *const ()),
+        ("rt_swi", rt_swi as *const ()),
+        ("rt_swi_number", rt_swi_number as *const ()),
     ]
 }

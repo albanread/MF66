@@ -9,13 +9,16 @@
 //! See `docs/design/mf66-apple-silicon.md` for the full plan and the verified
 //! ABI. This crate is at **Phase 1** (kernel macro library + headless boot path).
 
-#![cfg(target_os = "macos")]
+// macOS on Apple silicon, and Linux AArch64 (the BOX: box/, design/BOX_PORT.md).
+#![cfg(target_arch = "aarch64")]
 
 pub mod abi;
 pub mod aenc;
+#[cfg(target_os = "macos")]
 pub mod crash;
 pub mod asm_macros;
 pub mod codearena;
+pub mod host;
 pub mod jit;
 pub mod opt;
 pub mod primitives;

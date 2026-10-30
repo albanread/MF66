@@ -1,0 +1,49 @@
+; MF66 kernel — host primitives: keyboard input and system calls. Each calls a
+; host rt_* (src/runtime.rs), which uses the embedding host's hooks when it has
+; them (the BOX: OS_ReadC, OS_ReadLine32, the SWIs; src/host.rs) and a plain
+; fallback on the Mac.
+
+; key ( -- c )   wait for a character (-1 at the end of input / Escape)
+proc(key_word)
+    str     TOS, [DSP, #-cell]      ; spill old TOS
+    aapcs_call(rt_key)              ; x0 = c
+    stk(0, 1)
+    next()
+endp()
+
+; key? ( -- flag )   is a character waiting?
+proc(key_q_word)
+    str     TOS, [DSP, #-cell]
+    aapcs_call(rt_key_ready)        ; x0 = 0 / -1
+    stk(0, 1)
+    next()
+endp()
+
+; accept ( c-addr +n1 -- +n2 )   read a line of at most n1 characters
+proc(accept_word)
+    mov     x1, x0                  ; arg1 = n1
+    ldr     x0, [DSP]               ; arg0 = c-addr
+    aapcs_call(rt_accept)           ; x0 = n2
+    stk(2, 1)
+    next()
+endp()
+
+; (swi) ( regs n -- err )   call system call n with R0..R9 = regs[0..9], out
+; again into regs, the flags N Z C V into regs[10] as bits 3..0; err is 0 or
+; the address of the error block (the call is always made in its X form)
+proc(paren_swi)
+    mov     x1, x0                  ; arg1 = n
+    ldr     x0, [DSP]               ; arg0 = regs
+    aapcs_call(rt_swi)              ; x0 = err
+    stk(2, 1)
+    next()
+endp()
+
+; (swi#) ( c-addr u -- n )   a system call's number from its name, or -1
+proc(paren_swi_number)
+    mov     x1, x0                  ; arg1 = u
+    ldr     x0, [DSP]               ; arg0 = c-addr
+    aapcs_call(rt_swi_number)       ; x0 = n
+    stk(2, 1)
+    next()
+endp()
