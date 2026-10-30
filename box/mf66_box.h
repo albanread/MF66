@@ -48,4 +48,12 @@ int mf66_box_eval(const char *p, size_t n, const char *name, size_t namelen);
 int mf66_box_compiling(void);   /* a definition is open */
 void mf66_box_recover(void);    /* after a fault escaped from Forth code */
 
+/* For a console: the data stack (top first), the base, the words known
+ * (newest first, separated by spaces) and a word's stack comment */
+int64_t mf66_box_depth(void);
+int64_t mf66_box_stack(int64_t *out, size_t max);
+int64_t mf66_box_base(void);
+size_t mf66_box_words(uint8_t *buf, size_t max);
+size_t mf66_box_word_help(const uint8_t *name, size_t n, uint8_t *buf, size_t max);
+
 #endif

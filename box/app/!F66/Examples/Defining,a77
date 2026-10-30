@@ -1,0 +1,34 @@
+\ Defining: Forth's way of making new kinds of word.  CREATE makes a word
+\ with data; DOES> gives every word made that way the same behaviour.
+
+\ An array: the word made takes an index and gives the cell's address
+: array ( n "name" -- ) create cells allot  does> ( i -- addr ) swap cells + ;
+10 array squares
+: fill-squares  10 0 do i i * i squares ! loop ;
+: .squares  10 0 do i squares @ . loop cr ;
+
+\ A counter: each use adds one and gives the new count
+: counter ( "name" -- ) create 0 ,  does> ( -- n ) 1 over +! @ ;
+counter visits
+
+\ Units: each unit word multiplies by its own factor
+: unit ( factor "name" -- ) create ,  does> ( n -- n' ) @ * ;
+1 unit mm   10 unit cm   1000 unit m   1000000 unit km
+
+\ A table of execution tokens: a menu of actions by number
+: hello  ." hello" ;   : goodbye  ." goodbye" ;   : thanks  ." thank you" ;
+create actions ' hello , ' goodbye , ' thanks ,
+: do-action ( n -- ) cells actions + @ execute ;
+
+\ A word that makes constants that say their name and value when run
+: .value ( n -- ) ." [value " . ." ] " ;
+: named ( n "name" -- ) create ,  does> ( -- n ) @ dup .value ;
+42 named answer
+
+: defining
+  fill-squares ." squares: " .squares
+  ." visits: " visits . visits . visits . cr
+  ." 3 km 25 m 4 cm in mm: " 3 km 25 m + 4 cm + . cr
+  ." actions: " 3 0 do i do-action space loop cr
+  ." answer: " answer 2 * . cr ;
+defining

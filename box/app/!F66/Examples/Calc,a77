@@ -1,0 +1,50 @@
+\ Calc: a calculator form on the desktop, by the Declaritive module.
+\ Two fields, a button for each operation, the answer below.  Run it as a
+\ task of its own:  *WimpTask F66 <F66$Dir>.Examples.Calc
+\ Events from Declaritive_Dispatch: kind 1 a click (decl-id is the
+\ button), 3 Return in a field, 5 the close icon, 7 Quit.
+include <F66$Dir>.Library.Declaritive
+create msg 300 allot
+create field 64 allot
+0 value win
+0 value done
+
+: spec z" {'type':'window','id':'calc','title':'F66 Calculator','body':{'type':'form','children':[{'type':'input','id':'a','label':'First number','value':'12'},{'type':'input','id':'b','label':'Second number','value':'30'},{'type':'row','label':'Operation','children':[{'type':'button','id':'add','text':' + '},{'type':'button','id':'sub','text':' - '},{'type':'button','id':'mul','text':' * '},{'type':'button','id':'div','text':' / '},{'type':'button','id':'mod','text':'mod'}]},{'type':'text','id':'answer','label':'Answer','text':'Press an operation'},{'type':'row','span':true,'children':[{'type':'spacer'},{'type':'button','id':'quit','text':'Quit'}]}]}}" ;
+
+\ A field's text: Declaritive_Get puts it in R0 as a zero-terminated string
+: get ( z-id -- c-addr u ) >r win r> z" value" 3 swi" Declaritive_Get" sys r0 zcount ;
+\ Text to a number, with an optional minus sign: n and true, or false
+: number ( c-addr u -- n true | false )
+  dup 0= if 2drop 0 exit then
+  over c@ [char] - = dup >r if 1 /string then
+  0 0 2swap >number nip nip if r> 2drop 0 exit then
+  r> if negate then -1 ;
+: answer ( c-addr u -- ) msg zclear msg zappend  win z" answer" z" text" msg decl-set ;
+: show ( n -- ) msg zclear dup 0< if s" -" msg zappend negate then msg zappend#
+  win z" answer" z" text" msg decl-set ;
+: id? ( c-addr u -- f ) decl-id compare 0= ;
+
+: calculate ( xt -- )
+  z" a" get number 0= if drop s" The first field is not a number" answer exit then
+  z" b" get number 0= if 2drop s" The second field is not a number" answer exit then
+  ( xt a b ) rot execute show ;
+: safe/ ( a b -- n ) dup 0= if 2drop s" Cannot divide by zero" answer -1 throw then / ;
+: safe-mod ( a b -- n ) dup 0= if 2drop s" Cannot divide by zero" answer -1 throw then mod ;
+: try ( xt -- ) ['] calculate catch if drop then ;
+
+: click
+  s" add" id? if ['] + try then
+  s" sub" id? if ['] - try then
+  s" mul" id? if ['] * try then
+  s" div" id? if ['] safe/ try then
+  s" mod" id? if ['] safe-mod try then
+  s" quit" id? if 1 to done then ;
+: event ( kind -- )
+  dup 1 = if click then
+  dup 3 = if ['] + try then
+  dup 5 = swap 7 = or if 1 to done then ;
+: calc
+  z" Calculator" decl-init drop  spec decl-create to win
+  begin decl-poll decl-dispatch event done until
+  decl-closedown ;
+calc

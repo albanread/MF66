@@ -1,0 +1,51 @@
+\ RPN: a little calculator with its own stack, an interpreter written in
+\ Forth.  Type numbers and operators separated by spaces: + - * / neg
+\ dup swap drop clear, and . to print the top.  An empty line ends it.
+\ Example:  3 4 + 2 *  .
+
+create stk 32 cells allot   variable sp#   \ the calculator's own stack
+: push ( n -- ) sp# @ 32 < if stk sp# @ cells + ! 1 sp# +! else drop ." full " then ;
+: pop ( -- n ) sp# @ if -1 sp# +! stk sp# @ cells + @ else ." empty " 0 then ;
+: .stack  ." [ " sp# @ 0 ?do stk i cells + @ . loop ." ]" ;
+
+\ The operators: a name and a word, looked up by comparing names
+: binary ( xt -- ) >r pop pop swap r> execute push ;
+: op? ( c-addr u -- f )                      \ runs the operator if it is one
+  2dup s" +" compare 0= if 2drop ['] + binary -1 exit then
+  2dup s" -" compare 0= if 2drop ['] - binary -1 exit then
+  2dup s" *" compare 0= if 2drop ['] * binary -1 exit then
+  2dup s" /" compare 0= if 2drop pop pop swap dup if / push else 2drop ." divide by zero " then -1 exit then
+  2dup s" neg" compare 0= if 2drop pop negate push -1 exit then
+  2dup s" dup" compare 0= if 2drop pop dup push push -1 exit then
+  2dup s" swap" compare 0= if 2drop pop pop swap push push -1 exit then
+  2dup s" drop" compare 0= if 2drop pop drop -1 exit then
+  2dup s" clear" compare 0= if 2drop 0 sp# ! -1 exit then
+  2dup s" ." compare 0= if 2drop pop dup . push -1 exit then
+  2drop 0 ;
+
+\ A number, with an optional minus sign
+: number? ( c-addr u -- n f )
+  dup 0= if 2drop 0 0 exit then
+  over c@ [char] - = dup >r if 1 /string then
+  0 0 2swap >number nip nip 0= swap r> if negate then swap ;
+
+\ One token at a time: skip spaces, take up to the next space
+: token ( c-addr u -- rest-addr rest-u tok-addr tok-u )
+  over >r bl scan over r@ - r> swap ;
+: evaluate-line ( c-addr u -- )
+  begin bl skip dup while
+    token                                     ( rest token )
+    2dup op? 0= if
+      2dup number? if push 2drop else drop ." unknown: " type space then
+    else 2drop then
+  repeat 2drop ;
+
+create input 120 allot
+: rpn
+  ." RPN calculator: an empty line ends it." cr
+  begin
+    ." rpn> " input 120 accept dup
+  while
+    input swap evaluate-line .stack cr
+  repeat drop ." Bye." cr ;
+rpn

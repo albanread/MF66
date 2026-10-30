@@ -1,0 +1,57 @@
+\ Files: write a file, read it back a line at a time, ask OS_File what
+\ the filing system knows of it, and list a directory with OS_GBPB.
+\ The file is made in the scrap directory (<Wimp$ScrapDir>).
+
+: name ( -- c-addr u ) s" <Wimp$ScrapDir>.F66Demo" ;
+0 value fid
+create line 200 allot
+
+\ The ANS file words work on RISC OS files
+: write-demo
+  name w/o create-file throw to fid
+  s" Lines written by F66" fid write-line throw
+  s" through open-file, write-line and close-file," fid write-line throw
+  s" which are OS_Find and OS_GBPB underneath." fid write-line throw
+  fid close-file throw ;
+: read-demo
+  name r/o open-file throw to fid
+  1 begin
+    line 200 fid read-line throw
+  while
+    over . line swap type cr 1+
+  repeat 2drop
+  fid close-file throw ;
+
+\ OS_File 17 reads an object's catalogue information.  A typed file's
+\ load address is &FFFtttdd: its file type is the ttt
+create zname 256 allot
+: >z ( c-addr u -- z ) zname swap 2dup + >r move 0 r> c! zname ;
+: info
+  17 name >z 2 swi" OS_File" sys
+  ." object type " r0 . ." length " r4 . ." bytes"
+  r2 $FFF00000 and $FFF00000 = if ."  file type &" base @ hex r2 8 rshift $FFF and . base ! then cr ;
+: set-type  18 name >z $FFF 3 swi" OS_File" sys ;   \ OS_File 18: the type, Text (&FFF)
+
+\ OS_GBPB 10 reads a directory's entries a few at a time: for each, the
+\ load and exec addresses, length, attributes and object type, then the
+\ name, each entry starting on a word boundary
+create entries 1024 allot
+: entry-name ( a -- z ) 20 + ;
+: next-entry ( a -- a' ) entry-name zcount + 1+ 3 + -4 and ;
+: .entry ( a -- )
+  dup entry-name zcount tuck type 20 swap - 1 max spaces
+  dup 16 + L@ 2 = if ." directory" else dup 8 + L@ . ." bytes" then drop cr ;
+: list ( z-dir -- )
+  0 begin                                     ( dir offset )
+    >r 10 over entries 8 r> 1024 0 7 swi" OS_GBPB" sys
+    entries r3 0 ?do dup .entry next-entry loop drop
+    r4 dup -1 s>32 =
+  until 2drop ;
+
+: files
+  write-demo  set-type
+  ." Read back:" cr read-demo
+  ." OS_File says: " info
+  ." The examples beside this one:" cr
+  z" <F66$Dir>.Examples" list ;
+files

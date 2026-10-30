@@ -32,7 +32,8 @@ echo "link: libmf66-box.a"
 unwind="$(rustc --print sysroot)/lib/rustlib/$target/lib/self-contained/libunwind.a"
 "$LLD" -r -o "$out/obj/mf66_all.o" --whole-archive "$lib" --no-whole-archive "$unwind"
 printf '%s\n' mf66_box_set_hooks mf66_box_boot mf66_box_end mf66_box_running \
-    mf66_box_line mf66_box_eval mf66_box_compiling mf66_box_recover >"$out/obj/exports.txt"
+    mf66_box_line mf66_box_eval mf66_box_compiling mf66_box_recover \
+    mf66_box_depth mf66_box_stack mf66_box_base mf66_box_words mf66_box_word_help >"$out/obj/exports.txt"
 "$OBJCOPY" --strip-debug --keep-global-symbols="$out/obj/exports.txt" \
     "$out/obj/mf66_all.o" "$out/obj/mf66_box.o"
 rm -f "$out/libmf66-box.a" "$out/obj/mf66_all.o"

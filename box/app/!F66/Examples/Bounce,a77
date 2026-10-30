@@ -1,0 +1,47 @@
+\ Bounce: a small animation.  A ball bounces inside a box; its position
+\ is printed at the top of the screen with VDU 31 (text at a column and
+\ row) and VDU 17 (text colour).  Any key stops it.
+\ Run it from the command line (F12):  *F66 <F66$Dir>.Examples.Bounce
+
+: vdu ( c -- ) 1 0 sys ;
+: plot ( k x y -- ) 3 swi" OS_Plot" sys ;
+: move-to ( x y -- ) 4 -rot plot ;
+: >bgr ( rgb -- bgr0 ) dup $ff and 24 lshift  over $ff00 and 8 lshift or  swap $ff0000 and 8 rshift or ;
+: colour ( rgb -- ) >bgr 0 0 0 0 5 swi" ColourTrans_SetGCOL" sys ;
+: rect ( x0 y0 x1 y1 -- ) 2swap move-to 101 -rot plot ;
+: disc ( x y r -- ) >r 2dup move-to swap r> + swap 157 -rot plot ;
+: at ( col row -- ) 31 vdu swap vdu vdu ;            \ VDU 31,x,y
+: ink ( n -- ) 17 vdu vdu ;                           \ VDU 17,n
+: .n ( n -- ) s>d <# # # # # #> type ;              \ four digits
+
+\ The box, the ball and its speed, all in OS units
+200 constant left   1000 constant right
+200 constant bottom  700 constant top
+24 constant rad
+variable x  variable y  variable dx  variable dy
+: start  400 x !  500 y !  14 dx !  9 dy ! ;
+: ball ( rgb -- ) colour x @ y @ rad disc ;
+variable lo  variable hi
+: bounce ( pos speed lo hi -- )            \ turns a speed round at a wall
+  hi ! lo !
+  over @ over @ +                          ( pos speed next )
+  dup lo @ rad + <  swap hi @ rad - >  or
+  if dup @ negate swap ! else drop then drop ;
+: step
+  $000020 ball                                     \ rub out the old ball
+  x dx left right bounce  y dy bottom top bounce
+  dx @ x +!  dy @ y +!
+  $F0D040 ball ;
+: show ( frame -- ) 2 2 at 3 ink ." frame " .n 7 ink ."   x " x @ .n ."   y " y @ .n ;
+
+: bounce-demo
+  start
+  $000020 colour left rad - bottom rad - right rad + top rad + rect
+  0 begin
+    1+ step dup show
+    20 ms
+    key? over 1500 > or
+  until drop
+  key? if key drop then
+  0 6 at 7 ink ." Done" cr ;
+bounce-demo

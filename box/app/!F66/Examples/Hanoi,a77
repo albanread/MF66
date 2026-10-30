@@ -1,0 +1,70 @@
+\ Hanoi: the Towers of Hanoi, solved by a recursive word and drawn on the
+\ screen as it goes.  Six discs take 63 moves; Escape stops it.
+\ Run it from the command line (F12):  *F66 <F66$Dir>.Examples.Hanoi
+
+: vdu ( c -- ) 1 0 sys ;
+: plot ( k x y -- ) 3 swi" OS_Plot" sys ;
+: move-to ( x y -- ) 4 -rot plot ;
+: >bgr ( rgb -- bgr0 ) dup $ff and 24 lshift  over $ff00 and 8 lshift or  swap $ff0000 and 8 rshift or ;
+: colour ( rgb -- ) >bgr 0 0 0 0 5 swi" ColourTrans_SetGCOL" sys ;
+: rect ( x0 y0 x1 y1 -- ) 2swap move-to 101 -rot plot ;
+: label ( x y c-addr u -- ) 2swap move-to 5 vdu type 4 vdu ;
+
+6 constant discs
+\ Each peg is a stack of disc sizes: a count, then the discs bottom up
+create pegs 3 discs 1+ * cells allot
+: peg ( n -- addr ) discs 1+ cells * pegs + ;
+: push ( size n -- ) peg dup @ 1+ 2dup swap ! cells + ! ;
+: pop ( n -- size ) peg dup dup @ cells + @ swap -1 swap +! ;
+
+\ Where things are drawn
+: peg-x ( n -- x ) 400 * 300 + ;
+100 constant ground   40 constant thick
+create colours $E04040 , $F09030 , $F0E040 , $50C050 , $4080F0 , $A060E0 ,
+: disc-colour ( size -- rgb ) 1- cells colours + @ ;
+variable bx  variable by  variable bw
+: box ( size level n -- x0 y0 x1 y1 )         \ a disc's rectangle
+  peg-x bx !  thick * ground + by !  25 * 20 + bw !
+  bx @ bw @ -  by @  bx @ bw @ +  by @ thick + 4 - ;
+: stick ( n -- )                              \ a peg, drawn whole
+  $C0A070 colour peg-x dup 6 - ground rot 6 + ground discs 1+ thick * + rect ;
+variable px
+: rub ( size level n -- )                     \ a disc rubbed out, the peg put back
+  dup peg-x px ! box  $203040 colour  2 pick over >r >r rect
+  $C0A070 colour px @ 6 - r> px @ 6 + r> rect ;
+: draw ( size level n -- ) 2 pick disc-colour colour box rect ;
+: scene
+  $203040 colour 0 0 1600 900 rect
+  $806040 colour 100 ground 20 - 1500 ground rect
+  3 0 do i stick loop
+  $FFFFFF colour 100 850 s" Towers of Hanoi in F66" label ;
+
+variable moves
+: count-move  1 moves +!
+  $203040 colour 100 760 700 800 rect
+  $FFFFFF colour 100 795 move-to 5 vdu ." Moves: " moves @ . 4 vdu ;
+
+variable src  variable dst  variable size  variable level
+: shift ( from to -- )                        \ one disc moved, and drawn
+  dst ! src !
+  src @ peg @ 1- level !  src @ pop size !
+  size @ level @ src @ rub
+  dst @ peg @ level !  size @ dst @ push
+  size @ level @ dst @ draw
+  count-move 150 ms ;
+
+\ The recursion: n discs from one peg to another, by way of the third
+: hanoi ( n from to via -- )
+  3 pick 0= if 2drop 2drop exit then
+  2over 2over swap >r >r >r 1- r> r> r> recurse   \ n-1 from "from" to "via"
+  2 pick 2 pick shift                             \ the biggest to "to"
+  rot rot swap >r >r >r 1- r> r> r> recurse ;     \ n-1 from "via" to "to"
+
+: setup
+  3 0 do 0 i peg ! loop  scene
+  discs 0 do discs i - dup 0 push i 0 draw loop ;
+: towers
+  setup 0 moves !
+  discs 0 2 1 hanoi
+  $FFFFFF colour 100 720 s" Done: press a key" label key drop ;
+towers
