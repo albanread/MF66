@@ -1,0 +1,52 @@
+F66 for RISC OS
+===============
+
+F66 is MF66, a token-IR optimizing Forth: each definition is compiled to
+AArch64 machine code as it is read, by JASM's own encoder (no LLVM), and
+runs in the box's own process.  github.com/albanread/MF66.
+
+Running
+-------
+  Double-click !F66      the REPL in a TaskWindow; type bye to leave
+  Double-click a Forth   (filetype &A77) runs it in a TaskWindow
+  *F66 <file>            run a file (command line, TaskWindow, Obey)
+  *F66 -i <file>         run a file, then the REPL
+  *F66 -e "<forth>"      run one line
+  include <file>         load another file (Library.Declaritive, say)
+
+Errors in a file are reported as file:line: error: ...  A fault in Forth
+code (a bad address, say) ends the run with an error; the box goes on.
+Escape stops a program as it prints or calls a SWI.
+
+SWIs
+----
+Forth addresses are RISC OS addresses: here, pad, create'd buffers and
+strings can be given to a SWI as they are.
+
+  regs              ( -- addr )   R0..R9, a cell each, then the flags
+  sys               ( x0 .. xk-1 k n -- )  R0..Rk-1 from the stack, call n;
+                                  an error is printed and THROWn
+  xsys              ( x0 .. xk-1 k n -- err|0 )  the same, but the error
+                                  (V set) is returned: its block, or 0
+  swi / xswi        ( n -- ) / ( n -- err|0 )  with regs as they are
+  r0 .. r9          ( -- x )      a register after the call
+  swi-flags         ( -- addr )   N Z C V as bits 3..0
+  swi" OS_Write0"   ( -- n )      a SWI's number, looked up when compiled
+  s" name" swi#     ( -- n )      the same at run time (-1 if none)
+  z" text"          ( -- c-addr ) a zero-terminated string
+  zcount  .error    ( c-addr -- c-addr u ) and ( err -- ) print an error
+  s>32 32>s         registers are 32 bits; they come back zero-extended
+
+  : hello  z" Hello" 1 swi" OS_Write0" sys ;
+  : ticks  0 swi" OS_ReadMonotonicTime" sys r0 ;
+
+Files are RISC OS files (open-file and the rest); allocate gives RMA
+memory; key, key? and accept read the keyboard.
+
+Examples
+--------
+  Hello     printing and SWIs
+  SWIs      by name and number, the X form, flags, a buffer
+  Sieve     primes below 1 000 000, timed
+  Greeter   a desktop window from JSON, by the Declaritive module
+            (include <F66$Dir>.Library.Declaritive)

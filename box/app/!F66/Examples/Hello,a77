@@ -1,0 +1,6 @@
+\ Hello: printing, and a SWI or two
+." Hello from F66, the optimizing Forth" cr
+: squares ( n -- ) 1+ 1 do i i * . loop ;
+10 squares cr
+: hello-swi  z" Hello from OS_Write0" 1 swi" OS_Write0" sys  0 swi" OS_NewLine" sys ;
+hello-swi

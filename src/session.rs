@@ -1093,6 +1093,19 @@ impl Mf66Session {
                 }
                 continue;
             }
+            // include NAME — interpret a source file, line by line.
+            if lk == "include" {
+                let name = scan_word(b, &mut pos)
+                    .ok_or_else(|| anyhow::anyhow!("`include` needs a file name"))?
+                    .to_string();
+                let text = crate::runtime::read_whole(&name)
+                    .map_err(|e| anyhow::anyhow!("include {name}: {e}"))?;
+                for (i, line) in text.lines().enumerate() {
+                    self.eval(line)
+                        .map_err(|e| anyhow::anyhow!("{name}:{}: {e:#}", i + 1))?;
+                }
+                continue;
+            }
             // For system calls (the BOX, design/BOX_PORT.md):
             //   z" ccc"     ( -- c-addr )  a zero-terminated string literal
             //   swi" name"  ( -- n )       a SWI's number, looked up now

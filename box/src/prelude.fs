@@ -16,7 +16,7 @@ create regs 11 cells allot
 : swi# ( c-addr u -- n ) (swi#) ;
 : xswi ( n -- err|0 ) regs swap (swi) ;
 : zcount ( c-addr -- c-addr u ) 0 begin 2dup + c@ while 1+ repeat ;
-: .error ( err -- ) cell+ zcount type ;
+: .error ( err -- ) 4 + zcount type ;  \ past the error number
 : swi ( n -- ) xswi ?dup if cr .error cr -2 throw then ;
 : >regs ( x0 .. xk-1 k -- ) regs 10 cells 0 fill  dup 0 ?do dup i - pick regs i cells + ! loop  0 ?do drop loop ;
 : sys ( x0 .. xk-1 k n -- ) >r >regs r> swi ;

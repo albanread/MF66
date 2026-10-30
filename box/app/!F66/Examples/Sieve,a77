@@ -1,0 +1,14 @@
+\ Sieve: the primes below 1 000 000, timed by OS_ReadMonotonicTime
+1000000 constant n
+create flags n allot
+: ticks ( -- cs ) 0 swi" OS_ReadMonotonicTime" sys r0 ;
+: sieve ( -- count )
+  flags n 1 fill  0
+  n 2 do
+    flags i + c@ if
+      1+  i i * n < if  n i i * do 0 flags i + c! j +loop  then
+    then
+  loop ;
+ticks sieve ticks rot - swap
+." Primes below 1 000 000: " . cr
+." Time: " . ." cs" cr

@@ -1,0 +1,21 @@
+\ SWIs: by name and by number, registers in and out, the X form and flags
+\ By name, looked up when the word is compiled:
+: ticks ( -- cs ) 0 swi" OS_ReadMonotonicTime" sys r0 ;
+." Monotonic time: " ticks . ." cs" cr
+\ By number (OS_WriteC is 0), and at run time by name:
+: stars ( n -- ) 0 do [char] * 1 0 sys loop ;
+20 stars cr
+." OS_Write0 is SWI number " s" OS_Write0" swi# . cr
+\ A buffer is Forth data, already in RISC OS memory:
+create buf 256 allot
+: var ( z-name -- c-addr u ) buf 255 0 3 5 swi" OS_ReadVarVal" sys buf r2 ;
+." Sys$Time is " z" Sys$Time" var type cr
+\ The X form: an error comes back (V set) instead of stopping the program
+: try ( z-name -- ) buf 255 0 3 5 swi" XOS_ReadVarVal" xsys
+  ?dup if ." error: " .error ."  (flags " swi-flags @ . ." )" else buf r2 type then cr ;
+z" F66$NotThere" try
+\ OS_Byte 135 gives the screen mode in R2
+: mode ( -- n ) 135 0 0 3 swi" OS_Byte" sys r2 ;
+." Screen mode: " mode . cr
+\ Registers are 32 bits: 32>s gives a signed value back
+." -1 through a register: " -1 1 swi" OS_ReadMonotonicTime" sys -1 s>32 dup . ." is " 32>s . cr

@@ -1,0 +1,3 @@
+| !Run for !F66: the REPL in a TaskWindow, or run the file given
+/<Obey$Dir>.!Boot
+If "%*0" = "" Then TaskWindow "F66" -name F66 -wimpslot 64K Else TaskWindow "F66 %*0" -name F66 -wimpslot 64K
