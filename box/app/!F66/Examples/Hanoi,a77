@@ -1,5 +1,5 @@
 \ Hanoi: the Towers of Hanoi, solved by a recursive word and drawn on the
-\ screen as it goes.  Six discs take 63 moves; Escape stops it.
+\ screen as it goes.  Six discs take 63 moves, about 20 seconds; Escape stops it.
 \ Run it from the command line (F12):  *F66 <F66$Dir>.Examples.Hanoi
 
 : vdu ( c -- ) 1 0 sys ;
@@ -51,7 +51,7 @@ variable src  variable dst  variable size  variable level
   size @ level @ src @ rub
   dst @ peg @ level !  size @ dst @ push
   size @ level @ dst @ draw
-  count-move 150 ms ;
+  count-move 300 ms ;
 
 \ The recursion: n discs from one peg to another, by way of the third
 : hanoi ( n from to via -- )

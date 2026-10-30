@@ -282,3 +282,31 @@ link, since `/init` has none; everything but `mf66_box_*` is local.
 - MF66's own test suite on the Mac: all pass but `ans_core` (it reads
   WF66's tester from a path not on this Mac) and `phase0_data_stack_idiom`
   (it clobbers x19 without saving it; it failed before this port too).
+
+## 8. The console (30 Oct 2026)
+
+Double-clicking !F66 opens the console, `*F66 -console [<file>]`: a Wimp
+task inside the module (A7232ToolChain branch `forth-console`,
+rosgd/modules/forth/forthcon.c), on the pattern of FasterBASIC's editor
+(modules/fasterbasic/fbedit.c): one window drawn with ColourTrans
+rectangles and Font_Paint (Corpus.Medium), its extent its visible area.
+The output scrolls (Scroll_Request), the input line has editing, history
+and Tab completion, the Words list is at the side and the data stack in
+the status line; a file dropped on the window or the icon bar icon is
+included; the menu has Help on word, Clear, Reset and Quit.
+
+forth.c runs the console's lines (`forth_con_boot`, `_line`, `_end`) under
+the same fault escape as `*F66`, with a `forth_sink` in place of the VDU
+and the keyboard: output into the window (redrawn every 5 cs while a word
+runs), key and accept from it (Wimp_Poll loops of their own), Escape by
+INKEY(-113) since the Wimp keeps the key from being an escape condition,
+and `ms` by Wimp_PollIdle so the desktop goes on.  The library has one
+session, so `*F66` is refused while the console is open.
+
+The library gives the console (box/src/lib.rs, mf66_box.h):
+`mf66_box_depth`, `_stack` (top first), `_base`, `_words` (newest first:
+the words programs defined, found by reading their source as it is given,
+included files too; then the prelude's and the kernel's) and `_word_help`
+(the stack comment written after a colon definition's name, or one from a
+table of the kernel's common words).  The self-test (boot/selftest_forth.c)
+runs lines through the console's code without a window.

@@ -21,23 +21,25 @@
 : disc ( x y r -- ) >r 2dup move-to swap r> + swap 157 -rot plot ;
 : triangle ( x0 y0 x1 y1 x2 y2 -- ) 2>r move-to move-to 85 2r> plot ;
 
-\ String art: straight lines whose envelope is a curve
+\ String art: straight lines whose envelope is a curve.  (The loop's index
+\ i is on the return stack, so the size is kept in a variable, not there.)
+variable size
 : fan ( x y size -- )
+  size !
   21 0 do
-    >r 2dup swap r@ i * 20 / + swap move-to     \ along the bottom
-    2dup r@ 20 i - * 20 / + line-to             \ up the left side
-    r>
-  loop drop 2drop ;
+    2dup swap size @ i * 20 / + swap move-to     \ along the bottom
+    2dup size @ 20 i - * 20 / + line-to          \ up the left side
+  loop 2drop ;
 
 : label ( x y c-addr u -- ) 2swap move-to 5 vdu type 4 vdu ;   \ VDU 5: text at the graphics cursor
 
 : shapes
   $102040 colour  0 0 width height rect          \ the background
   $3060C0 colour  100 100 500 400 rect
-  $F0C020 colour  700 150 200 disc
-  $FFFFFF colour  700 150 220 circle
+  $F0C020 colour  750 350 200 disc
+  $FFFFFF colour  750 350 220 circle
   $40C060 colour  1000 100 1400 100 1200 450 triangle
-  $E04060 colour  100 500 400 fan
+  $E04060 colour  100 600 500 fan
   $FFFFFF colour  100 height 100 - s" Shapes from F66: rectangles, discs, circles, a triangle and lines" label
   ." Press a key" cr key drop ;
 shapes
