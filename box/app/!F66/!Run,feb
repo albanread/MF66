@@ -1,3 +1,4 @@
-| !Run for !F66: the REPL in a TaskWindow, or run the file given
+| !Run for !F66: the REPL in a TaskWindow (closed at bye), or run the file
+| given (the window kept, so its output can be read)
 /<Obey$Dir>.!Boot
-If "%*0" = "" Then TaskWindow "F66" -name F66 -wimpslot 64K Else TaskWindow "F66 %*0" -name F66 -wimpslot 64K
+If "%*0" = "" Then TaskWindow "F66" -name F66 -wimpslot 64K -quit Else TaskWindow "F66 %*0" -name F66 -wimpslot 64K

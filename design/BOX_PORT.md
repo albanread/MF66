@@ -212,3 +212,73 @@ are shared, the x86-64 kernel and lowering are WF66's. It needs:
 Until then the Intel ROM has the module without the library and `*F66`
 says it needs the Arm box. No Intel emulation is run on this Mac, so
 that work is proved on the Intel box's own build host.
+
+## 7. As built (30 Oct 2026)
+
+Branches: this repository's `cli/forth-box`; JASM's `box-linux-jit`
+(worktree `src/JASM-box-linux`, on top of JASM's `macos-arm64`, which has
+the lexer fix MF66's kernel needs, f3efa55: origin/main does not);
+A7232ToolChain's `forth` (worktree `src/A7232ToolChain-forth`, on top of
+`fasterbasic`).
+
+**Build.** `sh box/build.sh` (seconds) makes
+`BOX/caches/mf66/out-aarch64/libmf66-box.a` (16 MB, unstripped of code,
+debug information dropped) and `mf66_box.h`. The Makefile finds it there
+(`MF66_GUEST`), links it into `/init` and builds `modules/forth` with
+`ROSGD_HAVE_MF66`; `make usershare` copies `box/app/!F66` from the MF66
+checkout beside the toolchain. Rust's own libunwind goes into the partial
+link, since `/init` has none; everything but `mf66_box_*` is local.
+
+**What changed from the plan, and what was found.**
+- The kernel has no `immediate`/`postpone`/`parse`, its outer interpreter
+  being Rust: `z"`, `swi"` and `include` are parsing words there
+  (src/session.rs), the rest of the SWI words are a Forth prelude
+  (box/src/prelude.fs) on two kernel primitives, `(swi)` and `(swi#)`.
+- The register block is eleven cells: R0..R9 and the flags.
+- `*F66 -r <file>` replays a file as REPL input (each line echoed, ` ok`
+  or ` compiled`, going on after errors and faults): the REPL's own test,
+  as `*Exec` cannot be used in a headless box that powers off when its
+  command returns.
+- Escape is seen as a program prints, calls a SWI, waits in `ms` or reads
+  a key; it ends the run by the same jump as a fault (sigsetjmp in the
+  module), and the session is reset as after a fault.
+- The data region's dynamic area ("F66 Forth", 8 MB) is made at the first
+  run and kept; each boot zeroes it.
+- `!Run` starts the REPL with TaskWindow's `-quit`, so `bye` ends the task
+  and the window closes without asking; a file run keeps its window.
+- Escape at the REPL's prompt (OS_ReadLine32 returns with C set) leaves
+  the REPL, as `bye` does; Escape while Forth code runs stops it and the
+  REPL goes on.
+- A Declaritive program must be its own Wimp task, not inside a
+  TaskWindow: `*WimpTask F66 <F66$Dir>.Examples.Greeter`.
+- The Makefile's `MF66` is the first checkout beside the toolchain with a
+  `box/app` (the main checkout, `src/MF66`, has none until this is merged).
+- MF66's Forth has no `again`; `begin ... 0 until` is the endless loop.
+
+**Proved in the Arm box under QEMU** (slot A, headless):
+- `*F66` on files that print, define and run words (fib 25), and call
+  SWIs by name and number, with a buffer in Forth data space, the X form
+  with V set, and the flags; files written and read back through
+  open-file and the rest; `allocate` below 4 GB; an error with its line; a
+  fault (`0 @`) ending the run with "signal 11" and the next run normal.
+- `tools/build-arm-mac.sh --check`: 4 of 2022 checks failed, the known four
+  (three share checks, one MimeMap); the fourteen F66 checks
+  (`boot/selftest_forth.c`) pass.
+- In the desktop (deskdrive on `box/deskbox.sh`, the built user share):
+  `!F66` and the &A77 file with their icons; double-clicking `!F66` gives
+  the REPL in a TaskWindow (a definition, a SWI, an error, a fault, then
+  `include <F66$Dir>.Examples.Sieve`: 78498 primes in 1 cs); `bye`;
+  double-clicking a Forth file runs it in a TaskWindow; Greeter's
+  Declaritive window, its live input and tick, and Quit; Escape stopping a
+  loop with the REPL going on.
+
+**Left.**
+- The Intel box (section 6): WF66 on a Linux x86-64 loader with System V
+  calls. Its ROM has the module as a stub.
+- A Forth editor in the desktop (FasterBASIC has one); for now `!F66` is a
+  TaskWindow REPL and files are edited in StrongED or Edit.
+- `key`/`key?` are not used by any example yet and are proved only by
+  building; `ms` likewise.
+- MF66's own test suite on the Mac: all pass but `ans_core` (it reads
+  WF66's tester from a path not on this Mac) and `phase0_data_stack_idiom`
+  (it clobbers x19 without saving it; it failed before this port too).
