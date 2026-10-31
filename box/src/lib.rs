@@ -105,7 +105,9 @@ pub extern "C" fn mf66_box_line(p: *const u8, n: usize) -> i32 {
         let Some(s) = session() else { return -1 };
         let line = bytes(p, n);
         note_definitions(line);
-        match s.eval(line) {
+        // if, do and the rest outside a definition, as WF66 (f66-host's wrap)
+        let line = host::wrap::wrap_source(line, s.compiling());
+        match s.eval(&line) {
             Ok(()) => {
                 if s.wants_bye() {
                     1
@@ -133,7 +135,8 @@ pub extern "C" fn mf66_box_eval(p: *const u8, n: usize, name: *const u8, nlen: u
         let src = bytes(p, n).to_string();
         note_definitions(&src);
         for (i, line) in src.lines().enumerate() {
-            if let Err(e) = s.eval(line) {
+            let line = host::wrap::wrap_source(line, s.compiling());
+            if let Err(e) = s.eval(&line) {
                 say(&format!("\n{name}:{}: error: {e:#}\n", i + 1));
                 s.reset_input();
                 return -1;

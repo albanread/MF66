@@ -1101,7 +1101,9 @@ impl Mf66Session {
                 let text = crate::runtime::read_whole(&name)
                     .map_err(|e| anyhow::anyhow!("include {name}: {e}"))?;
                 for (i, line) in text.lines().enumerate() {
-                    self.eval(line)
+                    // if, do and the rest outside a definition (f66-host's wrap)
+                    let line = f66_host::wrap::wrap_source(line, self.compiling());
+                    self.eval(&line)
                         .map_err(|e| anyhow::anyhow!("{name}:{}: {e:#}", i + 1))?;
                 }
                 continue;

@@ -9,6 +9,7 @@
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub mod console;
+pub mod wrap;
 
 /// What a host may supply. Strings are (pointer, length); nothing is kept.
 #[repr(C)]
