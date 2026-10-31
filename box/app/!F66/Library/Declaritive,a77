@@ -1,0 +1,26 @@
+\ Declaritive for F66: desktop windows described in JSON (the Declaritive
+\ module).  include <F66$Dir>.Library.Declaritive
+\
+\   z" Name" decl-init drop          a Wimp task, Declaritive's own poll mask
+\   z" {...}" decl-create value win  a window from JSON
+\   begin decl-poll decl-dispatch    kind: 1 click, 2 change, 9 tick,
+\     ... decl-id decl-value         5 or 7 closed
+\   until  decl-closedown
+\   win z" id" z" property" z" value" decl-set
+create pollblk 256 allot
+variable decl-mask  variable decl-pw  variable decl-next
+: r8 ( -- x ) regs 8 cells + @ ;
+: r9 ( -- x ) regs 9 cells + @ ;
+: zstr ( a -- c-addr u ) ?dup if zcount else 0 0 then ;
+: decl-init ( z-name -- task ) 1 swap 2 swi" Declaritive_Initialise" sys r1 decl-mask ! r2 decl-pw ! 0 decl-next ! r0 ;
+: decl-create ( z-json -- win ) 0 swap 2 swi" Declaritive_Create" sys r0 ;
+: decl-set ( win z-id z-prop z-value -- ) 4 swi" Declaritive_Set" sys ;
+: decl-poll ( -- reason ) decl-next @ if decl-mask @ pollblk decl-next @ decl-pw @ 4 swi" Wimp_PollIdle" sys else decl-mask @ pollblk 0 decl-pw @ 4 swi" Wimp_Poll" sys then r0 ;
+: decl-dispatch ( reason -- kind ) pollblk 2 swi" Declaritive_Dispatch" sys r7 decl-mask ! r8 decl-next ! r0 ;
+: decl-id ( -- c-addr u ) r3 zstr ;
+: decl-value ( -- c-addr u ) r4 zstr ;
+: decl-closedown ( -- ) 0 swi" Declaritive_CloseDown" sys ;
+\ Building strings: a zero-terminated buffer, appended to
+: zclear ( zbuf -- ) 0 swap c! ;
+: zappend ( c-addr u zbuf -- ) zcount + swap 2dup + >r move 0 r> c! ;
+: zappend# ( n zbuf -- ) >r s>d <# #s #> r> zappend ;

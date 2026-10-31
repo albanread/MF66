@@ -1,0 +1,45 @@
+\ Shapes: drawing with OS_Plot, in the screen mode as it is.
+\ Graphics go to the screen, not a window: run it from the command line
+\ (press F12 in the desktop):  *F66 <F66$Dir>.Examples.Shapes
+\ Coordinates are OS units with (0,0) at the bottom left of the screen.
+
+: vdu ( c -- ) 1 0 sys ;                     \ OS_WriteC is SWI 0
+: plot ( k x y -- ) 3 swi" OS_Plot" sys ;
+: move-to ( x y -- ) 4 -rot plot ;
+: line-to ( x y -- ) 5 -rot plot ;
+\ ColourTrans takes a colour as &BBGGRR00; we write &RRGGBB
+: >bgr ( rgb -- bgr0 ) dup $ff and 24 lshift  over $ff00 and 8 lshift or  swap $ff0000 and 8 rshift or ;
+: colour ( rgb -- ) >bgr 0 0 0 0 5 swi" ColourTrans_SetGCOL" sys ;
+\ The screen's size: OS_ReadModeVariable 11/12 are the last pixel, 4/5
+\ the shifts from pixels to OS units
+: mode-var ( n -- x ) -1 swap 2 swi" OS_ReadModeVariable" sys r2 ;
+: width ( -- os ) 11 mode-var 1+ 4 mode-var lshift ;
+: height ( -- os ) 12 mode-var 1+ 5 mode-var lshift ;
+
+: rect ( x0 y0 x1 y1 -- ) 2swap move-to 101 -rot plot ;   \ filled
+: circle ( x y r -- ) >r 2dup move-to swap r> + swap 149 -rot plot ;
+: disc ( x y r -- ) >r 2dup move-to swap r> + swap 157 -rot plot ;
+: triangle ( x0 y0 x1 y1 x2 y2 -- ) 2>r move-to move-to 85 2r> plot ;
+
+\ String art: straight lines whose envelope is a curve.  (The loop's index
+\ i is on the return stack, so the size is kept in a variable, not there.)
+variable size
+: fan ( x y size -- )
+  size !
+  21 0 do
+    2dup swap size @ i * 20 / + swap move-to     \ along the bottom
+    2dup size @ 20 i - * 20 / + line-to          \ up the left side
+  loop 2drop ;
+
+: label ( x y c-addr u -- ) 2swap move-to 5 vdu type 4 vdu ;   \ VDU 5: text at the graphics cursor
+
+: shapes
+  $102040 colour  0 0 width height rect          \ the background
+  $3060C0 colour  100 100 500 400 rect
+  $F0C020 colour  750 350 200 disc
+  $FFFFFF colour  750 350 220 circle
+  $40C060 colour  1000 100 1400 100 1200 450 triangle
+  $E04060 colour  100 600 500 fan
+  $FFFFFF colour  100 height 100 - s" Shapes from F66: rectangles, discs, circles, a triangle and lines" label
+  ." Press a key" cr key drop ;
+shapes

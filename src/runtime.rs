@@ -11,6 +11,16 @@ thread_local! {
     static CAPTURE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Output: to the host's writer when one is set (the BOX prints as it goes),
+/// else to the capture buffer.
+pub fn out(bytes: &[u8]) {
+    if let Some(w) = crate::host::hooks().and_then(|h| h.write) {
+        w(bytes.as_ptr(), bytes.len());
+    } else {
+        CAPTURE.with(|b| b.borrow_mut().extend_from_slice(bytes));
+    }
+}
+
 /// Clear the capture buffer (before an `eval`).
 pub fn capture_clear() {
     CAPTURE.with(|b| b.borrow_mut().clear());
@@ -18,7 +28,7 @@ pub fn capture_clear() {
 
 /// Append a host string to the capture buffer (e.g. the REPL's ` ok`).
 pub fn capture_str(s: &str) {
-    CAPTURE.with(|b| b.borrow_mut().extend_from_slice(s.as_bytes()));
+    out(s.as_bytes());
 }
 
 /// Take the captured output as a string (after an `eval`).
@@ -31,7 +41,7 @@ pub fn capture_take() -> String {
 
 /// `emit ( c -- )` host side: append one byte.
 pub extern "C" fn rt_emit(ch: u64) -> u64 {
-    CAPTURE.with(|b| b.borrow_mut().push(ch as u8));
+    out(&[ch as u8]);
     0
 }
 
@@ -39,7 +49,7 @@ pub extern "C" fn rt_emit(ch: u64) -> u64 {
 pub extern "C" fn rt_type(addr: u64, len: u64) -> u64 {
     if addr != 0 && len > 0 {
         let slice = unsafe { std::slice::from_raw_parts(addr as *const u8, len as usize) };
-        CAPTURE.with(|b| b.borrow_mut().extend_from_slice(slice));
+        out(slice);
     }
     0
 }
@@ -77,7 +87,7 @@ pub extern "C" fn rt_print_int(n: u64, base: u64) -> u64 {
         out.push(' ');
         out
     };
-    CAPTURE.with(|b| b.borrow_mut().extend_from_slice(out.as_bytes()));
+    self::out(out.as_bytes());
     0
 }
 
@@ -115,7 +125,120 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 thread_local! {
-    static FILES: RefCell<Vec<Option<File>>> = const { RefCell::new(Vec::new()) };
+    static FILES: RefCell<Vec<Option<Fh>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// An open file: the host's (the BOX: a RISC OS file handle, through the
+/// hooks of src/host.rs) when the host has files, else Rust's.
+enum Fh {
+    Std(File),
+    Host(u64),
+}
+
+fn host_err() -> std::io::Error {
+    std::io::Error::other("host file operation failed")
+}
+
+impl Fh {
+    fn size(&mut self) -> std::io::Result<u64> {
+        match self {
+            Fh::Std(f) => f.metadata().map(|m| m.len()),
+            Fh::Host(h) => match crate::host::hooks().and_then(|k| k.file_extent).map(|e| e(*h)) {
+                Some(n) if n >= 0 => Ok(n as u64),
+                _ => Err(host_err()),
+            },
+        }
+    }
+}
+
+impl Read for Fh {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Fh::Std(f) => f.read(buf),
+            Fh::Host(h) => match crate::host::hooks().and_then(|k| k.file_read) {
+                Some(r) => match r(*h, buf.as_mut_ptr(), buf.len()) {
+                    n if n >= 0 => Ok(n as usize),
+                    _ => Err(host_err()),
+                },
+                None => Err(host_err()),
+            },
+        }
+    }
+}
+
+impl Write for Fh {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Fh::Std(f) => f.write(buf),
+            Fh::Host(h) => match crate::host::hooks().and_then(|k| k.file_write) {
+                Some(w) => match w(*h, buf.as_ptr(), buf.len()) {
+                    n if n > 0 || buf.is_empty() => Ok(n as usize),
+                    _ => Err(host_err()),
+                },
+                None => Err(host_err()),
+            },
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Fh::Std(f) => f.flush(),
+            Fh::Host(_) => Ok(()),
+        }
+    }
+}
+
+impl Seek for Fh {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Fh::Std(f) => f.seek(to),
+            Fh::Host(h) => {
+                let h = *h;
+                let ptr = crate::host::hooks().and_then(|k| k.file_ptr).ok_or_else(host_err)?;
+                let cur = ptr(h, 0, 0);
+                let want = match to {
+                    SeekFrom::Start(p) => p as i64,
+                    SeekFrom::Current(d) => cur + d,
+                    SeekFrom::End(d) => self.size()? as i64 + d,
+                };
+                if cur < 0 || want < 0 {
+                    return Err(host_err());
+                }
+                if want != cur && ptr(h, 1, want) < 0 {
+                    return Err(host_err());
+                }
+                Ok(want as u64)
+            }
+        }
+    }
+}
+
+impl Drop for Fh {
+    fn drop(&mut self) {
+        if let Fh::Host(h) = self {
+            if let Some(c) = crate::host::hooks().and_then(|k| k.file_close) {
+                c(*h);
+            }
+        }
+    }
+}
+
+/// A whole file's text (`include`): by the host's files when it has them.
+pub fn read_whole(name: &str) -> std::io::Result<String> {
+    let mut f = match host_open(name.as_ptr() as u64, name.len() as u64, 1) {
+        Some(Some(h)) => h,
+        Some(None) => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "not found")),
+        None => Fh::Std(File::open(name)?),
+    };
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Open by the host when it has files: mode 1 read, 2 write, 3 update, 4 create.
+fn host_open(addr: u64, len: u64, mode: u64) -> Option<Option<Fh>> {
+    let open = crate::host::hooks()?.file_open?;
+    let h = open(addr as *const u8, len as usize, mode);
+    Some((h != 0).then_some(Fh::Host(h)))
 }
 
 fn path_from(addr: u64, len: u64) -> String {
@@ -126,7 +249,7 @@ fn path_from(addr: u64, len: u64) -> String {
     String::from_utf8_lossy(slice).into_owned()
 }
 
-fn install(f: File) -> u64 {
+fn install(f: Fh) -> u64 {
     FILES.with(|t| {
         let mut t = t.borrow_mut();
         if let Some(i) = t.iter().position(|s| s.is_none()) {
@@ -139,7 +262,7 @@ fn install(f: File) -> u64 {
     })
 }
 
-fn with_file<R>(fid: u64, f: impl FnOnce(&mut File) -> R) -> Option<R> {
+fn with_file<R>(fid: u64, f: impl FnOnce(&mut Fh) -> R) -> Option<R> {
     if fid == 0 {
         return None;
     }
@@ -166,9 +289,13 @@ pub extern "C" fn rt_open_file(addr: u64, len: u64, fam: u64, fid_out: *mut u64)
         Some(o) => o,
         None => { unsafe { *fid_out = 0 }; return (-36i64) as u64; }
     };
-    match opts.open(path_from(addr, len)) {
-        Ok(f) => { let fid = install(f); unsafe { *fid_out = fid }; 0 }
-        Err(_) => { unsafe { *fid_out = 0 }; (-62i64) as u64 }
+    let f = match host_open(addr, len, fam & 3) {
+        Some(h) => h,
+        None => opts.open(path_from(addr, len)).ok().map(Fh::Std),
+    };
+    match f {
+        Some(f) => { let fid = install(f); unsafe { *fid_out = fid }; 0 }
+        None => { unsafe { *fid_out = 0 }; (-62i64) as u64 }
     }
 }
 
@@ -180,9 +307,13 @@ pub extern "C" fn rt_create_file(addr: u64, len: u64, fam: u64, fid_out: *mut u6
     }
     let mut o = OpenOptions::new();
     o.read(true).write(true).create(true).truncate(true);
-    match o.open(path_from(addr, len)) {
-        Ok(f) => { let fid = install(f); unsafe { *fid_out = fid }; 0 }
-        Err(_) => { unsafe { *fid_out = 0 }; (-62i64) as u64 }
+    let f = match host_open(addr, len, 4) {
+        Some(h) => h,
+        None => o.open(path_from(addr, len)).ok().map(Fh::Std),
+    };
+    match f {
+        Some(f) => { let fid = install(f); unsafe { *fid_out = fid }; 0 }
+        None => { unsafe { *fid_out = 0 }; (-62i64) as u64 }
     }
 }
 
@@ -237,7 +368,7 @@ pub extern "C" fn rt_file_position(fid: u64, pos_out: *mut u64) -> u64 {
 /// file-size ( fid -- ud ior ); kernel passes &size_out. Does not move the pointer.
 pub extern "C" fn rt_file_size(fid: u64, size_out: *mut u64) -> u64 {
     unsafe { *size_out = 0 };
-    match with_file(fid, |f| f.metadata().map(|m| m.len())) {
+    match with_file(fid, |f| f.size()) {
         Some(Ok(sz)) => { unsafe { *size_out = sz }; 0 }
         _ => (-68i64) as u64,
     }
@@ -313,6 +444,9 @@ pub extern "C" fn rt_read_line(
 
 /// delete-file ( c-addr u -- ior )
 pub extern "C" fn rt_delete_file(addr: u64, u: u64) -> u64 {
+    if let Some(d) = crate::host::hooks().and_then(|h| h.file_delete) {
+        return if d(addr as *const u8, u as usize) == 0 { 0 } else { (-66i64) as u64 };
+    }
     match std::fs::remove_file(path_from(addr, u)) {
         Ok(()) => 0,
         Err(_) => (-66i64) as u64,
@@ -329,6 +463,9 @@ pub extern "C" fn rt_flush_file(fid: u64) -> u64 {
 
 /// rename-file ( c-addr1 u1 c-addr2 u2 -- ior )
 pub extern "C" fn rt_rename_file(a1: u64, u1: u64, a2: u64, u2: u64) -> u64 {
+    if let Some(r) = crate::host::hooks().and_then(|h| h.file_rename) {
+        return if r(a1 as *const u8, u1 as usize, a2 as *const u8, u2 as usize) == 0 { 0 } else { (-70i64) as u64 };
+    }
     match std::fs::rename(path_from(a1, u1), path_from(a2, u2)) {
         Ok(()) => 0,
         Err(_) => (-70i64) as u64,
@@ -338,7 +475,10 @@ pub extern "C" fn rt_rename_file(a1: u64, u1: u64, a2: u64, u2: u64) -> u64 {
 // ── Memory-Allocation wordset (ANS): the OS heap via libc malloc/free/realloc ──
 /// allocate ( u -- a-addr ior ); kernel passes &addr_out (PAD). ior 0 = success.
 pub extern "C" fn rt_allocate(u: u64, addr_out: *mut u64) -> u64 {
-    let p = unsafe { libc::malloc(u as usize) };
+    let p = match crate::host::hooks().and_then(|h| h.mem_alloc) {
+        Some(a) => a(u as usize) as *mut libc::c_void,
+        None => unsafe { libc::malloc(u as usize) },
+    };
     if p.is_null() {
         unsafe { *addr_out = 0 };
         (-59i64) as u64 // ALLOCATE failure
@@ -412,6 +552,10 @@ pub extern "C" fn rt_parse_float(addr: u64, len: u64, out: *mut u64) -> u64 {
 
 /// ms ( u -- ): sleep u milliseconds (Facility wordset).
 pub extern "C" fn rt_ms(u: u64) {
+    if let Some(ms) = crate::host::hooks().and_then(|h| h.ms) {
+        ms(u);
+        return;
+    }
     if u > 0 {
         std::thread::sleep(std::time::Duration::from_millis(u));
     }
@@ -420,7 +564,10 @@ pub extern "C" fn rt_ms(u: u64) {
 /// free ( a-addr -- ior )
 pub extern "C" fn rt_free(addr: u64) -> u64 {
     if addr != 0 {
-        unsafe { libc::free(addr as *mut libc::c_void) };
+        match crate::host::hooks().and_then(|h| h.mem_free) {
+            Some(f) => f(addr as *mut u8),
+            None => unsafe { libc::free(addr as *mut libc::c_void) },
+        }
     }
     0
 }
@@ -428,13 +575,78 @@ pub extern "C" fn rt_free(addr: u64) -> u64 {
 /// resize ( a-addr u -- a-addr' ior ); kernel passes &addr_out. On failure the
 /// original block is left intact and addr_out keeps the old address.
 pub extern "C" fn rt_resize(addr: u64, u: u64, addr_out: *mut u64) -> u64 {
-    let p = unsafe { libc::realloc(addr as *mut libc::c_void, u as usize) };
+    let p = match crate::host::hooks().and_then(|h| h.mem_resize) {
+        Some(r) => r(addr as *mut u8, u as usize) as *mut libc::c_void,
+        None => unsafe { libc::realloc(addr as *mut libc::c_void, u as usize) },
+    };
     if p.is_null() {
         unsafe { *addr_out = addr };
         (-61i64) as u64 // RESIZE failure
     } else {
         unsafe { *addr_out = p as u64 };
         0
+    }
+}
+
+// ── Keyboard input and system calls (kernel/host.masm) ───────────────────
+// Through the host's hooks (src/host.rs); on the Mac, stdin, and no SWIs.
+
+/// key ( -- c ): one character, -1 at the end of input.
+pub extern "C" fn rt_key() -> u64 {
+    if let Some(k) = crate::host::hooks().and_then(|h| h.key) {
+        return k() as u64;
+    }
+    let mut b = [0u8; 1];
+    match std::io::stdin().read(&mut b) {
+        Ok(1) => b[0] as u64,
+        _ => u64::MAX,
+    }
+}
+
+/// key? ( -- flag )
+pub extern "C" fn rt_key_ready() -> u64 {
+    match crate::host::hooks().and_then(|h| h.key_ready) {
+        Some(k) if k() != 0 => u64::MAX,
+        _ => 0,
+    }
+}
+
+/// accept ( c-addr +n1 -- +n2 ): a line without its terminator.
+pub extern "C" fn rt_accept(addr: u64, max: u64) -> u64 {
+    if addr == 0 || max == 0 || max as i64 <= 0 {
+        return 0;
+    }
+    if let Some(r) = crate::host::hooks().and_then(|h| h.read_line) {
+        let n = r(addr as *mut u8, max as usize);
+        return if n < 0 { 0 } else { n as u64 };
+    }
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return 0;
+    }
+    let bytes = line.trim_end_matches(['\n', '\r']).as_bytes();
+    let n = bytes.len().min(max as usize);
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, n) };
+    n as u64
+}
+
+/// (swi) ( regs n -- err ): regs[0..9] are R0..R9 in and out, regs[10] the
+/// flags out. Without a host: no system calls, an "error" of -1.
+pub extern "C" fn rt_swi(regs: u64, n: u64) -> u64 {
+    match crate::host::hooks().and_then(|h| h.swi) {
+        Some(s) if regs != 0 => {
+            let r = regs as *mut u64;
+            s(n, r, unsafe { r.add(10) })
+        }
+        _ => u64::MAX,
+    }
+}
+
+/// (swi#) ( c-addr u -- n ): -1 if there is no such call.
+pub extern "C" fn rt_swi_number(addr: u64, len: u64) -> u64 {
+    match crate::host::hooks().and_then(|h| h.swi_number) {
+        Some(f) if addr != 0 => f(addr as *const u8, len as usize) as u64,
+        _ => u64::MAX,
     }
 }
 
@@ -479,5 +691,10 @@ pub fn externs() -> Vec<(&'static str, *const ())> {
         ("rt_utime", rt_utime as *const ()),
         ("rt_time_date", rt_time_date as *const ()),
         ("rt_parse_float", rt_parse_float as *const ()),
+        ("rt_key", rt_key as *const ()),
+        ("rt_key_ready", rt_key_ready as *const ()),
+        ("rt_accept", rt_accept as *const ()),
+        ("rt_swi", rt_swi as *const ()),
+        ("rt_swi_number", rt_swi_number as *const ()),
     ]
 }

@@ -1,0 +1,6 @@
+| !Boot for !F66: the Forth source file type and the sprites
+Set F66$Dir <Obey$Dir>
+IconSprites <F66$Dir>.!Sprites
+Set File$Type_A77 Forth
+| Double-click: run in a TaskWindow, where the output can be read
+Set Alias$@RunType_A77 TaskWindow "F66 %%*0" -name F66 -wimpslot 64K

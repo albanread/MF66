@@ -1,0 +1,17 @@
+[package]
+name = "mf66-box"
+version = "0.0.1"
+edition = "2021"
+description = "MF66 for the BOX: the Forth as a static library with a C API, linked into /init by A7232ToolChain's modules/forth. See design/BOX_PORT.md."
+
+# Its own workspace: built on its own for aarch64-unknown-linux-musl (box/build.sh).
+[workspace]
+
+[lib]
+name = "mf66_box"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+mf66 = { path = ".." }
+anyhow = "1"

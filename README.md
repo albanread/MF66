@@ -43,6 +43,13 @@ How the optimizing Forth compiler itself works — the token IR, the reduce pass
 the deferred virtual-stack lowerer, register pinning, the STC ABI, and the
 `CODE … END-CODE` escape hatch — is documented in **[compiler.md](compiler.md)**.
 
+## On the BOX
+
+MF66 also runs in the BOX (our 64-bit RISC OS over Linux) as `*F66` and the
+`!F66` application: the REPL in a TaskWindow, Forth files (type &A77), SWIs
+from Forth, Declaritive windows. See [design/BOX_PORT.md](design/BOX_PORT.md)
+and `box/`.
+
 ## ABI (decided)
 
 `TOS=x0`, `DSP=x19`, `UP=x20`, `LP=x21`, `FTOS=d8`, `FSP=x22`; everything that

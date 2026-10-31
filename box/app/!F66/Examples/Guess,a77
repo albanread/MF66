@@ -1,0 +1,32 @@
+\ Guess: a number guessing game, reading the keyboard with accept (a
+\ line) and key (one key).  Runs in a TaskWindow, the console or the
+\ command line.
+
+\ A random number: a linear congruential generator seeded from the clock
+variable seed
+: randomize  0 swi" OS_ReadMonotonicTime" sys r0 seed ! ;
+: random ( n -- 0..n-1 ) seed @ 1103515245 * 12345 + $7FFFFFFF and dup seed ! 16 rshift swap mod ;
+
+\ A number typed by the player, or -1 if what was typed is not one
+create typed 40 allot
+: ask ( -- n )
+  typed 40 accept typed swap                  ( c-addr u )
+  dup 0= if 2drop -1 exit then
+  0 0 2swap >number nip nip if drop -1 then ;
+
+: round ( -- )
+  100 random 1+  0                            ( secret tries )
+  ." I am thinking of a number from 1 to 100." cr
+  begin
+    ." Your guess? " ask                     ( secret tries guess )
+    swap 1+ swap
+    dup 0< if drop ." That is not a number." cr 0 else
+    2 pick 2dup < if 2drop ." Too low." cr 0 else
+    > if ." Too high." cr 0 else
+      ." Right, in " dup . ." tries." cr -1
+    then then then
+  until 2drop ;
+
+: again? ( -- f ) ." Another game (y/n)? " key dup emit cr dup [char] y = swap [char] Y = or ;
+: guess  randomize begin round again? 0= until ." Goodbye." cr ;
+guess

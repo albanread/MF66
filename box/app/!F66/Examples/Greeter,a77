@@ -1,0 +1,25 @@
+\ Greeter: a desktop window from F66, by the Declaritive module.  The
+\ window is described in JSON; its events come back from
+\ Declaritive_Dispatch: kind 1 a click, 2 a change, 9 the tick, 5/7 closed.
+include <F66$Dir>.Library.Declaritive
+create msg 300 allot
+0 value win
+0 value start
+0 value done
+: spec z" {'type':'window','id':'greeter','title':'F66 + Declaritive','tick':100,'body':{'type':'form','children':[{'type':'input','id':'name','label':'Your name','live':true},{'type':'text','id':'greeting','label':'Greeting','text':'Type your name'},{'type':'text','id':'clock','label':'Running for','text':''},{'type':'row','span':true,'children':[{'type':'spacer'},{'type':'button','id':'quit','text':'Quit'}]}]}}" ;
+: id? ( c-addr u -- f ) decl-id compare 0= ;
+: greet  msg zclear s" Hello, " msg zappend decl-value msg zappend s" !" msg zappend
+  win z" greeting" z" text" msg decl-set ;
+: clock  msg zclear 0 swi" OS_ReadMonotonicTime" sys r0 start - 100 / msg zappend#
+  s"  seconds" msg zappend  win z" clock" z" text" msg decl-set ;
+: event ( kind -- )
+  dup 1 = if s" quit" id? if 1 to done then then
+  dup 2 = if s" name" id? if greet then then
+  dup 9 = if clock then
+  dup 5 = swap 7 = or if 1 to done then ;
+: greeter
+  z" Greeter" decl-init drop  spec decl-create to win
+  0 swi" OS_ReadMonotonicTime" sys r0 to start
+  begin decl-poll decl-dispatch event done until
+  decl-closedown ;
+greeter

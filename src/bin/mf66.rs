@@ -19,7 +19,7 @@ fn main() {
     let mut s = match Mf66Session::new() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("mf66: boot failed: {e}");
+            eprintln!("mf66: boot failed: {e:#}");
             std::process::exit(1);
         }
     };

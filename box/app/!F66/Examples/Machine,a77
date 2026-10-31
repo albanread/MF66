@@ -1,0 +1,53 @@
+\ Machine: what the SWIs say about the machine -- the time and date, the
+\ OS version, memory, system variables and the screen mode.
+
+create buf 256 allot
+
+\ The time: OS_Word 14 reason 3 gives the five-byte UTC time; the
+\ Territory module turns it into local text in its own format
+create time5 8 allot
+: now ( -- ) 3 time5 c!  14 time5 2 swi" OS_Word" sys ;
+: .date ( -- )
+  now  -1 time5 buf 255 4 swi" Territory_ConvertStandardDateAndTime" sys
+  buf zcount type ;
+: .time ( -- )
+  now  time5 buf 255 z" %24:%MI:%SE" 4 swi" OS_ConvertDateAndTime" sys
+  buf zcount type ;
+
+\ The OS version: OS_Byte 0 with R1=0 returns it as an "error" block
+: .version ( -- ) 0 0 2 swi" XOS_Byte" xsys ?dup if .error then ;
+
+\ Memory: the page size and the number of pages
+: .memory ( -- )
+  0 swi" OS_ReadMemMapInfo" sys r0 r1 * 1024 / 1024 / . ." MB of RAM in "
+  r1 . ." pages of " r0 . ." bytes" ;
+
+\ A system variable's value, or "(unset)"
+: .var ( z-name -- )
+  dup zcount type ."  = "
+  buf 255 0 3 5 swi" XOS_ReadVarVal" xsys if ." (unset)" else buf r2 type then ;
+
+\ The screen mode: pixels from OS_ReadModeVariable, and colours
+: mode-var ( n -- x ) -1 swap 2 swi" OS_ReadModeVariable" sys r2 ;
+: .screen ( -- )
+  11 mode-var 1+ . ." by " 12 mode-var 1+ . ." pixels, "
+  1 9 mode-var lshift . ." bits a pixel, "
+  11 mode-var 1+ 4 mode-var lshift . ." by "
+  12 mode-var 1+ 5 mode-var lshift . ." OS units" ;
+
+: uptime ( -- ) 0 swi" OS_ReadMonotonicTime" sys r0 100 / dup 60 / . ." min " 60 mod . ." s" ;
+
+: machine
+  ." Date:     " .date cr
+  ." Time:     " .time cr
+  ." OS:       " .version cr
+  ." Memory:   " .memory cr
+  ." Screen:   " .screen cr
+  ." Up for:   " uptime cr
+  ." Variables:" cr
+  ."   " z" Sys$Time" .var cr
+  ."   " z" Sys$Year" .var cr
+  ."   " z" F66$Dir" .var cr
+  ."   " z" Wimp$State" .var cr
+  ."   " z" NoSuch$Variable" .var cr ;
+machine

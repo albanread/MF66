@@ -1,0 +1,60 @@
+\ ToDo: a list on the desktop, by the Declaritive module.  Type a job and
+\ press Return or Add; select one and press Done to take it off.  A clock
+\ at the foot shows the tick event.  Run it as a task of its own:
+\   *WimpTask F66 <F66$Dir>.Examples.ToDo
+include <F66$Dir>.Library.Declaritive
+create msg 2000 allot
+0 value win
+0 value done
+
+: spec z" {'type':'window','id':'todo','title':'F66 To do','tick':100,'body':{'type':'stack','children':[{'type':'row','children':[{'type':'input','id':'job','label':'Job','grow':1},{'type':'button','id':'add','text':'Add','default':true}]},{'type':'list-box','id':'list','rows':8,'options':[]},{'type':'row','children':[{'type':'text','id':'count','text':'Nothing to do','grow':1},{'type':'button','id':'done','text':'Done'},{'type':'button','id':'clear','text':'Clear all'}]},{'type':'text','id':'clock','text':''}]}}" ;
+
+\ The jobs: up to 20, 60 characters each, a count byte then the text
+20 constant max-jobs   61 constant job-size
+create jobs max-jobs job-size * allot
+variable #jobs
+-1 value chosen                       \ the job selected in the list, or -1
+: job ( i -- c-addr u ) job-size * jobs + count ;
+: job! ( c-addr u i -- ) job-size * jobs + >r 60 min dup r@ c! r> 1+ swap move ;
+
+\ The list's options, set as a property: one a line, "value=text"
+: show-list
+  msg zclear
+  #jobs @ 0 ?do i msg zappend# s" =" msg zappend i job msg zappend s\" \n" msg zappend loop
+  win z" list" z" options" msg decl-set
+  msg zclear #jobs @ ?dup if msg zappend# s"  to do" msg zappend else s" Nothing to do" msg zappend then
+  win z" count" z" text" msg decl-set
+  -1 to chosen ;
+: add ( c-addr u -- )
+  dup 0= #jobs @ max-jobs = or if 2drop exit then
+  #jobs @ job! 1 #jobs +! show-list
+  win z" job" z" value" z" " decl-set ;
+: remove ( i -- )                    \ the jobs after it move up one
+  dup 0< over #jobs @ >= or if drop exit then
+  #jobs @ 1- swap ?do i 1+ job i job! loop
+  -1 #jobs +! show-list ;
+
+: get-job ( -- c-addr u ) win z" job" z" value" 3 swi" Declaritive_Get" sys r0 zcount ;
+: clock
+  msg zclear s" Time now: " msg zappend
+  msg zcount + >r                     \ where the time goes
+  z" Sys$Time" r@ 100 0 3 5 swi" OS_ReadVarVal" sys  0 r> r2 + c!
+  win z" clock" z" text" msg decl-set ;
+: id? ( c-addr u -- f ) decl-id compare 0= ;
+: number ( c-addr u -- n ) 0 0 2swap >number 2drop drop ;
+: event ( kind -- )
+  dup 1 = if
+    s" add" id? if get-job add then
+    s" done" id? if chosen remove then
+    s" clear" id? if 0 #jobs ! show-list then
+  then
+  dup 2 = if s" list" id? if decl-value number to chosen then then
+  dup 3 = if decl-value add then
+  dup 9 = if clock then
+  dup 5 = swap 7 = or if 1 to done then ;
+: todo
+  z" ToDo" decl-init drop  spec decl-create to win
+  s" Try F66 on the BOX" add  s" Write a Forth word" add
+  begin decl-poll decl-dispatch event done until
+  decl-closedown ;
+todo

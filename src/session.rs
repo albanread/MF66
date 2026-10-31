@@ -83,6 +83,8 @@ pub struct Mf66Session {
 
     region: *mut u8,
     layout: Layout,
+    /// The region came from the host (`host::region_alloc`), not the heap.
+    host_region: bool,
 
     dstack_top: u64,
     rstack_top: u64,
@@ -258,7 +260,13 @@ impl Mf66Session {
         // 1. Expand the kernel macros to AArch64 text.
         let mut asm = Assembler::new();
         asm.register_macro("stk", crate::asm_macros::stk);
-        let main = kernel_path();
+        // The kernel sources are built in (no checkout needed at run time, as in
+        // the BOX): `@include` finds them in the assembler's virtual files.
+        let dir = kernel_dir();
+        for (name, text) in KERNEL_SOURCES {
+            asm.add_virtual_file(dir.join(name), *text);
+        }
+        let main = dir.join("main.masm");
         let text = asm
             .assemble_file(&main)
             .map_err(|e| anyhow::anyhow!("assemble {}: {e}", main.display()))?;
@@ -274,7 +282,14 @@ impl Mf66Session {
 
         // 3. Allocate + seed the Forth region.
         let layout = Layout::from_size_align(REGION_SIZE, 4096).unwrap();
-        let region = unsafe { alloc_zeroed(layout) };
+        // A host may give the region (the BOX: a dynamic area in the RISC OS
+        // arena, so Forth addresses can be handed to SWIs as they are).
+        let host_region = crate::host::region_alloc(REGION_SIZE);
+        let region = match host_region {
+            Some(p) => p,
+            None => unsafe { alloc_zeroed(layout) },
+        };
+        let host_region = host_region.is_some();
         if region.is_null() {
             anyhow::bail!("region allocation failed");
         }
@@ -289,6 +304,7 @@ impl Mf66Session {
             forth_main,
             region,
             layout,
+            host_region,
             dstack_top,
             rstack_top,
             user_base,
@@ -1075,6 +1091,42 @@ impl Mf66Session {
                         self.push_or_compile_pair(addr, len);
                     }
                 }
+                continue;
+            }
+            // include NAME — interpret a source file, line by line.
+            if lk == "include" {
+                let name = scan_word(b, &mut pos)
+                    .ok_or_else(|| anyhow::anyhow!("`include` needs a file name"))?
+                    .to_string();
+                let text = crate::runtime::read_whole(&name)
+                    .map_err(|e| anyhow::anyhow!("include {name}: {e}"))?;
+                for (i, line) in text.lines().enumerate() {
+                    self.eval(line)
+                        .map_err(|e| anyhow::anyhow!("{name}:{}: {e:#}", i + 1))?;
+                }
+                continue;
+            }
+            // For system calls (the BOX, design/BOX_PORT.md):
+            //   z" ccc"     ( -- c-addr )  a zero-terminated string literal
+            //   swi" name"  ( -- n )       a SWI's number, looked up now
+            if lk == "z\"" {
+                let body = scan_span(b, &mut pos, b'"')
+                    .ok_or_else(|| anyhow::anyhow!("unterminated z\""))?;
+                let mut bytes = body.as_bytes().to_vec();
+                bytes.push(0);
+                let (addr, _) = self.store_string(&bytes);
+                self.push_or_compile_lit(addr as i64);
+                continue;
+            }
+            if lk == "swi\"" {
+                let body = scan_span(b, &mut pos, b'"')
+                    .ok_or_else(|| anyhow::anyhow!("unterminated swi\""))?;
+                let name = body.trim();
+                let n = crate::runtime::rt_swi_number(name.as_ptr() as u64, name.len() as u64) as i64;
+                if n < 0 {
+                    anyhow::bail!("no SWI called {name}");
+                }
+                self.push_or_compile_lit(n);
                 continue;
             }
             if lk == "s\\\"" {
@@ -2899,14 +2951,45 @@ impl Mf66Session {
 
 impl Drop for Mf66Session {
     fn drop(&mut self) {
-        unsafe { dealloc(self.region, self.layout) };
+        if self.host_region {
+            crate::host::region_free(self.region, REGION_SIZE);
+        } else {
+            unsafe { dealloc(self.region, self.layout) };
+        }
     }
 }
 
-/// Locate `kernel/main.masm` relative to the crate root.
-fn kernel_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernel/main.masm")
+/// The directory the kernel's virtual files are registered under.
+fn kernel_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernel")
 }
+
+/// Every kernel source, built into the binary.
+const KERNEL_SOURCES: &[(&str, &str)] = &[
+    ("main.masm", include_str!("../kernel/main.masm")),
+    ("macros.masm", include_str!("../kernel/macros.masm")),
+    ("prims.masm", include_str!("../kernel/prims.masm")),
+    ("rstack.masm", include_str!("../kernel/rstack.masm")),
+    ("stack.masm", include_str!("../kernel/stack.masm")),
+    ("arith.masm", include_str!("../kernel/arith.masm")),
+    ("logic.masm", include_str!("../kernel/logic.masm")),
+    ("compare.masm", include_str!("../kernel/compare.masm")),
+    ("memory.masm", include_str!("../kernel/memory.masm")),
+    ("strings.masm", include_str!("../kernel/strings.masm")),
+    ("number.masm", include_str!("../kernel/number.masm")),
+    ("dict.masm", include_str!("../kernel/dict.masm")),
+    ("io.masm", include_str!("../kernel/io.masm")),
+    ("float.masm", include_str!("../kernel/float.masm")),
+    ("exceptions.masm", include_str!("../kernel/exceptions.masm")),
+    ("dataspace.masm", include_str!("../kernel/dataspace.masm")),
+    ("oop.masm", include_str!("../kernel/oop.masm")),
+    ("stackext.masm", include_str!("../kernel/stackext.masm")),
+    ("numout.masm", include_str!("../kernel/numout.masm")),
+    ("fmath.masm", include_str!("../kernel/fmath.masm")),
+    ("files.masm", include_str!("../kernel/files.masm")),
+    ("memalloc.masm", include_str!("../kernel/memalloc.masm")),
+    ("host.masm", include_str!("../kernel/host.masm")),
+];
 
 /// Next whitespace-delimited word from `b` starting at `*pos`; advances `*pos`
 /// past it. `None` at end of input. (The cursor-based replacement for

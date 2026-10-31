@@ -1,0 +1,87 @@
+F66 for RISC OS
+===============
+
+F66 is a token-IR optimizing Forth: each definition is compiled to machine
+code as it is read, by JASM's own encoder (no LLVM), and runs in the box's
+own process.  On the Arm box it is MF66 (AArch64, github.com/albanread/MF66);
+on the Intel box it is WF66, its x86-64 parent (github.com/albanread/WF66).
+The examples run on both.
+
+Running
+-------
+  Double-click !F66      the console: a desktop window to try Forth in
+  *F66                   the REPL at the command line; type bye to leave
+  Double-click a Forth   (filetype &A77) runs it in a TaskWindow
+  *F66 <file>            run a file (command line, TaskWindow, Obey)
+  *F66 -i <file>         run a file, then the REPL
+  *F66 -e "<forth>"      run one line
+  *F66 -console [<file>] the console, including the file if one is given
+  include <file>         load another file (Library.Declaritive, say)
+
+The console
+-----------
+The output above, what you type and what the Forth prints, " ok" after
+each line; the input line below it; the Words list at the side (newest
+first) and the data stack in the status line, as .s shows it.
+  Return                 run the line         Up, Down    history
+  Left, Right, Home,     edit the line        Tab         complete a word
+  Copy, Backspace        (Escape clears it)   F1          the word's stack
+  Select on a word       put it in the line               comment
+  Adjust on a word       its stack comment    ^ v         page the Words
+  Drop a Forth file on the window or its icon bar icon to include it.
+  Menu: Help on word, Clear (the output), Reset (a fresh Forth), Quit.
+Escape stops a running word when it prints, calls a SWI, waits (ms) or
+reads the keyboard; key and accept read from the console.  While the
+console is open it has the Forth: *F66 (and double-clicking a Forth
+file) says so until it is quit; drop the file on the console instead.
+
+Errors in a file are reported as file:line: error: ...  A fault in Forth
+code (a bad address, say) ends the run with an error; the box goes on.
+Escape stops a program as it prints or calls a SWI.
+
+SWIs
+----
+Forth addresses are RISC OS addresses: here, pad, create'd buffers and
+strings can be given to a SWI as they are.
+
+  regs              ( -- addr )   R0..R9, a cell each, then the flags
+  sys               ( x0 .. xk-1 k n -- )  R0..Rk-1 from the stack, call n;
+                                  an error is printed and THROWn
+  xsys              ( x0 .. xk-1 k n -- err|0 )  the same, but the error
+                                  (V set) is returned: its block, or 0
+  swi / xswi        ( n -- ) / ( n -- err|0 )  with regs as they are
+  r0 .. r9          ( -- x )      a register after the call
+  swi-flags         ( -- addr )   N Z C V as bits 3..0
+  swi" OS_Write0"   ( -- n )      a SWI's number, looked up when compiled
+  s" name" swi#     ( -- n )      the same at run time (-1 if none)
+  z" text"          ( -- c-addr ) a zero-terminated string
+  zcount  .error    ( c-addr -- c-addr u ) and ( err -- ) print an error
+  s>32 32>s         registers are 32 bits; they come back zero-extended
+
+  : hello  z" Hello" 1 swi" OS_Write0" sys ;
+  : ticks  0 swi" OS_ReadMonotonicTime" sys r0 ;
+
+Files are RISC OS files (open-file and the rest); allocate gives RMA
+memory; key, key? and accept read the keyboard.
+
+Examples
+--------
+Graphics go to the screen: run Shapes, Bounce and Hanoi from the command
+line (F12): *F66 <F66$Dir>.Examples.Shapes.  Calc, ToDo and Greeter are
+desktop programs: *WimpTask F66 <F66$Dir>.Examples.Calc.
+
+  Hello     printing and SWIs
+  SWIs      by name and number, the X form, flags, a buffer
+  Sieve     primes below 1 000 000, timed
+  Machine   time and date, OS version, memory, variables, the screen mode
+  Files     write, read back, OS_File's information, a directory listed
+  Defining  CREATE and DOES>: arrays, counters, units, a table of actions
+  RPN       a little calculator: an interpreter written in Forth
+  Guess     a number guessing game: accept and key
+  Shapes    OS_Plot: rectangles, discs, circles, a triangle, lines
+  Bounce    an animation, with text placed by VDU 31 and coloured by VDU 17
+  Hanoi     the Towers of Hanoi, solved by recursion and drawn as it goes
+  Greeter   a desktop window from JSON, by the Declaritive module
+            (include <F66$Dir>.Library.Declaritive)
+  Calc      a calculator form: fields, buttons, an answer (Declaritive)
+  ToDo      a to-do list: a list box, buttons and a clock (Declaritive)

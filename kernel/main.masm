@@ -38,6 +38,7 @@
 @include "fmath.masm"
 @include "files.masm"
 @include "memalloc.masm"
+@include "host.masm"
 
 ; forth_main — the only data-stack-representation translation layer.
 ;
