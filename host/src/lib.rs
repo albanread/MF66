@@ -8,6 +8,8 @@
 
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+pub mod console;
+
 /// What a host may supply. Strings are (pointer, length); nothing is kept.
 #[repr(C)]
 pub struct Hooks {
