@@ -310,3 +310,28 @@ included files too; then the prelude's and the kernel's) and `_word_help`
 (the stack comment written after a colon definition's name, or one from a
 table of the kernel's common words).  The self-test (boot/selftest_forth.c)
 runs lines through the console's code without a window.
+
+## 9. The Intel box (31 Oct 2026)
+
+Done as section 6 planned, with one change: WF66's calls to the host keep
+the Win64 convention on Linux too. Its `forth_main` and every `rt_*` host
+function are `extern "win64"` (the same as `extern "C"` on Windows), so its
+kernel and code generator are unchanged and serve Windows and Linux. The
+kernel's KERNEL32/msvcrt imports are bound on Linux to Rust functions of the
+same shape that use the hooks.
+
+- JASM branch `box-linux-x64` (worktree `src/JASM-box-linux-x64`, from
+  `box-linux-jit`): `NativeJit` on Linux x86-64 through `jitmem` (mmap,
+  mprotect, `map_near`).
+- WF66 branch `cli/wf66-box`: `box/` builds `libwf66-box.a` for
+  x86_64-unknown-linux-musl with this crate's C interface (`mf66_box.h`);
+  see WF66's box/README.md.
+- This branch, `cli/forth-box-intel`: the hooks table and the console's
+  helpers moved to `host/` (the f66-host crate), which both Forths use.
+- A7232ToolChain branch `forth-intel`: the Makefile links WF66's library
+  into the Intel /init; the module names its Forth (`F66_FORTH`).
+
+The Intel self-test runs the same F66 checks (boot/selftest_forth.c) and
+passes them; bench.fth gives 832040, 148933 and 40000200000. The console,
+Escape, a fault, SWIs and Greeter's Declaritive window were driven in the
+Intel desktop on the 2019 Mac Pro.
