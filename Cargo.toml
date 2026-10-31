@@ -13,6 +13,8 @@ description = "MF66 — an Apple Silicon (macOS arm64) re-implementation of WF66
 wfasm = { path = "../JASM-box-linux/rust", default-features = false }
 anyhow = "1"
 libc = "0.2"
+# The host hooks, shared with WF66 (the Intel box): host/.
+f66-host = { path = "host" }
 
 # ── IDE workspace (optional) ──────────────────────────────────────────────────
 # `ui`  : the headless workspace + the TCL agentic control layer. Pulls the

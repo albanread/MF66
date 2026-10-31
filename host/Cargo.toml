@@ -1,0 +1,9 @@
+[package]
+name = "f66-host"
+version = "0.0.1"
+edition = "2021"
+description = "The host hooks of the BOX's Forths: the C-shaped table through which rosgd/modules/forth gives MF66 (Arm) and WF66 (Intel) their output, input, memory, files and SWIs. See design/BOX_PORT.md."
+
+[lib]
+name = "f66_host"
+path = "src/lib.rs"

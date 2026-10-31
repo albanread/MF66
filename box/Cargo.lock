@@ -9,6 +9,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "f66-host"
+version = "0.0.1"
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19,6 +23,7 @@ name = "mf66"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "f66-host",
  "libc",
  "wfasm",
 ]
