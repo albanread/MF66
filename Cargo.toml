@@ -8,9 +8,8 @@ description = "MF66 — an Apple Silicon (macOS arm64) re-implementation of WF66
 # The LLVM-free JASM backend: the native AArch64 encoder (`a64::A64Encoder`)
 # and the MAP_JIT loader (`native_macos::MacJit`). Same crate WF66 uses, same
 # `default-features = false` (no LLVM). See docs/design/mf66-apple-silicon.md.
-# While the BOX port is open, JASM's box-linux-jit branch (its AArch64 loader
-# on Linux too): the worktree src/JASM-box-linux.
-wfasm = { path = "../JASM-box-linux/rust", default-features = false }
+# JASM's main has the AArch64 loader on Linux too (the BOX): ../JASM.
+wfasm = { path = "../JASM/rust", default-features = false }
 anyhow = "1"
 libc = "0.2"
 # The host hooks, shared with WF66 (the Intel box): host/.
